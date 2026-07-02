@@ -856,6 +856,16 @@ class FSDPStrategy(DistributedStrategy):
 
         # Step 4: Save on rank 0 only
         if self.is_rank_0():
+            # Grouped-MoE export fix: the FSDP2 full state dict of a grouped-swapped
+            # (GroupedMoEShim) MoE model carries FUSED ``...mlp.moe.experts.w1/w2/w3`` +
+            # ``...mlp.moe.router.gate.weight`` keys. ``config.json`` says ``qwen3_moe``,
+            # so vLLM's HF loader (which expects the per-expert layout) KeyErrors on
+            # ``experts.w1``. Normalize + remap grouped -> per-expert HF layout (the SAME
+            # transform the weight-sync-to-vLLM path in ``FSDPWeightExtractor`` applies)
+            # BEFORE ``save_pretrained``. GATED on grouped expert keys actually being
+            # present, so a dense / non-grouped / non-MoE save stays BYTE-IDENTICAL.
+            output_state_dict = self._maybe_remap_grouped_moe_state_dict(output_state_dict)
+
             with io.local_work_dir(output_dir) as work_dir:
                 # Save the model in HuggingFace format using safetensors
                 model_to_save.save_pretrained(work_dir, state_dict=output_state_dict, safe_serialization=True, **kwargs)
@@ -871,3 +881,39 @@ class FSDPStrategy(DistributedStrategy):
             self.print(f"[rank-0]: Successfully saved model to {output_dir}")
 
         dist.barrier()
+
+    # GroupedMoEShim ``.mlp.moe.`` segment + FSDP ``_fsdp_wrapped_module`` segment that
+    # sit between the HF ``...mlp.`` prefix and the grouped ``experts.w1/...`` / ``router.gate``
+    # keys the ``convert_tt_to_hf_moe`` converter matches on. Mirrors
+    # ``FSDPWeightExtractor._strip_grouped_prefix`` in ``workers/fsdp/fsdp_worker.py``.
+    _MOE_SHIM_SEG = ".mlp.moe."
+    _MOE_FSDP_SEG = "._fsdp_wrapped_module."
+
+    @staticmethod
+    def _maybe_remap_grouped_moe_state_dict(state_dict):
+        """Grouped-MoE -> per-expert HF remap on a rank-0 full state dict, if grouped.
+
+        Detects the grouped (GroupedMoEShim) layout by the presence of a fused
+        ``...mlp.moe.experts.w1`` key (FSDP ``_fsdp_wrapped_module`` segments stripped
+        first). If NOT grouped (dense / non-MoE / already-HF), the state dict is returned
+        UNCHANGED (byte-identical save path — the critical invariant). If grouped, every
+        key's ``_fsdp_wrapped_module`` + ``.mlp.moe.`` -> ``.mlp.`` prefix is stripped and
+        the trainer's verified ``convert_tt_to_hf_moe`` (reused, NOT reinvented) splits the
+        fused ``experts.w1/w2/w3`` stacks into per-expert ``experts.{j}.{gate,up,down}_proj``
+        and renames ``router.gate`` -> ``mlp.gate``. Tensors are already full (materialized
+        by ``get_model_state_dict(full_state_dict=True)`` on rank 0), so no gather is needed.
+        """
+
+        def _strip(name):
+            return name.replace(FSDPStrategy._MOE_FSDP_SEG, ".").replace(FSDPStrategy._MOE_SHIM_SEG, ".mlp.")
+
+        # Gate: only remap when fused grouped expert tensors are actually present.
+        is_grouped = any(_strip(k).endswith(".mlp.experts.w1") for k in state_dict)
+        if not is_grouped:
+            return state_dict
+
+        from skyrl_train.models.layers.moe_weight_remap import convert_tt_to_hf_moe
+
+        remapped = {_strip(k): v for k, v in state_dict.items()}
+        convert_tt_to_hf_moe(remapped)  # in-place grouped -> per-expert HF
+        return remapped

@@ -104,9 +104,16 @@ AGENT_SCHEMA = SectionSchema(
         # parser auto-corrects, allowing the model to get rewards despite malformed responses.
         "strict_json_parser": FieldMapping("strict_json_parser", field_type="kwargs", default=False),
         # Episode logging control
-        # When false, disables creation of episode-* folders with debug.json, prompt.txt, response.txt
-        # This reduces disk I/O for RL training where SkyRL uses TrialResult directly
-        "enable_episode_logging": FieldMapping("enable_episode_logging", field_type="kwargs", default=True),
+        # When false, disables creation of episode-* folders with debug.json, prompt.txt, response.txt.
+        # DEFAULT False (throughput-critical): debug.json is the full raw litellm
+        # request+response (whole message history, MBs, growing) written SYNCHRONOUSLY
+        # by litellm's logger_fn on every LLM call. With a remote (s3://) trials_dir
+        # that per-turn write is a blocking object-store upload that stalls the shared
+        # RolloutCoordinator event loop -> serializes all trials -> starves the vLLM
+        # engines (py-spy confirmed). RL training does NOT read it (logprobs come from
+        # rollout_details; the trajectory from trajectory.json, both written
+        # independently). Set true only for local debugging.
+        "enable_episode_logging": FieldMapping("enable_episode_logging", field_type="kwargs", default=False),
         # Terminal session recording (asciinema)
         # When false, disables recording.cast file generation
         # This significantly reduces disk I/O for RL training.

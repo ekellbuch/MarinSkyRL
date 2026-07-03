@@ -109,8 +109,12 @@ AGENT_SCHEMA = SectionSchema(
         "enable_episode_logging": FieldMapping("enable_episode_logging", field_type="kwargs", default=True),
         # Terminal session recording (asciinema)
         # When false, disables recording.cast file generation
-        # This significantly reduces disk I/O for RL training
-        "record_terminal_session": FieldMapping("record_terminal_session", field_type="kwargs", default=True),
+        # This significantly reduces disk I/O for RL training.
+        # DEFAULT False (config-hygiene): RL runs never need the asciinema cast,
+        # and leaving it on adds per-episode sandbox I/O + a recording.cast that
+        # _upload_agent_logs ships back into the sandbox. A yaml can still opt in
+        # with `record_terminal_session: true`.
+        "record_terminal_session": FieldMapping("record_terminal_session", field_type="kwargs", default=False),
         # Pane logging control
         # When false, disables terminus_2.pane file generation
         # This reduces disk I/O for RL training
@@ -118,7 +122,9 @@ AGENT_SCHEMA = SectionSchema(
         # Trajectory configuration (dict passed as trajectory_config kwarg to Terminus-2)
         # raw_content: If True, save raw LLM responses (including <think> blocks) in trajectory
         # linear_history: If True, split trajectory into separate files on summarization
-        "trajectory_config": FieldMapping("trajectory_config", field_type="kwargs"),
+        # DEFAULT raw_content=True (config-hygiene): TIS/logprob alignment needs the
+        # raw (pre-parse) assistant content; a yaml can override the whole dict.
+        "trajectory_config": FieldMapping("trajectory_config", field_type="kwargs", default={"raw_content": True}),
     }
 )
 

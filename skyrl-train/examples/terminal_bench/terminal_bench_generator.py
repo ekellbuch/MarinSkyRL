@@ -234,6 +234,19 @@ class TerminalBenchGenerator(GeneratorInterface):
         # Error handling config (for RLOO-N advantage estimator)
         self._error_handling_config = self._harbor_config_builder.get_error_handling_config()
 
+        # Preserve-logprobs-on-soft-timeout: when a trajectory was FULLY generated
+        # but a POST-generation step failed (VerifierTimeoutError -> no reward, or a
+        # soft AgentTimeout without a verifier result), keep the generated
+        # tokens+logprobs at reward=0 instead of discarding them, so an RLOO-N group
+        # is not dropped for all-missing-logprobs (global_step stuck at 0). Gated +
+        # length-checked at the discard sites; falls back to the discard stub when the
+        # generation has no TIS-valid (length-matched) logprobs. Default ON; set
+        # harbor.error_handling.preserve_logprobs_on_timeout=false for the old
+        # discard-everything behavior.
+        self._preserve_logprobs_on_timeout = self._error_handling_config.get(
+            "preserve_logprobs_on_timeout", True
+        )
+
         # TIS (Truncated Importance Sampling) config
         # Only show TIS-related warnings when collect_rollout_details is enabled
         self._collect_rollout_details = self._harbor_config_builder.get_collect_rollout_details()
@@ -1209,6 +1222,34 @@ class TerminalBenchGenerator(GeneratorInterface):
         )
         return exclude, exception_type
 
+    def _should_preserve_timeout_trajectory(self, result) -> bool:
+        """Whether to KEEP a fully-generated trajectory whose POST-generation step
+        failed (VerifierTimeoutError -> no reward, or a soft AgentTimeout without a
+        verifier result) instead of discarding it.
+
+        Only True when preserve-on-timeout is enabled AND the agent actually
+        produced ``rollout_details`` carrying logprobs -- so we never synthesize a
+        training sample from a trial that never generated. This is a cheap
+        prerequisite gate; the AUTHORITATIVE TIS-validity check (``rollout_logprobs``
+        length == ``response_ids`` length) still runs after extraction and falls
+        back to the discard stub on any mismatch, so malformed / length-mismatched
+        logprobs are never fed to TIS.
+        """
+        if not self._preserve_logprobs_on_timeout:
+            return False
+        # Only in RLOO-N error-classification mode; legacy group-zeroing mode
+        # (classification off) keeps its byte-identical behavior.
+        if not self._error_handling_config.get("enable_error_classification", False):
+            return False
+        agent_result = getattr(result, "agent_result", None)
+        rollout_details = getattr(agent_result, "rollout_details", None)
+        if not rollout_details:
+            return False
+        main = rollout_details[0]
+        if not isinstance(main, dict):
+            return False
+        return bool(main.get("logprobs"))
+
     def _process_trial_result(
         self,
         result: TrialResult | Exception,
@@ -1242,6 +1283,15 @@ class TerminalBenchGenerator(GeneratorInterface):
                 exception_type=exception_type,
             )
 
+        # Preserve-on-soft-timeout state (see _should_preserve_timeout_trajectory).
+        # When set, a POST-generation failure (no verifier reward) does NOT discard
+        # the generated trajectory: we fall through to build it at reward=0 and gate
+        # on TIS-valid logprobs before returning it. Default-off values keep the
+        # non-preserve paths byte-identical.
+        preserve_timeout = False
+        preserve_exclude_from_baseline = False
+        preserve_exception_type: Optional[str] = None
+
         # Check for exception_info - Harbor may return both exception_info AND
         # verifier_result when a trial had an error (e.g., AgentTimeoutError,
         # ContextLengthExceededError) but the verifier still ran.
@@ -1271,8 +1321,20 @@ class TerminalBenchGenerator(GeneratorInterface):
                         f"using verifier reward"
                     )
                     # Fall through to normal processing below
+                elif self._should_preserve_timeout_trajectory(result):
+                    # Passthrough w/o verifier result, but the agent produced a full
+                    # trajectory with logprobs. Keep it at reward=0 (excluded from the
+                    # baseline) instead of discarding, so the RLOO-N group survives.
+                    preserve_timeout = True
+                    preserve_exclude_from_baseline = True
+                    preserve_exception_type = exception_type
+                    logger.info(
+                        f"Trajectory {trajectory_id}: {exception_type} PASSTHROUGH w/o verifier "
+                        f"result — preserving generated logprobs at reward=0 (excluded from baseline)"
+                    )
                 else:
-                    # Passthrough requested but no verifier result — treat as mask
+                    # Passthrough requested but no verifier result and no usable
+                    # generation — treat as mask.
                     logger.warning(
                         f"Trajectory {trajectory_id}: {exception_type} classified as PASSTHROUGH "
                         f"but no verifier result available, masking instead"
@@ -1289,25 +1351,39 @@ class TerminalBenchGenerator(GeneratorInterface):
                     )
             else:
                 exclude_from_baseline = bool(treatment)
-                logger.warning(
-                    f"Trajectory {trajectory_id} failed with Harbor exception: "
-                    f"{exception_info.exception_message if hasattr(exception_info, 'exception_message') else exception_info} "
-                    f"(type={exception_type}, exclude_from_baseline={exclude_from_baseline})"
-                )
-                return TerminalBenchAgentOutput(
-                    response_ids=[0],
-                    reward=0,
-                    stop_reason="error",
-                    loss_mask=[0],
-                    prompt_ids=[0],
-                    trajectory_id=trajectory_id,
-                    exclude_from_baseline=exclude_from_baseline,
-                    exception_type=exception_type,
-                )
+                if self._should_preserve_timeout_trajectory(result):
+                    # POST-generation failure classified ZERO/MASK (e.g.
+                    # VerifierTimeoutError). The agent generated a full trajectory
+                    # with logprobs; keep it at reward=0 with this exclude flag so the
+                    # RLOO-N group is not dropped for all-missing-logprobs.
+                    preserve_timeout = True
+                    preserve_exclude_from_baseline = exclude_from_baseline
+                    preserve_exception_type = exception_type
+                    logger.info(
+                        f"Trajectory {trajectory_id}: {exception_type} (exclude_from_baseline="
+                        f"{exclude_from_baseline}) — preserving generated logprobs at reward=0"
+                    )
+                else:
+                    logger.warning(
+                        f"Trajectory {trajectory_id} failed with Harbor exception: "
+                        f"{exception_info.exception_message if hasattr(exception_info, 'exception_message') else exception_info} "
+                        f"(type={exception_type}, exclude_from_baseline={exclude_from_baseline})"
+                    )
+                    return TerminalBenchAgentOutput(
+                        response_ids=[0],
+                        reward=0,
+                        stop_reason="error",
+                        loss_mask=[0],
+                        prompt_ids=[0],
+                        trajectory_id=trajectory_id,
+                        exclude_from_baseline=exclude_from_baseline,
+                        exception_type=exception_type,
+                    )
 
         # Check for missing verifier result (trial ran but didn't produce valid output)
-        # Note: exception_info is already handled above, so if we reach here it's None
-        if not result.verifier_result:
+        # Note: exception_info is already handled above, so if we reach here it's None.
+        # A preserved timeout trajectory legitimately has no verifier_result -> skip.
+        if not result.verifier_result and not preserve_timeout:
             logger.warning(
                 f"Trajectory {trajectory_id} failed: No verifier result and no exception info. "
                 f"This is unexpected - marking as infrastructure failure."
@@ -1323,9 +1399,11 @@ class TerminalBenchGenerator(GeneratorInterface):
                 exception_type="MissingVerifierResult",
             )
 
-        # Extract data from successful trial
+        # Extract data from successful trial. A preserved timeout trajectory has no
+        # verifier reward -> reward 0.0, but its generated chat_history/logprobs are
+        # extracted exactly like a successful trial.
         try:
-            original_reward = result.verifier_result.rewards["reward"]
+            original_reward = 0.0 if preserve_timeout else result.verifier_result.rewards["reward"]
             chat_history = result.agent_result.metadata["all_messages"]
             summarization_count = result.agent_result.metadata["summarization_count"]
         except (KeyError, AttributeError, TypeError) as e:
@@ -1348,9 +1426,10 @@ class TerminalBenchGenerator(GeneratorInterface):
                 exception_type=exception_type,
             )
 
-        # Apply reward shaping if enabled
+        # Apply reward shaping if enabled. Skipped for a preserved timeout
+        # trajectory (there is no verifier signal to shape; reward stays 0.0).
         reward_components: Optional[Dict[str, float]] = None
-        if self._reward_shaping_config.get("enable_reward_shaping", True):
+        if not preserve_timeout and self._reward_shaping_config.get("enable_reward_shaping", True):
             verifier_stdout = getattr(result.verifier_result, "stdout", None)
             shaper_name = self._reward_shaping_config.get("reward_shaper", "pass_ratio")
             shaper_kwargs = self._reward_shaping_config.get("shaper_kwargs", {})
@@ -1575,6 +1654,33 @@ class TerminalBenchGenerator(GeneratorInterface):
         if response_span_tags is not None:
             response_span_tags = response_span_tags[:max_response_tokens]
 
+        # AUTHORITATIVE TIS-safety gate for a preserved timeout trajectory: keep it
+        # ONLY if it produced length-matched logprobs (one logprob per response
+        # token). Otherwise fall back to the discard stub (current behavior) so a
+        # malformed / length-mismatched artifact is never fed to TIS.
+        if preserve_timeout:
+            if rollout_logprobs is None or len(rollout_logprobs) != len(response_ids):
+                logger.warning(
+                    f"Trajectory {trajectory_id}: {preserve_exception_type} preserve gate FAILED "
+                    f"(rollout_logprobs="
+                    f"{'None' if rollout_logprobs is None else len(rollout_logprobs)} "
+                    f"!= response_ids={len(response_ids)}); discarding for TIS safety"
+                )
+                return TerminalBenchAgentOutput(
+                    response_ids=[0],
+                    reward=0,
+                    stop_reason="error",
+                    loss_mask=[0],
+                    prompt_ids=[0],
+                    trajectory_id=trajectory_id,
+                    exclude_from_baseline=preserve_exclude_from_baseline,
+                    exception_type=preserve_exception_type,
+                )
+            logger.info(
+                f"Trajectory {trajectory_id}: {preserve_exception_type} PRESERVED at reward=0 "
+                f"({len(rollout_logprobs)} logprobs kept, TIS-valid)"
+            )
+
         return TerminalBenchAgentOutput(
             response_ids=response_ids,
             reward=reward,
@@ -1589,4 +1695,6 @@ class TerminalBenchGenerator(GeneratorInterface):
             alignment_stats=alignment_stats,
             token_level_shaping=token_level_shaping,
             response_span_tags=response_span_tags,
+            exclude_from_baseline=preserve_exclude_from_baseline if preserve_timeout else False,
+            exception_type=preserve_exception_type if preserve_timeout else None,
         )

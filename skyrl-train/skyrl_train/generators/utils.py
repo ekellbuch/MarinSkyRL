@@ -1264,6 +1264,51 @@ def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tok
                         cur_token_ids = real_prefix + generated_token_ids + tokens_after_eos
                         spliced = True
 
+            # --- GENERALIZED served-id splice (Fix A, env-gated) — SUPERSET of the
+            # empty-think splice above. Fires PER-TURN whenever the served
+            # completion_token_ids are present AND the re-tokenized turn starts with
+            # the real generation-prompt prefix (``prefix_matches``) — DECOUPLED from
+            # empty-think detection. This closes the residual off-by-1..4 think-block
+            # whitespace divergence that survives the enable_thinking=True root-fix:
+            # under enable_thinking=True ``detect_qwen3_5_empty_think_prefix`` returns
+            # None (so the block above never fires), yet the template still
+            # canonicalizes think-block newlines at re-tok time → re-tok token count
+            # drifts from the served stream → TIS tier-1 exact-by-id match fails →
+            # logprobs zeroed. Here ``generation_prompt_ids`` already matches the
+            # served-stream boundary (get_generation_prompt_ids forwards
+            # chat_template_kwargs), so the served ids ARE exactly the tokens that
+            # followed the generation prompt at rollout time. Using them VERBATIM as
+            # the generated (loss_mask==1) region makes tier-1 exact by construction
+            # (generated_token_ids == served ids) and trains on the exact sampled
+            # tokens. Trailing template tokens (e.g. ``\n`` after the served EOS) are
+            # recovered from the last EOS of the re-tokenized turn, mirroring the
+            # empty-think splice. Fully gated behind SKYRL_TIS_SERVED_ID_SPLICE=1;
+            # with the env unset this entire block is skipped → BYTE-IDENTICAL to the
+            # prior behavior (the empty-think splice above is independently gated by
+            # SKYRL_QWEN3_5_TIS_SPLICE and is untouched here).
+            if (
+                not spliced
+                and os.environ.get("SKYRL_TIS_SERVED_ID_SPLICE") == "1"
+                and prefix_matches
+                and assistant_token_ids is not None
+                and assistant_msg_idx < len(assistant_token_ids)
+            ):
+                served_ids = assistant_token_ids[assistant_msg_idx]
+                if served_ids and isinstance(served_ids, list):
+                    # Recover the trailing template tokens AFTER the served content
+                    # (e.g. ``<|im_end|>\n`` → the ``\n``) from the re-tokenized turn,
+                    # which ends with the SAME trailing template.
+                    if tokenizer.eos_token_id in cur_token_ids:
+                        _le = len(cur_token_ids) - 1 - cur_token_ids[::-1].index(tokenizer.eos_token_id)
+                        trailing = cur_token_ids[_le + 1 :]
+                    else:
+                        trailing = []
+                    prefix_len = len(generation_prompt_ids)
+                    generated_token_ids = list(served_ids)
+                    tokens_after_eos = list(trailing)
+                    cur_token_ids = list(generation_prompt_ids) + generated_token_ids + tokens_after_eos
+                    spliced = True
+
             if not spliced:
                 if not prefix_matches:
                     actual_prefix = cur_token_ids[:prefix_len]

@@ -16,12 +16,18 @@ from skyrl_train.inference_engines.utils import (
 )
 from omegaconf import DictConfig
 import threading
+from collections import OrderedDict
 from loguru import logger
 import random
 import ray.exceptions
 from dataclasses import dataclass, field
 
 ABORT_GENERATION_GRACE_PERIOD_SECONDS = 5
+
+# Cap on the session -> engine memo so it cannot grow unbounded across a long run.
+# Sessions are evicted LRU once the cap is exceeded (a re-appearing evicted session
+# is simply re-assigned by load, which is harmless).
+SESSION_ENGINE_MEMO_MAX_SIZE = 200_000
 
 
 class InferenceEngineClient(InferenceEngineInterface):
@@ -55,6 +61,24 @@ class InferenceEngineClient(InferenceEngineInterface):
         self.http_endpoint_port = full_config.generator.http_endpoint_port
         self.generation_paused_event = threading.Event()
         self._dead_engines: set[int] = set()
+
+        # ---- Load-aware session routing state ----
+        # Per-engine count of requests this client has dispatched but not yet gotten a
+        # response for. Because this client is the SOLE router in front of the engines,
+        # this outstanding count equals (running + waiting) as seen by each engine — a
+        # real-time load signal with no reset-on-read side effect (unlike get_stats(),
+        # which resets each vLLM engine's per-step accumulators that VLLMStatsCallback
+        # depends on). Used for power-of-two-choices balancing of new sessions.
+        self._engine_inflight: List[int] = [0] * len(engines)
+        # session_id (str) -> engine_idx. Populated on a session's FIRST request (load
+        # balanced) and reused for every later turn (sticky, to preserve prefix-cache
+        # reuse). LRU-capped so it cannot grow unbounded. OrderedDict is used as an LRU.
+        self._session_engine_memo: "OrderedDict[str, int]" = OrderedDict()
+        # Guards _engine_inflight and _session_engine_memo. The critical sections hold
+        # no awaits, so this cheap lock keeps the two structures consistent even if the
+        # HTTP endpoint thread and other callers ever touch them concurrently.
+        self._routing_lock = threading.Lock()
+
         if self.enable_http_endpoint:
             self._spin_up_http_endpoint()
 
@@ -88,6 +112,72 @@ class InferenceEngineClient(InferenceEngineInterface):
         if fallback is None:
             raise RuntimeError("All inference engines have died")
         return fallback
+
+    # ----------------------------
+    # Load-aware session routing
+    # ----------------------------
+    def _get_engine_loads(self) -> Optional[List[int]]:
+        """Return a snapshot of per-engine outstanding-request counts, or None if
+        unavailable. None triggers graceful fallback to pure hash routing."""
+        try:
+            return list(self._engine_inflight)
+        except Exception:
+            return None
+
+    def _pick_engine_for_new_session(self, session_key: str) -> int:
+        """Choose an engine for a not-yet-seen session using power-of-two-choices:
+        hash the session to two candidate engines and pick the less loaded of the two.
+
+        Two independent hashes are used so the pair of candidates is well spread; the
+        winner (lower outstanding load) is chosen, with ties broken toward the first
+        candidate so the choice stays deterministic for a given load snapshot. If load
+        info is unavailable, fall back to the original single-hash routing.
+        """
+        n = len(self.engines)
+        if n == 1:
+            return 0
+        c1 = hash_with_sha256(session_key) % n
+        c2 = hash_with_sha256("skyrl-lb:" + session_key) % n
+
+        loads = self._get_engine_loads()
+        if loads is None:
+            # Graceful fallback: behave exactly like the legacy hash routing.
+            return c1
+        # Prefer live engines: if a candidate is dead, treat it as maximally loaded so
+        # the other candidate wins; if both are dead, _resolve_engine_idx handles it.
+        big = float("inf")
+        l1 = big if c1 in self._dead_engines else loads[c1]
+        l2 = big if c2 in self._dead_engines else loads[c2]
+        return c2 if (c2 != c1 and l2 < l1) else c1
+
+    def _route_session(self, session_id: Union[str, int]) -> int:
+        """Return the engine index for `session_id`, load-balancing the FIRST request of
+        a session and returning the same engine (sticky) for every later turn."""
+        key = str(session_id)
+        with self._routing_lock:
+            memo = self._session_engine_memo
+            cached = memo.get(key)
+            if cached is not None:
+                memo.move_to_end(key)  # LRU touch
+                # Keep stickiness, but reroute if the assigned engine has since died.
+                return self._resolve_engine_idx(cached)
+            engine_idx = self._pick_engine_for_new_session(key)
+            engine_idx = self._resolve_engine_idx(engine_idx)
+            memo[key] = engine_idx
+            memo.move_to_end(key)
+            while len(memo) > SESSION_ENGINE_MEMO_MAX_SIZE:
+                memo.popitem(last=False)  # evict least-recently-used
+            return engine_idx
+
+    def _inc_inflight(self, engine_idx: int) -> None:
+        with self._routing_lock:
+            if 0 <= engine_idx < len(self._engine_inflight):
+                self._engine_inflight[engine_idx] += 1
+
+    def _dec_inflight(self, engine_idx: int) -> None:
+        with self._routing_lock:
+            if 0 <= engine_idx < len(self._engine_inflight) and self._engine_inflight[engine_idx] > 0:
+                self._engine_inflight[engine_idx] -= 1
 
     async def _run_on_all_engines(self, method_name: str, *args, **kwargs):
         """
@@ -487,14 +577,23 @@ class InferenceEngineClient(InferenceEngineInterface):
     async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         session_id = request_payload["json"].pop("session_id", None)
         if session_id is None:
-            engine_idx = random.randint(0, len(self.engines) - 1)
+            engine_idx = self._resolve_engine_idx(random.randint(0, len(self.engines) - 1))
         else:
             assert isinstance(session_id, (str, int)), "Session ID must be an integer or string for `/chat/completions`"
-            engine_idx = hash_with_sha256(str(session_id)) % len(self.engines)
-        engine_idx = self._resolve_engine_idx(engine_idx)
+            # Load-balance the FIRST request of this session (power-of-two-choices over
+            # per-engine outstanding load); every later turn of the same session is
+            # sticky to that engine to preserve prefix-cache reuse.
+            engine_idx = self._route_session(session_id)
 
-        # Always use the retry loop which also issues the first request inside
-        return await self._chat_completion_with_retry(engine_idx, request_payload)
+        # Track outstanding load so concurrent sessions balance across engines instead of
+        # hash-pinning onto one. Attributed to the initially chosen engine; the retry loop
+        # may fail over to another engine on death, a rare case we don't re-attribute.
+        self._inc_inflight(engine_idx)
+        try:
+            # Always use the retry loop which also issues the first request inside
+            return await self._chat_completion_with_retry(engine_idx, request_payload)
+        finally:
+            self._dec_inflight(engine_idx)
 
     async def completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -943,6 +1042,9 @@ class InferenceEngineClient(InferenceEngineInterface):
         state = self.__dict__.copy()
         state["_server_thread"] = None
         state["generation_paused_event"] = None
+        # threading.Lock is not picklable; the pickled copy is only used for weight-sync
+        # RPC args and never routes, so dropping the routing lock is safe.
+        state["_routing_lock"] = None
         return state
 
     def _spin_up_http_endpoint(self):

@@ -38,6 +38,11 @@ from skyrl_train.utils.ppo_utils import (
     compute_approx_kl,
     build_think_weighted_loss_mask,
 )
+from skyrl_train.models.layers.moe import (
+    _epdiag_enabled as epdiag_enabled,
+    epdiag_set_phase,
+    epdiag_bump_modelfwd,
+)
 from skyrl_train.workers.worker_utils import BatchIterator, reduce_metrics
 from skyrl_train.dataset.replay_buffer import Experience
 from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
@@ -525,6 +530,14 @@ class Worker(DistributedTorchRayActor):
 
         This is a wrapper around `_forward_micro_batch` that runs in micro batches of `cfg.trainer.micro_forward_batch_size_per_gpu`.
         """
+        # [EPDIAG fwd-op audit] Mark the fwd_logprobs phase + reset the per-phase
+        # MoE.forward / model-forward counters, IN THE WORKER PROCESS (moe.py's
+        # module globals are per-process; the trainer/driver is a different
+        # process, so the phase must be set here where MoE.forward runs). This
+        # wrapper is invoked once per fwd_logprobs_values_reward phase per actor;
+        # each `_forward_micro_batch` below bumps modelfwd. Logging only, EPDIAG-gated.
+        if epdiag_enabled():
+            epdiag_set_phase("fwd_logprobs")
         # WORKER_FORWARD_ENTER instrument (diagnosis-confirmation for the async-dispatch
         # drain fix). The MoE-RL wedge stranded every NON-rank-0 policy shard's `forward`
         # task behind the prior weight-sync coroutine on the async actor's single event
@@ -992,6 +1005,13 @@ class PolicyWorkerBase(Worker):
     def ppo_train(self, train_data: TrainingInputBatch) -> TrainingOutputBatch:
         global_step = train_data.metadata["global_step"]
 
+        # [EPDIAG fwd-op audit] Mark the train phase + reset the per-phase
+        # MoE.forward / model-forward counters, IN THE WORKER PROCESS (see the
+        # note in Worker.forward). Invoked once per train_critic_and_policy phase
+        # per actor; each training_step below bumps modelfwd. Logging only, gated.
+        if epdiag_enabled():
+            epdiag_set_phase("train")
+
         # Per-batch stale_min for StaleClip (None for sync RL, populated for async).
         stale_min = train_data.metadata.get("stale_min")
         # Lazily instantiate spike-mitigation objects on first call.
@@ -1150,6 +1170,9 @@ class PolicyWorkerBase(Worker):
         """
         Perform one micro-batch of training, accumulate gradients, and step the optimizer only after `accumulation_steps` micro-batches.
         """
+        # [EPDIAG fwd-op audit] One model-forward pass (train). Logging only.
+        if epdiag_enabled():
+            epdiag_bump_modelfwd()
         self.model.train()
         experience.to_device(torch.cuda.current_device())
 
@@ -1464,6 +1487,9 @@ class PolicyWorkerBase(Worker):
         )
 
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
+        # [EPDIAG fwd-op audit] One model-forward pass (fwd_logprobs). Logging only.
+        if epdiag_enabled():
+            epdiag_bump_modelfwd()
         device = torch.cuda.current_device()
         micro_batch.to(device)
         self.model.eval()

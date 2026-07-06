@@ -90,10 +90,46 @@ EPCommBackend = Literal["torch", "deepep"]
 # the gate-block + this helper once the mechanism is pinned.
 
 _EPDIAG_FWD_COUNT = 0
+# [EPDIAG fwd-op audit] Per-phase bookkeeping so a raw MoE.forward tally can be
+# read as MoE-forwards-PER-model-forward instead of a single monotonic counter
+# that conflates phases + steps. `_EPDIAG_PHASE` labels the current phase
+# ("fwd_logprobs" / "train"); `_EPDIAG_MODELFWD` counts full model-forward passes
+# in the current phase. Both are RESET by epdiag_set_phase at each phase entry so
+# the emitted `fwd/modelfwd` ratio == MoE-forwards per model-forward, which should
+# be ~= num_MoE_layers if the EP dispatch does not re-drive MoE.forward. All of
+# this is LOGGING ONLY and gated on EPDIAG=1 (zero overhead when off).
+_EPDIAG_PHASE = "?"
+_EPDIAG_MODELFWD = 0
 
 
 def _epdiag_enabled() -> bool:
     return os.environ.get("EPDIAG", "0") in ("1", "true", "True")
+
+
+def epdiag_set_phase(name: str) -> None:
+    """Mark the start of a diagnostic phase and reset the per-phase counters.
+
+    Called (env-gated by the caller) at each phase entry — the policy's
+    fwd_logprobs forward wrapper and its train (ppo_train) wrapper — so the
+    MoE.forward tally (`_EPDIAG_FWD_COUNT`) and the model-forward tally
+    (`_EPDIAG_MODELFWD`) are counted PER phase-invocation, cleanly. Logging only.
+    """
+    global _EPDIAG_PHASE, _EPDIAG_FWD_COUNT, _EPDIAG_MODELFWD
+    _EPDIAG_PHASE = name
+    _EPDIAG_FWD_COUNT = 0
+    _EPDIAG_MODELFWD = 0
+
+
+def epdiag_bump_modelfwd() -> None:
+    """Count one full model-forward pass in the current phase. Logging only.
+
+    Called (env-gated by the caller) at the top of each policy model-forward
+    (the fwd_logprobs `_forward_micro_batch` and the train `training_step`).
+    `_EPDIAG_FWD_COUNT / _EPDIAG_MODELFWD` then reads as MoE-forwards per
+    model-forward (~= num_MoE_layers absent EP re-drive).
+    """
+    global _EPDIAG_MODELFWD
+    _EPDIAG_MODELFWD += 1
 
 
 def _epdiag_decode_coords(rank: int, world: int) -> str:
@@ -184,7 +220,8 @@ def _epdiag_probe(
                 sel_rows = {i: re2d[i].tolist() for i in probe_idx}
 
         print(
-            f"[EPDIAG] ts={ts:.3f} rank={rank}/{world} {coords} fwd={fwd_idx} "
+            f"[EPDIAG] ts={ts:.3f} rank={rank}/{world} {coords} "
+            f"phase={_EPDIAG_PHASE} fwd={fwd_idx} modelfwd={_EPDIAG_MODELFWD} "
             f"r3={r3_active} ntpe_hash={ntpe_hash} ntpe_sum={ntpe_sum} "
             f"ntpe_min={ntpe_min} ntpe_max={ntpe_max} ntpe_argmax={ntpe_argmax} "
             f"sel_fp={sel_fp} sel_n={sel_n} "

@@ -1994,6 +1994,22 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         unfinished_request_ids = list(engine.output_processor.request_states.keys())
         if unfinished_request_ids:
             await engine.abort(unfinished_request_ids)
+            # DRAIN before returning. engine.abort() only marks requests to leave the scheduler at
+            # the NEXT engine step; it neither stops the in-flight decode nor waits for the engine
+            # to go idle. The caller (weight sync) is about to move model params onto the `meta`
+            # device (vLLM layerwise reload). Any decode that steps after this returns would then hit
+            # `_C::rms_norm` on a meta tensor -> hard EngineCore crash under enforce_eager (and a
+            # stale/freed-buffer read under cudagraph replay). So wait for the engine to go idle.
+            # Bounded + fail-loud: a wedged engine surfaces as an error instead of silently
+            # corrupting the reload / hanging the sync.
+            drain_deadline = time.monotonic() + 60.0  # generous ceiling; drains in <1s normally
+            while engine.output_processor.has_unfinished_requests():
+                if time.monotonic() > drain_deadline:
+                    raise RuntimeError(
+                        "abort_generation: engine did not drain within 60s before a weight reload "
+                        "would meta-ize live params (in-flight decode would crash on _C::rms_norm)"
+                    )
+                await asyncio.sleep(0.02)
         await engine.reset_prefix_cache()  # avoid KV-cache pollution
         logger.info(f"abort_generation() finished, aborted {len(unfinished_request_ids)} requests")
 

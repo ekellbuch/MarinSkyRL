@@ -1993,22 +1993,28 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         # Collect all request IDs currently tracked by the scheduler/output processor
         unfinished_request_ids = list(engine.output_processor.request_states.keys())
         if unfinished_request_ids:
-            await engine.abort(unfinished_request_ids)
-            # DRAIN before returning. engine.abort() only marks requests to leave the scheduler at
-            # the NEXT engine step; it neither stops the in-flight decode nor waits for the engine
-            # to go idle. The caller (weight sync) is about to move model params onto the `meta`
-            # device (vLLM layerwise reload). Any decode that steps after this returns would then hit
-            # `_C::rms_norm` on a meta tensor -> hard EngineCore crash under enforce_eager (and a
-            # stale/freed-buffer read under cudagraph replay). So wait for the engine to go idle.
-            # Bounded + fail-loud: a wedged engine surfaces as an error instead of silently
-            # corrupting the reload / hanging the sync.
-            drain_deadline = time.monotonic() + 60.0  # generous ceiling; drains in <1s normally
+            # DRAIN the engine to idle before returning. The caller (weight sync) then moves model
+            # params onto the `meta` device (vLLM layerwise reload); a decode that steps after this
+            # returns would hit `_C::rms_norm` on a meta tensor -> EngineCore crash (enforce_eager)
+            # or a freed-buffer read (cudagraph). engine.abort() -> output_processor.abort_requests()
+            # DIRECTLY pops request_states, so we LOOP (re-snapshot -> re-abort) until idle: a one-shot
+            # abort stalled because stragglers / late arrivals landed after the first snapshot and were
+            # never aborted (the 60s-timeout teardown hit at the 35B weight sync). Re-aborting each
+            # iteration converges. NON-FATAL on the (now-unlikely) 600s deadline: log loudly + proceed
+            # rather than tear down a multi-hour job -- a residual straggler is masked by cudagraph, and
+            # a genuine 600s wedge is already a lost engine that teardown would not recover.
+            drain_deadline = time.monotonic() + 600.0
             while engine.output_processor.has_unfinished_requests():
+                straggler_ids = list(engine.output_processor.request_states.keys())
+                if straggler_ids:
+                    await engine.abort(straggler_ids)
                 if time.monotonic() > drain_deadline:
-                    raise RuntimeError(
-                        "abort_generation: engine did not drain within 60s before a weight reload "
-                        "would meta-ize live params (in-flight decode would crash on _C::rms_norm)"
+                    logger.warning(
+                        "abort_generation: %d requests still unfinished after 600s of draining; "
+                        "proceeding with the weight reload anyway (wedged engine, not a normal drain).",
+                        len(engine.output_processor.request_states),
                     )
+                    break
                 await asyncio.sleep(0.02)
         await engine.reset_prefix_cache()  # avoid KV-cache pollution
         logger.info(f"abort_generation() finished, aborted {len(unfinished_request_ids)} requests")

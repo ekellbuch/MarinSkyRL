@@ -101,6 +101,78 @@ def _build_error_response(message: str, type_phrase: str, code: int) -> Dict[str
     return ErrorResponse(message=message, type=type_phrase, code=code).model_dump()
 
 
+# Guard so the fake/meta registration runs at most once per worker process.
+_NORM_META_FAKES_REGISTERED = False
+
+
+def ensure_norm_meta_fakes_registered() -> None:
+    """Register Meta/fake kernels for vLLM's RMSNorm custom ops (idempotent).
+
+    WHY: the layerwise weight-reload bracket (``skyrl_begin_weight_reload`` ->
+    ``initialize_layerwise_reload``) restores every layer's params/buffers onto
+    the **meta** device, then the CP>1 finalize path materializes those meta
+    tensors and traces ``process_weights_after_loading`` over them. That trace
+    dispatches ``torch.ops._C.rms_norm`` (and its sibling
+    ``fused_add_rms_norm``) with Meta tensors, but the vLLM fork registers those
+    C++ ops for ``torch::kCUDA`` ONLY (csrc/torch_bindings.cpp) — no Meta/fake
+    kernel — so the dispatch dies with:
+      ``NotImplementedError: _C::rms_norm: attempted to run this operator with
+      Meta tensors, but there was no fake impl or Meta kernel registered``
+    which killed all 3 inference engines during ``sync_weights`` on the CP4
+    30B-A3B RL cell (agent_logs/2026-07-07_grid30bc_rmsnorm_meta_sync_weights.md).
+    The CP1 sibling cell never traces these on meta, so it survived — hence this
+    is CP>1-specific.
+
+    Both ops are shape/dtype-preserving in-place normalizations whose C++ schema
+    (torch_bindings.cpp) returns nothing:
+      ``rms_norm(Tensor! result, Tensor input, Tensor weight, float epsilon) -> ()``
+      ``fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor weight, float epsilon) -> ()``
+    The correct fake for a mutating op that returns nothing is a no-op returning
+    ``None`` (identical shape to vLLM's own ``_C::scaled_fp4_quant.out`` fake).
+    This ONLY fires under meta-tensor tracing (the CP>1 sync path); real CUDA
+    execution keeps using the registered CUDA kernel, so numerics/MoE routing are
+    UNCHANGED. Ships via ``--skyrl-ref`` (no gpu-rl image rebuild).
+
+    Called from the weight-reload bracket rather than at import time because the
+    ``_C`` custom-op library is only guaranteed loaded once the vLLM model is
+    built — by the first weight sync ``torch.ops._C.rms_norm`` exists.
+    """
+    global _NORM_META_FAKES_REGISTERED
+    if _NORM_META_FAKES_REGISTERED:
+        return
+
+    _C = getattr(torch.ops, "_C", None)
+    if _C is None:  # vLLM C-extension not loaded yet; try again on the next call.
+        return
+
+    from torch.library import register_fake
+
+    # (name, arg-count) pairs. Fake matches the C++ schema exactly: a mutating op
+    # that returns nothing => the fake returns None (no output tensors to fake).
+    def _rms_norm_fake(result, input, weight, epsilon):  # -> ()
+        return None
+
+    def _fused_add_rms_norm_fake(input, residual, weight, epsilon):  # -> ()
+        return None
+
+    registrations = (
+        ("rms_norm", "_C::rms_norm", _rms_norm_fake),
+        ("fused_add_rms_norm", "_C::fused_add_rms_norm", _fused_add_rms_norm_fake),
+    )
+    for attr, qualname, fake in registrations:
+        if not hasattr(_C, attr):
+            continue  # op not present in this vLLM build; nothing to register.
+        try:
+            register_fake(qualname, fake)
+            logger.info(f"Registered Meta/fake kernel for {qualname} (CP>1 weight-sync fix)")
+        except RuntimeError as e:
+            # A fake already exists (e.g. a future vLLM registers one, or a
+            # sibling engine in-process already ran this) — that's fine, leave it.
+            logger.debug(f"Skipping fake registration for {qualname}: {e}")
+
+    _NORM_META_FAKES_REGISTERED = True
+
+
 @dataclass
 class Logprob:
     logprob: float
@@ -341,6 +413,10 @@ class WorkerWrap:
                 "start_weight_update called while a weight update is already active. "
                 "Call finish_weight_update first."
             )
+        # Register the RMSNorm Meta/fake kernels BEFORE the reload restores layers
+        # to the meta device — the CP>1 finalize path traces _C::rms_norm on those
+        # meta tensors and would otherwise crash (see ensure_norm_meta_fakes_registered).
+        ensure_norm_meta_fakes_registered()
         from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
 
@@ -362,6 +438,9 @@ class WorkerWrap:
         """
         if not getattr(self, "_skyrl_weight_update_active", False):
             raise RuntimeError("skyrl_begin_weight_reload must be called before skyrl_finish_weight_reload.")
+        # Idempotent no-op if begin already registered them; guards the case where
+        # finalize is the first meta-materializing call in this worker.
+        ensure_norm_meta_fakes_registered()
         from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
 

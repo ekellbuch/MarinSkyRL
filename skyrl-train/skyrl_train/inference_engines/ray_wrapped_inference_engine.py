@@ -625,6 +625,23 @@ def create_ray_wrapped_inference_engines(
 
     engines = [RayWrappedInferenceEngine(actor_handle) for actor_handle in inference_engine_actors]
 
+    # Readiness gate (DISAGGREGATED-mode init-deadlock fix): block until every engine
+    # actor has finished loading its model (weights + CUDA-graph capture) BEFORE the
+    # trainer opens the weight-sync NCCL group in init_weight_sync_state. In COLOCATED
+    # mode the sleep barrier below (ray.get(sleep_refs)) already forces this wait; in
+    # DISAGGREGATED mode (inference_engine_enable_sleep=False) nothing otherwise waits,
+    # so a slow-loading engine (e.g. Qwen3.6-35B-A3B MoE) is still inside __init__ when
+    # the policy ranks post the default-group barrier (worker.py) -> the barrier ALLREDUCE
+    # hits the 20-min SKYRL_WORKER_NCCL_TIMEOUT_IN_S watchdog and SIGABRTs the job
+    # (init_weight_sync_state failed at Ray boundary). 30B loads fast enough to win the
+    # race; 35B loses it deterministically. report_engine_hosts fans a collective_rpc
+    # across every engine TP/EP worker, so the ray.get returns only once all workers are
+    # up (model fully loaded) -> closes the race for any model size / load time. It is a
+    # read-only probe (returns hostnames), no side effects. vLLM-only (collective_rpc);
+    # the colocated sleep barrier still covers the sglang/colocated paths unchanged.
+    if not inference_engine_enable_sleep and backend == "vllm":
+        ray.get([engine.inference_engine_actor.report_engine_hosts.remote() for engine in engines])
+
     if inference_engine_enable_sleep:
         if backend == "vllm":
             # NOTE(shu): set to 1 for LoRA

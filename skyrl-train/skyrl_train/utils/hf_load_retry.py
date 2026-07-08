@@ -64,6 +64,24 @@ try:
     _HF_TRANSIENT_EXC = _HF_TRANSIENT_EXC + (_urllib3.exceptions.HTTPError,)
 except Exception:  # noqa: BLE001
     pass
+try:
+    # httpx/httpcore are the transport huggingface_hub uses under the hood. A
+    # mid-download "Server disconnected without sending a response" surfaces as
+    # httpx.RemoteProtocolError (cause: httpcore.RemoteProtocolError) — NOT an
+    # OSError/requests/urllib3 type, so it slipped past the tuple above and killed
+    # a 64-rank 80B FSDP weight load (80b-next-cp1, 2026-07-08). These protocol/
+    # network errors are transient (a dropped keep-alive on one of many shard
+    # HEAD/GET requests) → retry them. ProtocolError is the parent of the *Protocol
+    # variants; both httpx and httpcore expose the same names.
+    import httpx as _httpx  # type: ignore
+    import httpcore as _httpcore  # type: ignore
+
+    _HF_TRANSIENT_EXC = _HF_TRANSIENT_EXC + (
+        _httpx.TransportError,   # base: connect/read/write/protocol/pool errors
+        _httpcore.ProtocolError,
+    )
+except Exception:  # noqa: BLE001
+    pass
 
 
 def is_transient_hf_load_error(exc: BaseException) -> bool:
@@ -101,6 +119,9 @@ def is_transient_hf_load_error(exc: BaseException) -> bool:
                 "connection broken",
                 "remote end closed",
                 "broken pipe",
+                "server disconnected",
+                "disconnected without sending",
+                "peer closed connection",
             )
         ):
             return True

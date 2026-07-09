@@ -1126,13 +1126,24 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     )
     env_vars["TORCH_FR_DUMP_TEMP_FILE"] = _fr_dump_path
     env_vars["TORCH_NCCL_DEBUG_INFO_TEMP_FILE"] = _fr_dump_path
-    # Finite NCCL collective timeout (20 min). Read by
+    # Finite NCCL collective timeout. Read by
     # skyrl_train.utils.constants.SKYRL_WORKER_NCCL_TIMEOUT_IN_S and applied at
     # torch.distributed.init_process_group(timeout=...) in worker.py; the EP /
     # FSDP device-mesh sub-groups inherit this default-PG timeout. Default is
-    # 600s; we raise to 1200s so a stuck EP all-to-all aborts (with a flight
-    # recorder dump) rather than spinning indefinitely.
-    env_vars["SKYRL_WORKER_NCCL_TIMEOUT_IN_S"] = "1200"
+    # 600s; we raise to a 1200s FLOOR so a stuck EP all-to-all aborts (with a
+    # flight recorder dump) rather than spinning indefinitely.
+    # HONOR a larger explicitly-configured value (do NOT clobber it): very large
+    # models (e.g. 80B) can take >20 min to materialize the full CPU state dict on
+    # rank 0 before the FIRST fsdp2_load_full_state_dict broadcast lazily inits the
+    # policy-PG NCCL comm — the non-src ranks then time out on store->get of the
+    # ncclUniqueId at the 1200s cap. A config that sets a higher value (extra_env)
+    # gets it; 1200 stays the floor for configs that don't.
+    _cfg_nccl_timeout = 1200
+    try:
+        _cfg_nccl_timeout = max(1200, int(os.environ.get("SKYRL_WORKER_NCCL_TIMEOUT_IN_S", "1200")))
+    except (TypeError, ValueError):
+        _cfg_nccl_timeout = 1200
+    env_vars["SKYRL_WORKER_NCCL_TIMEOUT_IN_S"] = str(_cfg_nccl_timeout)
 
     # NOTE (charlie): See https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
     # and https://docs.vllm.ai/en/v0.9.2/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues

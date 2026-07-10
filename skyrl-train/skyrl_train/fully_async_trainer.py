@@ -280,6 +280,37 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.mini_batch_size = cfg.trainer.policy_mini_batch_size
         self.max_staleness_steps = cfg.trainer.fully_async.max_staleness_steps
 
+        # Completed-but-unconsumed generation-buffer cap (head-node memory bound).
+        #
+        # WHY THIS KNOB (2026-07-10, 80B head-plasma/RAM overflow root-cause): the
+        # per-epoch buffer below is `asyncio.Queue(maxsize=num_parallel_generation_workers)`.
+        # Each buffered `GeneratedOutputGroup` holds a full `GeneratorOutput` whose
+        # `rollout_routed_experts` (R3) capture is O(response_len · num_moe_layers ·
+        # top_k) per token — for Qwen3-Next-80B (L=48, K=10) that is ~15 MiB/sequence,
+        # ~126 MiB per 8-sample group. With `num_parallel_generation_workers=900` the
+        # buffer alone can pin ~113 GiB of head-node memory (the pre-existing occupancy
+        # that starves the gs1 forward-chunk `ray.put`s — see
+        # agent_logs/2026-07-09_80b_v5_98k_nccl_wedge_kill.md and 48593f42). The buffer
+        # depth is NOT a throughput lever here: generation concurrency is capped by the
+        # inference engines' working set (num_inference_engines · max_num_seqs /
+        # n_samples_per_prompt), NOT by the worker count, so a deep buffer only lets a
+        # stale rollout BACKLOG accumulate (most of which ages past max_staleness_steps
+        # and is discarded at consumption anyway). This knob lets us bound that backlog
+        # WITHOUT reducing worker concurrency.
+        #
+        # Default None => maxsize == num_parallel_generation_workers, i.e. BYTE-IDENTICAL
+        # to today's behavior (no config change => no behavior change). Set it to a small
+        # multiple of the mini-batch (e.g. mini_batch_size · (max_staleness_steps + 1), or
+        # a fixed 128) to cap the footprint to O(1) in async depth. NOTE: when this is set
+        # below num_parallel_generation_workers, up to (num_parallel_generation_workers -
+        # cap) workers may block in `buffer.put(...)` each still holding ONE completed
+        # group, so to fully bound the head-node footprint you should ALSO lower
+        # num_parallel_generation_workers toward the engine working set.
+        self.max_buffered_groups = (
+            OmegaConf.select(cfg, "trainer.fully_async.max_buffered_groups", default=None)
+            or self.num_parallel_generation_workers
+        )
+
         assert (
             # otherwise wasted throughput
             self.mini_batch_size <= self.num_parallel_generation_workers
@@ -627,9 +658,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         for epoch in range(start_epoch, self.cfg.trainer.epochs):
             # 0. Per-epoch prologue. Note that we do not do any cross-epoch asynchrony here.
 
-            # Buffer of completed generation, size bounded by num_parallel_generation_workers.
+            # Buffer of completed generation. Cap defaults to num_parallel_generation_workers
+            # (byte-identical to prior behavior) but can be bounded independently via
+            # trainer.fully_async.max_buffered_groups to cap head-node memory — see
+            # self.max_buffered_groups in __init__.
             generation_output_group_buffer = asyncio.Queue[GeneratedOutputGroup](
-                maxsize=self.num_parallel_generation_workers
+                maxsize=self.max_buffered_groups
             )
 
             # Store buffer ref for checkpoint callback access

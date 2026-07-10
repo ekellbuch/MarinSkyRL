@@ -28,6 +28,11 @@ class RayActor:
     def dummy(self, a, b):
         return
 
+    def get_ray_node_id(self):
+        # Mirror skyrl_train.workers.worker.Worker.get_ray_node_id so the
+        # SKYRL_R3_DECENTRAL path can resolve this actor's node id.
+        return ray.get_runtime_context().get_node_id()
+
 
 class RayActorGroup:
     def __init__(self, num_actors: int):
@@ -84,6 +89,54 @@ def test_mesh_dispatch_with_mixed():
     object_refs[0] = ray.put(None)
     with pytest.raises(AssertionError):
         MeshDispatch.sync_collect(actor_group.actor_infos, object_refs)
+
+
+def _r3_batch():
+    """A batch carrying `rollout_routed_experts` so the resident/decentral R3 path
+    engages (dispatch only decentralizes when the chunk carries R3)."""
+    return TrainingInputBatch(
+        {
+            "a": torch.tensor([1, 2, 3, 4]),
+            # [batch=4, response_len=2, L=3, K=2] int16 (as shipped post-collate).
+            "rollout_routed_experts": torch.arange(4 * 2 * 3 * 2, dtype=torch.int16).reshape(4, 2, 3, 2),
+        }
+    )
+
+
+def test_r3_decentral_byte_identical(monkeypatch):
+    """SKYRL_R3_DECENTRAL=1 must yield BYTE-IDENTICAL collected output to the
+    resident driver-put path (Fix A changes object LOCATION, never VALUE)."""
+    num_actors = 8
+
+    def run(decentral: bool):
+        monkeypatch.setenv("SKYRL_R3_RESIDENT", "1")
+        monkeypatch.setenv("SKYRL_R3_DECENTRAL", "1" if decentral else "0")
+        group = RayActorGroup(num_actors)
+        object_refs = MeshDispatch.dispatch(group.actor_infos, "do_work", _r3_batch())
+        return MeshDispatch.sync_collect(group.actor_infos, object_refs)
+
+    resident = run(decentral=False)
+    decentral = run(decentral=True)
+
+    # "a" collected from dp collection ranks 0..3 (do_work adds self.rank): [1,3,5,7].
+    assert torch.equal(resident["a"], torch.tensor([1, 3, 5, 7]))
+    # Decentral is byte-identical on every key (both "a" and the R3 passthrough).
+    assert set(decentral.keys()) == set(resident.keys())
+    for k in resident.keys():
+        assert torch.equal(decentral[k], resident[k]), f"decentral diverged on key {k}"
+
+
+def test_r3_decentral_off_is_resident_default(monkeypatch):
+    """With DECENTRAL unset/0 but RESIDENT on, behavior is the existing driver-put
+    resident path (no regression, byte-identical to today)."""
+    monkeypatch.setenv("SKYRL_R3_RESIDENT", "1")
+    monkeypatch.delenv("SKYRL_R3_DECENTRAL", raising=False)
+    group = RayActorGroup(8)
+    refs = MeshDispatch.dispatch(group.actor_infos, "do_work", _r3_batch())
+    out = MeshDispatch.sync_collect(group.actor_infos, refs)
+    assert torch.equal(out["a"], torch.tensor([1, 3, 5, 7]))
+    # R3 passes through unchanged.
+    assert out["rollout_routed_experts"].dtype == torch.int16
 
 
 def test_dispatch_registry():

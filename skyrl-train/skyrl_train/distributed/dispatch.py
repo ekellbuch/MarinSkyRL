@@ -9,6 +9,7 @@ import asyncio
 from abc import ABC, abstractmethod
 import ray
 from ray import ObjectRef
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
 import inspect
 from loguru import logger
@@ -87,6 +88,96 @@ def _ray_put_bounded(obj, timeout_s: float, what: str) -> ObjectRef:
     if "exc" in result:
         raise result["exc"]
     return result["ref"]
+
+
+# ---------------------------------------------------------------------------
+# Fix A -- R3 de-centralization (SKYRL_R3_DECENTRAL, default OFF)
+# ---------------------------------------------------------------------------
+#
+# WHY (2026-07-10, 80B head-plasma overflow). The `SKYRL_R3_RESIDENT` fix
+# (ac4b3806) deduped the per-actor R3 fan-out to one `ray.put` per dp-group, but
+# that `ray.put` runs ON THE DRIVER, so the multi-GB `rollout_routed_experts`
+# (R3) chunk still lands in the DRIVER (head-node) plasma and stays PINNED there
+# for the whole ~800s forward (the live `forward.remote()` tasks BORROW the
+# driver-owned object). At 80B (8 dp-groups x ~4.6GB + the async-generation
+# backlog) this overflows the head object store -> the dp=1 put stalls ->
+# DispatchPutTimeoutError at global_step 1 (see
+# agent_logs/2026-07-09_80b_v5_98k_nccl_wedge_kill.md). Prior frameworks
+# (prime-rl / verl / slime) never centralize R3 in the head.
+#
+# WHAT this does. When SKYRL_R3_DECENTRAL=1, the per-dp-group chunk is
+# materialized into the plasma of a CONSUMER (dp-group) NODE instead of the
+# driver: a tiny NodeAffinity-scheduled task runs on that node and RETURNS the
+# chunk unchanged. Ray stores a task's return value in the EXECUTING worker's
+# node object store (the driver owns only the metadata / ref-count, not the
+# bytes). The dp-group's `forward.remote()` calls then borrow a
+# consumer-node-resident object, so the HEAD plasma holds ~0 R3 for the forward's
+# duration. The driver's transient arg copy (the implicit put Ray makes to ship
+# the chunk to the relocate task) is unreferenced the moment that task fetches it
+# (seconds), NOT pinned for the ~800s forward -> head footprint becomes O(1) in
+# model scale.
+#
+# CORRECTNESS. This changes only WHERE the chunk's bytes reside, never the value.
+# The relocate task is a pure pass-through (`return chunk`), so the object the
+# forward actors dereference is byte-identical to the driver-side
+# `ray.put(chunk)` it replaces (same `data.chunk` rows, same Ray serialization).
+# All upstream row / dp / CP / micro-batch alignment (#6335) lives in the collate
+# + chunk path and is inherited UNCHANGED -- exactly the property the
+# SKYRL_R3_RESIDENT fix relied on. Default OFF == today's driver-put behavior for
+# strict A/B isolation.
+#
+# SCOPE (honest). This removes the PINNED driver residency (the wedge cause) but
+# not the driver's TRANSIENT ship of each chunk (the driver still assembles the
+# batch and puts each dp-chunk once to ship it). Eliminating even the transient
+# would require a gen-worker-resident R3 capture rewrite (a dp-chunk's R3 spans
+# many generation workers, so concat+pad+chunk needs driver materialization) that
+# touches the capture->train alignment path -> deferred as a follow-up.
+
+# Per-actor node-id cache: get_ray_node_id is a stable actor property, resolve once.
+_ACTOR_NODE_ID_CACHE: Dict[str, str] = {}
+
+
+@ray.remote(num_cpus=0)
+def _relocate_chunk_to_node(chunk: TrainingInputBatch) -> TrainingInputBatch:
+    """Return `chunk` unchanged; used purely to place the chunk's object-store
+    copy on the executing (dp-group consumer) node rather than the driver.
+
+    Scheduled with NodeAffinity onto a consumer node of the target dp-group. Ray
+    stores a task's return value in the executing worker's node plasma, owned by
+    the caller (driver) but RESIDENT on the consumer node -- so the driver never
+    holds the R3 bytes resident in the head plasma for the forward's duration.
+    `num_cpus=0` so it always schedules on the GPU-saturated training nodes.
+    """
+    return chunk
+
+
+def _resolve_actor_node_id(handle: ActorHandle, timeout_s: float) -> Optional[str]:
+    """Best-effort resolve (and cache) the Ray node id an actor lives on.
+
+    Returns None on any failure/timeout so the caller can fall back to the bounded
+    driver put -- we NEVER want to lose the loud-fail (DispatchPutTimeoutError)
+    property or hang here. `timeout_s <= 0` waits unbounded (matches the disabled
+    dispatch-put bound).
+    """
+    try:
+        key = handle._actor_id.hex()
+    except Exception:  # noqa: BLE001 - non-Worker/handle without a stable id -> no decentral
+        return None
+    if key in _ACTOR_NODE_ID_CACHE:
+        return _ACTOR_NODE_ID_CACHE[key]
+    try:
+        ref = handle.get_ray_node_id.remote()
+        node_id = ray.get(ref, timeout=(timeout_s if timeout_s > 0 else None))
+    except Exception as e:  # noqa: BLE001 - actor lacks the method / call failed / timed out
+        logger.warning(
+            f"SKYRL_R3_DECENTRAL: could not resolve node id for actor {key[:8]} "
+            f"({e!r}); falling back to the bounded driver ray.put for this dp-group."
+        )
+        return None
+    if not isinstance(node_id, str) or not node_id:
+        return None
+    _ACTOR_NODE_ID_CACHE[key] = node_id
+    return node_id
 
 
 @dataclass
@@ -264,26 +355,54 @@ class MeshDispatch(Dispatch):
         # well before the watchdog would otherwise silently wait out the full hour.
         # <=0 disables the bound (byte-identical to today's bare `ray.put()`).
         dispatch_put_timeout_s = float(os.environ.get("SKYRL_DISPATCH_PUT_TIMEOUT_S", "600"))
+        # Fix A (SKYRL_R3_DECENTRAL, default OFF): when the resident path is
+        # engaged, materialize each dp-chunk on a CONSUMER node instead of the
+        # driver plasma. Only meaningful alongside `resident` (it is the R3
+        # transport that overflows the head). See the module-level block above.
+        decentral = resident and os.environ.get("SKYRL_R3_DECENTRAL", "0") == "1"
         chunk_refs: List[Optional[ObjectRef]] = [None] * len(data_chunks)
         for actor_info in actor_infos:
             # index into tensordict to get the correct data to send
             dp = actor_info.rank.dp
             if resident:
-                # ray.put the dp-chunk ONCE; share the single ObjectRef across all
+                # Put the dp-chunk ONCE; share the single ObjectRef across all
                 # actors in this dp-group (no per-actor re-serialization / spill).
                 if chunk_refs[dp] is None:
-                    chunk_refs[dp] = _ray_put_bounded(
-                        data_chunks[dp], dispatch_put_timeout_s, what=f"method={method} dp={dp}"
-                    )
                     _r3 = data_chunks[dp]["rollout_routed_experts"]
                     nbytes = int(_r3.nbytes) if _r3 is not None else 0
-                    # UNGATED per-dp-group marker so we can SEE the resident set
-                    # install (target: one line per dp-group, on every step) and
-                    # confirm the R3 bytes are put once, not per-actor.
-                    logger.info(
-                        f"R3_RESIDENT_SET method={method} dp={dp} nbytes={nbytes} "
-                        f"dtype={_r3.dtype if _r3 is not None else None}"
+                    dtype = _r3.dtype if _r3 is not None else None
+                    node_id = (
+                        _resolve_actor_node_id(actor_info.handle, dispatch_put_timeout_s)
+                        if decentral
+                        else None
                     )
+                    if decentral and node_id is not None:
+                        # Materialize the chunk's object-store copy on a CONSUMER
+                        # node (this actor's node), NOT the driver head plasma.
+                        # Byte-identical value (pure pass-through) -> alignment
+                        # inherited unchanged; head holds ~0 R3 for the forward.
+                        chunk_refs[dp] = _relocate_chunk_to_node.options(
+                            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=True)
+                        ).remote(data_chunks[dp])
+                        # UNGATED per-dp-group marker (distinct from R3_RESIDENT_SET)
+                        # so the smoke test can confirm the DECENTRAL path is taken
+                        # AND that the head-resident R3_RESIDENT_SET put is NOT.
+                        logger.info(
+                            f"R3_DECENTRAL_SET method={method} dp={dp} nbytes={nbytes} "
+                            f"dtype={dtype} node={node_id[:8]}"
+                        )
+                    else:
+                        # Default / fallback: bounded driver-side ray.put (today's
+                        # behavior; keeps the loud DispatchPutTimeoutError on stall).
+                        chunk_refs[dp] = _ray_put_bounded(
+                            data_chunks[dp], dispatch_put_timeout_s, what=f"method={method} dp={dp}"
+                        )
+                        # UNGATED per-dp-group marker so we can SEE the resident set
+                        # install (target: one line per dp-group, on every step) and
+                        # confirm the R3 bytes are put once, not per-actor.
+                        logger.info(
+                            f"R3_RESIDENT_SET method={method} dp={dp} nbytes={nbytes} dtype={dtype}"
+                        )
                 data_to_send = chunk_refs[dp]
             else:
                 data_to_send = data_chunks[dp]

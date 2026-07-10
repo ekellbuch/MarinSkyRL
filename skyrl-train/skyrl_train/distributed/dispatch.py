@@ -1,6 +1,7 @@
 """Defines dispatch and collect logic for distributed training"""
 
 import os
+import threading
 from dataclasses import dataclass
 from ray.actor import ActorHandle
 from typing import List, Tuple, Optional, Dict, Type, Any
@@ -11,6 +12,81 @@ from ray import ObjectRef
 from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
 import inspect
 from loguru import logger
+
+
+class DispatchPutTimeoutError(RuntimeError):
+    """Raised by `_ray_put_bounded` when a dispatch-loop `ray.put()` does not return
+    within `SKYRL_DISPATCH_PUT_TIMEOUT_S` seconds.
+
+    WHY THIS EXISTS (2026-07-10, 80B v4/v5 wedge): `MeshDispatch.dispatch` below is a
+    plain synchronous Python `for` loop calling `ray.put()` inline once per dp-group
+    (the R3-resident-set fix, ac4b3806/6cfee800). It is called *inline* (not via
+    `asyncio.to_thread`) from `Worker.async_run_method` / `async_run_ray_method`
+    (worker.py), so it runs directly on the trainer's own asyncio event-loop thread.
+    Unlike every other blocking primitive in this codebase (NCCL collectives all have
+    an explicit watchdog/heartbeat timeout: SKYRL_WORKER_NCCL_TIMEOUT_IN_S,
+    TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC, VLLM_ROUTED_EXPERTS_SIDE_TIMEOUT_SECONDS,
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS, override_timeout_sec, ...), this `ray.put()`
+    call has NO bound at all: if it stalls (object-store capacity/eviction pressure,
+    a slow/unresponsive R2 spill target, or an object still pinned by a stuck
+    consumer task), the loop never reaches the next dp-group's `ray.put()`, so those
+    dp-groups' actors are NEVER dispatched a `forward.remote()` call at all -- and
+    the failure is invisible until some unrelated downstream watchdog (NCCL
+    heartbeat, hours later) finally fires. See
+    agent_logs/2026-07-09_80b_v5_98k_nccl_wedge_kill.md: the finelog shows
+    `R3_RESIDENT_SET method=forward dp=0` exactly once and dp=1.. never, and the
+    unconditional post-loop `MESH_DISPATCH ... issued forward.remote() to N actors`
+    summary (logged only once every actor_info has been dispatched) never fires even
+    once across the whole 928MB log -- i.e. this loop provably never completes.
+
+    This does NOT claim to fix the underlying trigger (still uncertain -- see the
+    commit message); it converts a silent, multi-hour, whole-job-idle stall into a
+    fast, loud, retryable failure, matching this codebase's dominant "nothing blocks
+    forever without an explicit timeout" idiom.
+    """
+
+
+def _ray_put_bounded(obj, timeout_s: float, what: str) -> ObjectRef:
+    """`ray.put(obj)`, bounded to `timeout_s` seconds.
+
+    `ray.put()` has no native timeout param, so the put runs on a daemon helper
+    thread and this function waits on it with `Thread.join(timeout=...)`. On timeout
+    we raise `DispatchPutTimeoutError` immediately -- we do NOT wait for or cancel
+    the helper thread (Ray gives no cancel API for an in-flight `ray.put()`); the
+    thread is a daemon so it cannot block process exit, and the caller is expected to
+    let the exception propagate and the process restart (the launcher's
+    `--max-retries` already handles this).
+
+    `timeout_s <= 0` disables the bound entirely -> byte-identical to a bare
+    `ray.put(obj)` call (including the exact same exception behavior on failure).
+    """
+    if timeout_s <= 0:
+        return ray.put(obj)
+
+    result: Dict[str, Any] = {}
+
+    def _do_put() -> None:
+        try:
+            result["ref"] = ray.put(obj)
+        except BaseException as e:  # noqa: BLE001 - re-raised on the caller's thread below
+            result["exc"] = e
+
+    t = threading.Thread(target=_do_put, name=f"skyrl-dispatch-put-{what}", daemon=True)
+    t.start()
+    t.join(timeout=timeout_s)
+    if t.is_alive():
+        raise DispatchPutTimeoutError(
+            f"ray.put() for {what} did not return within {timeout_s:.0f}s "
+            f"(SKYRL_DISPATCH_PUT_TIMEOUT_S). This is the dispatch-loop stall signature "
+            f"documented in agent_logs/2026-07-09_80b_v5_98k_nccl_wedge_kill.md: failing "
+            f"loud+fast here instead of hanging silently (previously only surfaced hours "
+            f"later via an unrelated NCCL watchdog, with dp-groups after this one never "
+            f"dispatched at all). The stuck put() keeps running in the background (no "
+            f"cancel API) -- this process should be restarted."
+        )
+    if "exc" in result:
+        raise result["exc"]
+    return result["ref"]
 
 
 @dataclass
@@ -178,6 +254,16 @@ class MeshDispatch(Dispatch):
             and len(data_chunks) > 0
             and "rollout_routed_experts" in data_chunks[0]
         )
+        # Bound on each per-dp-group `ray.put()` below (see `_ray_put_bounded` /
+        # `DispatchPutTimeoutError` docstrings for the full incident writeup). Default
+        # 600s is generous relative to observed local put durations for a single
+        # multi-GB dp-chunk (low single-digit seconds even under object-store
+        # pressure) while still being well inside the existing NCCL/collective
+        # timeout budgets this codebase already uses (SKYRL_WORKER_NCCL_TIMEOUT_IN_S /
+        # TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = 3600s) -- i.e. a stuck put fails loud
+        # well before the watchdog would otherwise silently wait out the full hour.
+        # <=0 disables the bound (byte-identical to today's bare `ray.put()`).
+        dispatch_put_timeout_s = float(os.environ.get("SKYRL_DISPATCH_PUT_TIMEOUT_S", "600"))
         chunk_refs: List[Optional[ObjectRef]] = [None] * len(data_chunks)
         for actor_info in actor_infos:
             # index into tensordict to get the correct data to send
@@ -186,7 +272,9 @@ class MeshDispatch(Dispatch):
                 # ray.put the dp-chunk ONCE; share the single ObjectRef across all
                 # actors in this dp-group (no per-actor re-serialization / spill).
                 if chunk_refs[dp] is None:
-                    chunk_refs[dp] = ray.put(data_chunks[dp])
+                    chunk_refs[dp] = _ray_put_bounded(
+                        data_chunks[dp], dispatch_put_timeout_s, what=f"method={method} dp={dp}"
+                    )
                     _r3 = data_chunks[dp]["rollout_routed_experts"]
                     nbytes = int(_r3.nbytes) if _r3 is not None else 0
                     # UNGATED per-dp-group marker so we can SEE the resident set

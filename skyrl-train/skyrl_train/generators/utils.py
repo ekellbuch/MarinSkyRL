@@ -1104,6 +1104,29 @@ def _re_sentinel_rows(n: int, sentinel_row: Optional[List[List[int]]]) -> List[L
     return [list(sentinel_row) for _ in range(n)]
 
 
+def _tis_splice_enabled() -> bool:
+    """Unified TIS served-id splice policy (deslop stage 2). Default ON.
+
+    Uses vLLM's raw served ``completion_token_ids`` as the generated (loss_mask==1)
+    region so TIS tier-1 exact-by-id alignment holds, closing the residual think-block
+    re-tokenization divergence. The GENERALIZED served-id splice supersedes the
+    qwen3_5 empty-think special case; this single gate arms both blocks (which are
+    mutually exclusive by construction — empty-think fires only when the template
+    renders the empty ``<think></think>``, the generalized path handles the rest).
+
+    Byte-identical for turns whose guards don't match (non-thinking models: the
+    re-tokenized turn already equals the served stream, so splicing is a no-op). The
+    canonical knob is ``SKYRL_TIS_SPLICE``; the two legacy names
+    (``SKYRL_TIS_SERVED_ID_SPLICE``, ``SKYRL_QWEN3_5_TIS_SPLICE``) are still honored as
+    overrides. Set any of them to a falsey value to disable.
+    """
+    for var in ("SKYRL_TIS_SPLICE", "SKYRL_TIS_SERVED_ID_SPLICE", "SKYRL_QWEN3_5_TIS_SPLICE"):
+        val = os.environ.get(var)
+        if val is not None:
+            return val in ("1", "true", "True")
+    return True
+
+
 def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tokenizer, assistant_logprobs=None, custom_chat_template=None, assistant_routed_experts=None, assistant_token_ids=None, alignment_stats: Optional["AlignmentStats"] = None, chat_template_kwargs=None):
     """
     Get the response ids and loss mask from a list of messages.
@@ -1170,10 +1193,10 @@ def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tok
     # re-tokenizing. ``qwen3_5_assistant_prefix_ids`` is the real
     # ``<|im_start|>assistant\n`` prefix (BEFORE the injected empty think block).
     # Returns None for every non-qwen3_5 tokenizer → byte-identical old behavior,
-    # consistent with the aa11512 qwen3_5 arch-gating. Disable via
-    # ``SKYRL_QWEN3_5_TIS_SPLICE=0``.
+    # consistent with the aa11512 qwen3_5 arch-gating. Gated by the unified
+    # ``_tis_splice_enabled()`` policy (default ON; disable via SKYRL_TIS_SPLICE=0).
     qwen3_5_assistant_prefix_ids = None
-    if assistant_token_ids is not None and os.environ.get("SKYRL_QWEN3_5_TIS_SPLICE", "1") in ("1", "true", "True"):
+    if assistant_token_ids is not None and _tis_splice_enabled():
         qwen3_5_assistant_prefix_ids = detect_qwen3_5_empty_think_prefix(tokenizer, generation_prompt_ids)
 
     # 1. Initalize the things to accumulate
@@ -1286,9 +1309,14 @@ def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tok
             # with the env unset this entire block is skipped → BYTE-IDENTICAL to the
             # prior behavior (the empty-think splice above is independently gated by
             # SKYRL_QWEN3_5_TIS_SPLICE and is untouched here).
+            # NOTE (deslop stage 2): gated by the unified _tis_splice_enabled()
+            # policy (default ON — this generalized served-id path SUPERSEDES the
+            # empty-think special case above). Byte-identical for turns whose guards
+            # (prefix_matches + served ids present) don't match, i.e. the common
+            # non-thinking case where re-tok already equals the served stream.
             if (
                 not spliced
-                and os.environ.get("SKYRL_TIS_SERVED_ID_SPLICE") == "1"
+                and _tis_splice_enabled()
                 and prefix_matches
                 and assistant_token_ids is not None
                 and assistant_msg_idx < len(assistant_token_ids)

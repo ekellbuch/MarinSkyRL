@@ -284,6 +284,41 @@ def _cp_moe_no_mask():
         _cp_moe_force_no_mask.active = prev
 
 
+def _model_is_gdn_arch(pretrain_or_model) -> bool:
+    """Best-effort: does this HF model use GatedDeltaNet / linear-attention layers
+    (the Qwen3-Next / Qwen3.6 family) that REQUIRE the pure-torch GDN path because
+    the fla wheel is broken? Reads only the HF config (no weights). Returns False
+    on any error or for a plain dense/full-attention model."""
+    try:
+        cfg = AutoConfig.from_pretrained(pretrain_or_model, trust_remote_code=True)
+    except Exception:
+        return False
+    model_type = str(getattr(cfg, "model_type", "") or "").lower()
+    archs = " ".join(getattr(cfg, "architectures", None) or []).lower()
+    if "qwen3_next" in model_type or "qwen3next" in archs or "qwen3_next" in archs:
+        return True
+    # Qwen3-Next-style configs enumerate per-layer types; a "linear"/GDN entry means
+    # linear-attention layers are present even if the model_type string differs.
+    layer_types = getattr(cfg, "layer_types", None)
+    if layer_types and any("linear" in str(x).lower() for x in layer_types):
+        return True
+    return False
+
+
+def _gdn_mask_fla_enabled(pretrain_or_model) -> bool:
+    """Resolve whether to force the pure-torch GDN path (mask the broken fla wheel).
+
+    Footgun default (deslop stage 2): ON, AUTO-derived from the model arch. The
+    ``SKYRL_GDN_MASK_FLA`` env var is the override (set ``0`` to force off, ``1`` to
+    force on); UNSET auto-enables ONLY for GDN archs (Qwen3-Next), so it is a strict
+    no-op on dense / full-attention models (which never import fla) — byte-identical
+    to today, where dense configs left it unset and GDN configs set it ``1``."""
+    val = os.environ.get("SKYRL_GDN_MASK_FLA")
+    if val is not None:
+        return val in ("1", "true", "True")
+    return _model_is_gdn_arch(pretrain_or_model)
+
+
 class HFModelWrapper(nn.Module):
     """
     Base class for wrapped HF models in reinforcement learning.
@@ -369,8 +404,11 @@ class HFModelWrapper(nn.Module):
             # overlay is mounted, the broken fla-0.5.0 wheel would crash the
             # qwen3_next modeling import — mask fla off BEFORE from_pretrained so
             # transformers uses its pure-torch (or, opt-in, FlashQLA) GDN path.
-            # Gated on SKYRL_GDN_MASK_FLA so non-Qwen3-Next runs are untouched.
-            if os.environ.get("SKYRL_GDN_MASK_FLA", "0") in ("1", "true", "True"):
+            # Footgun default ON, auto-derived from arch (no-op on dense); the
+            # SKYRL_GDN_MASK_FLA env var is the override. Computed ONCE, reused for
+            # the FlashQLA gate below.
+            _gdn_mask = _gdn_mask_fla_enabled(pretrain_or_model)
+            if _gdn_mask:
                 from skyrl_train.models.qwen3_next_gdn import mask_fla
 
                 mask_fla()
@@ -528,7 +566,9 @@ class HFModelWrapper(nn.Module):
             # SKYRL_GDN_FLASHQLA=1 and the fla_tilelang overlay is mounted; rebinds
             # each Qwen3NextGatedDeltaNet.chunk_gated_delta_rule to the fused
             # tilelang kernel. Falls back to pure-torch (warning) if unavailable.
-            if os.environ.get("SKYRL_GDN_MASK_FLA", "0") in ("1", "true", "True"):
+            # Gated on the same resolved GDN-arch decision as mask_fla above
+            # (engage_flashqla is itself a no-op unless SKYRL_GDN_FLASHQLA=1).
+            if _gdn_mask:
                 from skyrl_train.models.qwen3_next_gdn import engage_flashqla
 
                 engage_flashqla(self.model)

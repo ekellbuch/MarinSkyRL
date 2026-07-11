@@ -6,9 +6,24 @@ SKYRL_RAY_PG_TIMEOUT_IN_S = int(os.environ.get("SKYRL_RAY_PG_TIMEOUT_IN_S", 180)
 Timeout for allocating the placement group for different actors in SkyRL
 """
 
-SKYRL_WORKER_NCCL_TIMEOUT_IN_S = int(os.environ.get("SKYRL_WORKER_NCCL_TIMEOUT_IN_S", 600))
+# Canonical worker-NCCL-collective timeout. ONE source of truth for the default
+# and the accessor (was previously divergent: constants default 600 vs utils.py
+# `max(1200, env-or-1200)`). Raised to 1800s (30 min) — the long MoE weight-sync
+# gather + first-step forward on 80B routinely exceeds the old 600s watchdog and
+# SIGABRTs the gang; every live iris config already sets >=1800 so this is a
+# no-op there and only protects a config that forgot the line. Env var is the
+# override (env > default); set it lower for a quick test.
+DEFAULT_WORKER_NCCL_TIMEOUT_IN_S = 1800
+
+
+def get_worker_nccl_timeout_s() -> int:
+    """Resolve the worker NCCL-collective timeout (seconds): env override, else default."""
+    return int(os.environ.get("SKYRL_WORKER_NCCL_TIMEOUT_IN_S", DEFAULT_WORKER_NCCL_TIMEOUT_IN_S))
+
+
+SKYRL_WORKER_NCCL_TIMEOUT_IN_S = get_worker_nccl_timeout_s()
 """
-Timeout for initializing the NCCL process group for the worker, defaults to 10 minutes.
+Timeout for initializing the NCCL process group for the worker, defaults to 30 minutes.
 """
 
 # For some reason the `LD_LIBRARY_PATH` is not exported to the worker with .env file.

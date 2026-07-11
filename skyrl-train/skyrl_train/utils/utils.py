@@ -17,7 +17,13 @@ from ray.util.placement_group import (
     placement_group_table,
 )
 
-from .constants import SKYRL_LD_LIBRARY_PATH_EXPORT, SKYRL_RAY_PG_TIMEOUT_IN_S, SKYRL_PYTHONPATH_EXPORT
+from .constants import (
+    SKYRL_LD_LIBRARY_PATH_EXPORT,
+    SKYRL_RAY_PG_TIMEOUT_IN_S,
+    SKYRL_PYTHONPATH_EXPORT,
+    DEFAULT_WORKER_NCCL_TIMEOUT_IN_S,
+    get_worker_nccl_timeout_s,
+)
 
 
 def policy_strict_spread_eligible(cfg: DictConfig) -> bool:
@@ -1126,23 +1132,20 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     )
     env_vars["TORCH_FR_DUMP_TEMP_FILE"] = _fr_dump_path
     env_vars["TORCH_NCCL_DEBUG_INFO_TEMP_FILE"] = _fr_dump_path
-    # Finite NCCL collective timeout. Read by
-    # skyrl_train.utils.constants.SKYRL_WORKER_NCCL_TIMEOUT_IN_S and applied at
-    # torch.distributed.init_process_group(timeout=...) in worker.py; the EP /
-    # FSDP device-mesh sub-groups inherit this default-PG timeout. Default is
-    # 600s; we raise to a 1200s FLOOR so a stuck EP all-to-all aborts (with a
-    # flight recorder dump) rather than spinning indefinitely.
-    # HONOR a larger explicitly-configured value (do NOT clobber it): very large
-    # models (e.g. 80B) can take >20 min to materialize the full CPU state dict on
-    # rank 0 before the FIRST fsdp2_load_full_state_dict broadcast lazily inits the
-    # policy-PG NCCL comm — the non-src ranks then time out on store->get of the
-    # ncclUniqueId at the 1200s cap. A config that sets a higher value (extra_env)
-    # gets it; 1200 stays the floor for configs that don't.
-    _cfg_nccl_timeout = 1200
+    # Finite NCCL collective timeout, forwarded to the Ray workers. Resolved via
+    # the SINGLE canonical accessor (skyrl_train.utils.constants.
+    # get_worker_nccl_timeout_s: env override, else DEFAULT_WORKER_NCCL_TIMEOUT_IN_S
+    # = 1800). Read back by constants.SKYRL_WORKER_NCCL_TIMEOUT_IN_S and applied at
+    # torch.distributed.init_process_group(timeout=...) in worker.py; the EP / FSDP
+    # device-mesh sub-groups inherit this default-PG timeout. Raised (was constants
+    # default 600 / here a 1200 floor) to 1800 so a stuck EP all-to-all or a slow
+    # 80B first-step forward / rank-0 full-state-dict materialize aborts (with a
+    # flight recorder dump) rather than SIGABRTing on the old watchdog. A config
+    # that sets a larger value (extra_env) gets it — the env var is the override.
     try:
-        _cfg_nccl_timeout = max(1200, int(os.environ.get("SKYRL_WORKER_NCCL_TIMEOUT_IN_S", "1200")))
+        _cfg_nccl_timeout = get_worker_nccl_timeout_s()
     except (TypeError, ValueError):
-        _cfg_nccl_timeout = 1200
+        _cfg_nccl_timeout = DEFAULT_WORKER_NCCL_TIMEOUT_IN_S
     env_vars["SKYRL_WORKER_NCCL_TIMEOUT_IN_S"] = str(_cfg_nccl_timeout)
 
     # NOTE (charlie): See https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445

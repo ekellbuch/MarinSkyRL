@@ -127,10 +127,12 @@ def test_r3_decentral_byte_identical(monkeypatch):
 
 
 def test_r3_decentral_off_is_resident_default(monkeypatch):
-    """With DECENTRAL unset/0 but RESIDENT on, behavior is the existing driver-put
-    resident path (no regression, byte-identical to today)."""
+    """With DECENTRAL=0 but RESIDENT on, behavior is the existing driver-put
+    resident path (no regression, byte-identical to today). NOTE: as of
+    2026-07-11 SKYRL_R3_DECENTRAL defaults to ON, so this test sets =0
+    EXPLICITLY to exercise the off path (was relying on the unset default)."""
     monkeypatch.setenv("SKYRL_R3_RESIDENT", "1")
-    monkeypatch.delenv("SKYRL_R3_DECENTRAL", raising=False)
+    monkeypatch.setenv("SKYRL_R3_DECENTRAL", "0")
     group = RayActorGroup(8)
     refs = MeshDispatch.dispatch(group.actor_infos, "do_work", _r3_batch())
     out = MeshDispatch.sync_collect(group.actor_infos, refs)

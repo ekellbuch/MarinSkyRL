@@ -91,7 +91,7 @@ def _ray_put_bounded(obj, timeout_s: float, what: str) -> ObjectRef:
 
 
 # ---------------------------------------------------------------------------
-# Fix A -- R3 de-centralization (SKYRL_R3_DECENTRAL, default OFF)
+# Fix A -- R3 de-centralization (SKYRL_R3_DECENTRAL, default ON as of 2026-07-11)
 # ---------------------------------------------------------------------------
 #
 # WHY (2026-07-10, 80B head-plasma overflow). The `SKYRL_R3_RESIDENT` fix
@@ -123,8 +123,9 @@ def _ray_put_bounded(obj, timeout_s: float, what: str) -> ObjectRef:
 # `ray.put(chunk)` it replaces (same `data.chunk` rows, same Ray serialization).
 # All upstream row / dp / CP / micro-batch alignment (#6335) lives in the collate
 # + chunk path and is inherited UNCHANGED -- exactly the property the
-# SKYRL_R3_RESIDENT fix relied on. Default OFF == today's driver-put behavior for
-# strict A/B isolation.
+# SKYRL_R3_RESIDENT fix relied on. Set SKYRL_R3_DECENTRAL=0 to force the old
+# driver-put behavior (strict A/B isolation); default is now ON (2026-07-11) so
+# the head-plasma DispatchPutTimeout footgun does not recur at scale.
 #
 # SCOPE (honest). This removes the PINNED driver residency (the wedge cause) but
 # not the driver's TRANSIENT ship of each chunk (the driver still assembles the
@@ -355,11 +356,14 @@ class MeshDispatch(Dispatch):
         # well before the watchdog would otherwise silently wait out the full hour.
         # <=0 disables the bound (byte-identical to today's bare `ray.put()`).
         dispatch_put_timeout_s = float(os.environ.get("SKYRL_DISPATCH_PUT_TIMEOUT_S", "600"))
-        # Fix A (SKYRL_R3_DECENTRAL, default OFF): when the resident path is
+        # Fix A (SKYRL_R3_DECENTRAL, default ON): when the resident path is
         # engaged, materialize each dp-chunk on a CONSUMER node instead of the
         # driver plasma. Only meaningful alongside `resident` (it is the R3
         # transport that overflows the head). See the module-level block above.
-        decentral = resident and os.environ.get("SKYRL_R3_DECENTRAL", "0") == "1"
+        # operator 2026-07-11: default-on to prevent the R3-head-plasma
+        # DispatchPutTimeout footgun (the 80B gs1 forward wedge); set =0 to force
+        # the old centralized driver-put behavior (e.g. for strict A/B isolation).
+        decentral = resident and os.environ.get("SKYRL_R3_DECENTRAL", "1") == "1"
         chunk_refs: List[Optional[ObjectRef]] = [None] * len(data_chunks)
         for actor_info in actor_infos:
             # index into tensordict to get the correct data to send

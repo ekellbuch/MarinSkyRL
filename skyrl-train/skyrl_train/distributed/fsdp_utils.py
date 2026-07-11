@@ -283,9 +283,6 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
         # the real weights on rank 0 and is empty ({}) on the other ranks, which is exactly what
         # broadcast_from_rank0=True expects.
         import os as _os
-        import sys as _sys
-
-        _dbg = _os.environ.get("SKYRL_EP_LOADER_DEBUG", "") == "1"
 
         # ------------------------------------------------------------------
         # STREAMED EP full-state-dict load (80B GPU-0 init OOM fix).
@@ -455,20 +452,9 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
 
             del full_cpu
 
-        if _dbg:
-            print(
-                f"[EP-LOADER-DBG] rank={rank} streamed-load assembled {len(new_sd)} params "
-                f"(chunk_rows={max_rows}); calling load_state_dict(assign=True)",
-                file=_sys.stderr,
-                flush=True,
-            )
-
         # assign=True: params are meta DTensors, replace storage in-place.
         model.load_state_dict(new_sd, assign=True)
         del new_sd
-
-        if _dbg:
-            print(f"[EP-LOADER-DBG] rank={rank} streamed-load returned cleanly", file=_sys.stderr, flush=True)
 
         # Mirror the non-EP path's CPU<->GPU offload dance to keep reserved memory bounded.
         offload_fsdp2_model_to_cpu(model)

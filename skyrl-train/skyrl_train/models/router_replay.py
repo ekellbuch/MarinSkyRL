@@ -34,7 +34,6 @@ experts. The controller is indices-only and model-agnostic.
 
 from __future__ import annotations
 
-import os
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -105,7 +104,6 @@ class RouterReplay:
         # recorded target; False ⇒ fall through to native routing. R3 needs
         # this to skip prompt / pad / sentinel rows.
         self._replay_mask: Optional[torch.Tensor] = None
-        self._debug: bool = os.environ.get("SKYRL_ROUTER_REPLAY_DEBUG") == "1"
 
     @property
     def action(self) -> RouterReplayAction:
@@ -189,18 +187,6 @@ class RouterReplay:
 
         if self._action is not RouterReplayAction.REPLAY:
             return top_indices
-
-        if self._debug:
-            if routing_scores.dim() != 2 or top_indices.dim() != 2:
-                raise AssertionError(
-                    f"router_replay: expected 2D tensors, got routing_scores "
-                    f"{tuple(routing_scores.shape)} and top_indices {tuple(top_indices.shape)}."
-                )
-            if routing_scores.shape[0] != top_indices.shape[0]:
-                raise AssertionError(
-                    f"router_replay: routing_scores / top_indices row count mismatch: "
-                    f"{routing_scores.shape[0]} vs {top_indices.shape[0]}."
-                )
 
         # Strict: every layer position must have a target. A missing target is
         # a real plumbing bug (layer count mismatch, or set_microbatch_targets

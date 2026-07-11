@@ -41,7 +41,6 @@ eager (3a) and grouped (3b) paths.
 
 from __future__ import annotations
 
-import os
 from typing import Literal, Optional
 
 import torch
@@ -60,177 +59,6 @@ from torchtitan.distributed.expert_parallel import expert_parallel
 # Expert-parallel communication backend. "torch" = torchtitan ExpertParallel
 # all_to_all (Stage 4); "deepep" = DeepEP fused dispatch/combine (Stage 5, lazy-imported).
 EPCommBackend = Literal["torch", "deepep"]
-
-
-# --------------------------------------------------------------------------- #
-# [EPDIAG] EP residual-desync diagnostic probe (env-gated, cheap, REMOVABLE)   #
-# --------------------------------------------------------------------------- #
-# References the 2026-06-23 correction: the EP/CP-aware dispatch fix (11556c4)
-# replicated input data across EP-group ranks (EPPROBE 947848: 32->2 unique
-# shards) but the SeqNum=145 ALLTOALL_BASE[128] deadlock in torchtitan's
-# _token_dispatch STILL recurred at ~2:58h (run 948592). That all-to-all is the
-# fixed-size [128] num_tokens_per_expert metadata exchange — it can't desync on
-# shape, only on per-rank ARRIVAL (a straggler) or via a routing/count DIVERGENCE
-# that desyncs the SUBSEQUENT ragged token all-to-all. This probe logs, PER RANK,
-# RIGHT BEFORE self.experts(...) (so it prints even if the all-to-all then hangs):
-#   - a wall-clock time.time() timestamp (to measure the ~382s arrival spread),
-#   - global rank + WORLD_SIZE + decoded (ddp,fsdp,cp,ep) mesh coords,
-#   - the full num_tokens_per_expert vector + a stable hash/sum/min/max/argmax,
-#   - a hash of the routing selected_experts_indices (the histc INPUT),
-#   - whether R3 router-replay was active on this forward + the per-rank fwd index.
-# Reading it across an EP group (same ddp,fsdp,cp; varying ep):
-#   (a) ntpe_hash + sel_hash MATCH but timestamps spread ~382s  -> COMPUTE/arrival
-#       straggler (one rank does more work upstream); NOT a routing problem.
-#   (b) ntpe_hash / sel_hash DIVERGE -> routing produces per-rank-different expert
-#       assignment despite replicated input -> implicates R3 router-replay (does
-#       replay reconstruct identical routing on every rank?) or the CP token-split.
-# Gate: EPDIAG=1. Coord decode reads optional EPDIAG_CP / EPDIAG_EP hints (the
-# FSDP2 mesh is ["ddp","fsdp","cp","ep"], ep-fastest; dp = rank // (sp*cp*ep)).
-# Cheap: a couple of host syncs on a small int vector, only when EPDIAG=1; remove
-# the gate-block + this helper once the mechanism is pinned.
-
-_EPDIAG_FWD_COUNT = 0
-# [EPDIAG fwd-op audit] Per-phase bookkeeping so a raw MoE.forward tally can be
-# read as MoE-forwards-PER-model-forward instead of a single monotonic counter
-# that conflates phases + steps. `_EPDIAG_PHASE` labels the current phase
-# ("fwd_logprobs" / "train"); `_EPDIAG_MODELFWD` counts full model-forward passes
-# in the current phase. Both are RESET by epdiag_set_phase at each phase entry so
-# the emitted `fwd/modelfwd` ratio == MoE-forwards per model-forward, which should
-# be ~= num_MoE_layers if the EP dispatch does not re-drive MoE.forward. All of
-# this is LOGGING ONLY and gated on EPDIAG=1 (zero overhead when off).
-_EPDIAG_PHASE = "?"
-_EPDIAG_MODELFWD = 0
-
-
-def _epdiag_enabled() -> bool:
-    return os.environ.get("EPDIAG", "0") in ("1", "true", "True")
-
-
-def epdiag_set_phase(name: str) -> None:
-    """Mark the start of a diagnostic phase and reset the per-phase counters.
-
-    Called (env-gated by the caller) at each phase entry — the policy's
-    fwd_logprobs forward wrapper and its train (ppo_train) wrapper — so the
-    MoE.forward tally (`_EPDIAG_FWD_COUNT`) and the model-forward tally
-    (`_EPDIAG_MODELFWD`) are counted PER phase-invocation, cleanly. Logging only.
-    """
-    global _EPDIAG_PHASE, _EPDIAG_FWD_COUNT, _EPDIAG_MODELFWD
-    _EPDIAG_PHASE = name
-    _EPDIAG_FWD_COUNT = 0
-    _EPDIAG_MODELFWD = 0
-
-
-def epdiag_bump_modelfwd() -> None:
-    """Count one full model-forward pass in the current phase. Logging only.
-
-    Called (env-gated by the caller) at the top of each policy model-forward
-    (the fwd_logprobs `_forward_micro_batch` and the train `training_step`).
-    `_EPDIAG_FWD_COUNT / _EPDIAG_MODELFWD` then reads as MoE-forwards per
-    model-forward (~= num_MoE_layers absent EP re-drive).
-    """
-    global _EPDIAG_MODELFWD
-    _EPDIAG_MODELFWD += 1
-
-
-def _epdiag_decode_coords(rank: int, world: int) -> str:
-    """Decode (ddp,fsdp,cp,ep) for a global rank given EPDIAG_CP/EPDIAG_EP hints.
-
-    Mirrors worker.py's flat decomposition: inner = sp*cp*ep (sp=1 on the cp/ep
-    config), ep-fastest. dp = rank // inner is the (ddp,fsdp) data-parallel group.
-    Falls back to "ep_group=?" if hints are absent (raw rank still logged)."""
-    try:
-        cp = int(os.environ.get("EPDIAG_CP", "0"))
-        ep = int(os.environ.get("EPDIAG_EP", "0"))
-        if cp <= 0 or ep <= 0:
-            return "coords=?(set EPDIAG_CP,EPDIAG_EP)"
-        sp = int(os.environ.get("EPDIAG_SP", "1")) or 1
-        inner = sp * cp * ep
-        dp = rank // inner  # (ddp,fsdp) data-parallel group index
-        rep = rank % inner  # position within the replicated (sp,cp,ep) block
-        ep_coord = rep % ep
-        cp_coord = (rep // ep) % cp
-        # remaining higher dims (sp / fsdp / ddp) collapse into dp here; dp itself
-        # identifies the (ddp,fsdp) group, which is what an EP group shares.
-        return f"dp_group={dp} cp={cp_coord} ep={ep_coord} (inner={inner})"
-    except Exception as e:  # never let the probe break the forward
-        return f"coords=err({e})"
-
-
-def _epdiag_probe(
-    num_tokens_per_expert: torch.Tensor,
-    selected_experts_indices: torch.Tensor,
-    routed_experts: Optional[torch.Tensor],
-) -> None:
-    """Emit one [EPDIAG] line per rank right before the EP all_to_all. Best-effort."""
-    global _EPDIAG_FWD_COUNT
-    _EPDIAG_FWD_COUNT += 1
-    fwd_idx = _EPDIAG_FWD_COUNT
-    try:
-        import time
-
-        rank = int(os.environ.get("RANK", "-1"))
-        world = int(os.environ.get("WORLD_SIZE", "-1"))
-        coords = _epdiag_decode_coords(rank, world)
-        ts = time.time()
-
-        # Cheap host syncs on small int tensors (only when EPDIAG=1).
-        ntpe = num_tokens_per_expert.detach().to(torch.int64).reshape(-1)
-        ntpe_list = ntpe.tolist()
-        ntpe_sum = int(ntpe.sum().item())
-        ntpe_min = int(ntpe.min().item()) if ntpe.numel() else 0
-        ntpe_max = int(ntpe.max().item()) if ntpe.numel() else 0
-        ntpe_argmax = int(ntpe.argmax().item()) if ntpe.numel() else -1
-        # Order-INDEPENDENT-free stable hash of the count VECTOR (position matters).
-        ntpe_hash = hash(tuple(ntpe_list)) & 0xFFFFFFFF
-
-        # Hash of the routing indices themselves (the histc input) — tests whether
-        # the ROUTING diverges per rank, not just the resulting counts. Sum the raw
-        # int indices into a single scalar fingerprint (cheap, one reduction).
-        sel = selected_experts_indices.detach().reshape(-1).to(torch.int64)
-        sel_fp = int(sel.sum().item())
-        sel_n = int(sel.numel())
-
-        r3_active = "R3replay" if routed_experts is not None else "natural"
-
-        # [EPDIAG2] Degenerate-routing localization (A vs B). The (dp0,cp1) group
-        # collapses all its tokens onto a fixed 8-expert set; the existing fields
-        # only fingerprint that (ntpe_hash / max=63088), they do NOT say WHICH 8
-        # experts nor show the raw forced rows. Add both, cheaply:
-        #   - loaded_experts: the SORTED list of expert IDs that received tokens
-        #     (the non-zero positions of the [128] global histogram). This is the
-        #     A-vs-B tell: {0..7} / sentinel-adjacent (incl. expert 0) => candidate
-        #     A (sentinel/mask collapse); an arbitrary content-dependent 8-set =>
-        #     candidate B (capture/align degenerate row). n_loaded == 8 confirms the
-        #     collapse; >8 = distributed (the non-degenerate groups).
-        #   - sel_rows: a few RAW forced routed_experts rows (the [top_k] sets fed
-        #     into histc) — head rows + a mid row + tail row of this rank's local
-        #     token batch. If every dumped row is the IDENTICAL 8-set => "single
-        #     repeated row" confirmed (and we can read its content); if they vary
-        #     the collapse is statistical not a single replicated row.
-        nz = (ntpe > 0).nonzero().reshape(-1)
-        loaded_experts = nz.tolist()
-        n_loaded = int(nz.numel())
-        sel_rows = "n/a"
-        if routed_experts is not None:
-            re2d = routed_experts.detach().reshape(-1, routed_experts.shape[-1]).to(torch.int64)
-            n_rows = re2d.shape[0]
-            if n_rows > 0:
-                probe_idx = sorted(set([0, 1, 2, n_rows // 2, n_rows - 1] if n_rows > 1 else [0]))
-                probe_idx = [i for i in probe_idx if 0 <= i < n_rows]
-                sel_rows = {i: re2d[i].tolist() for i in probe_idx}
-
-        print(
-            f"[EPDIAG] ts={ts:.3f} rank={rank}/{world} {coords} "
-            f"phase={_EPDIAG_PHASE} fwd={fwd_idx} modelfwd={_EPDIAG_MODELFWD} "
-            f"r3={r3_active} ntpe_hash={ntpe_hash} ntpe_sum={ntpe_sum} "
-            f"ntpe_min={ntpe_min} ntpe_max={ntpe_max} ntpe_argmax={ntpe_argmax} "
-            f"sel_fp={sel_fp} sel_n={sel_n} "
-            f"n_loaded={n_loaded} loaded_experts={loaded_experts} sel_rows={sel_rows} "
-            f"ntpe={ntpe_list}",
-            flush=True,
-        )
-    except Exception as e:  # never let the probe break the forward
-        print(f"[EPDIAG] probe error: {e}", flush=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -268,85 +96,6 @@ def _run_experts_for_loop(
     return out
 
 
-def _grpmm_diag_enabled() -> bool:
-    return os.environ.get("SKYRL_GROUPMM_DIAG", "0") in ("1", "true", "True")
-
-
-def _grpmm_diag(
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w3: torch.Tensor,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
-    offsets: torch.Tensor,
-) -> None:
-    """Emit one [GRPMM] line per rank RIGHT BEFORE the ``torch._grouped_mm`` call.
-
-    Localizes the deterministic ``RuntimeError: matrix batch sizes have to match``
-    crash in the EP8 + DCP=2 + R3 @ 131k geometry: the EP-dispatched per-expert
-    token grouping (``offsets`` = cumsum(``num_tokens_per_expert``)) disagrees with
-    ``w1.shape[0]`` (the LOCAL-expert count after EP+FSDP sharding). ``torch._grouped_mm``
-    requires ``offsets.numel() == w1.shape[0]`` (one offset per weight-stack group).
-
-    The mismatch tell:
-      - ``offsets.numel() - 1`` describes #expert-groups the token side produced
-        (cumsum, exclusive of the implicit 0 start) vs ``offsets.numel()`` groups
-        torch._grouped_mm reads (one per running-sum boundary);
-      - ``w1.shape[0]`` is the #local experts the weight stack holds.
-    If ``offsets.numel() != w1.shape[0]`` the count is off; this dump says which
-    side (token/dispatch vs weight/EP-shard) and by how much. Pure observation —
-    changes no compute. Gate: SKYRL_GROUPMM_DIAG=1. Mirrors the EPDIAG probe style.
-    """
-    try:
-        rank = int(os.environ.get("RANK", "-1"))
-        world = int(os.environ.get("WORLD_SIZE", "-1"))
-        coords = _epdiag_decode_coords(rank, world)
-
-        # EP / mesh hints (same env arm the EPDIAG probe reads).
-        ep = int(os.environ.get("EPDIAG_EP", "0"))
-        cp = int(os.environ.get("EPDIAG_CP", "0"))
-        sp = int(os.environ.get("EPDIAG_SP", "1")) or 1
-        # Configured GLOBAL expert count + expected LOCAL count (num_experts // EP).
-        global_experts = int(os.environ.get("SKYRL_NUM_EXPERTS", "-1"))
-        expected_local = (global_experts // ep) if (ep > 0 and global_experts > 0) else -1
-
-        ntpe = num_tokens_per_expert.detach().to(torch.int64).reshape(-1)
-        ntpe_list = ntpe.tolist()
-        ntpe_numel = int(ntpe.numel())
-        ntpe_sum = int(ntpe.sum().item()) if ntpe_numel else 0
-
-        offs = offsets.detach().to(torch.int64).reshape(-1)
-        offs_list = offs.tolist()
-        offs_numel = int(offs.numel())
-
-        w1_local = int(w1.shape[0])  # == #local experts the weight stack has
-        w1_shape = tuple(w1.shape)
-        w2_shape = tuple(w2.shape) if w2 is not None else None
-        x_shape = tuple(x.shape)
-
-        # ASSERT-style summary: groups the offsets describe vs local experts w1 has.
-        # torch._grouped_mm wants offsets.numel() == w1.shape[0]; the EPDIAG-era
-        # "offsets.numel()-1" framing is the cumsum-with-implicit-0 reading. Dump
-        # both so the supervisor can see which convention is in play.
-        match_strict = "MATCH" if offs_numel == w1_local else f"MISMATCH(off_by={offs_numel - w1_local})"
-        match_minus1 = "MATCH" if (offs_numel - 1) == w1_local else f"MISMATCH(off_by={(offs_numel - 1) - w1_local})"
-
-        print(
-            f"[GRPMM] rank={rank}/{world} {coords} "
-            f"ep={ep} cp={cp} sp={sp} "
-            f"num_experts_global={global_experts} expected_local(num_experts//ep)={expected_local} "
-            f"w1.shape={w1_shape} w1.shape[0]_local_experts={w1_local} "
-            f"w2.shape={w2_shape} x.shape={x_shape} "
-            f"ntpe.numel()={ntpe_numel} ntpe.sum()={ntpe_sum} "
-            f"offsets.numel()={offs_numel} "
-            f"ASSERT offsets.numel()-vs-w1[0]={match_strict} (offsets.numel()-1)-vs-w1[0]={match_minus1} "
-            f"num_tokens_per_expert={ntpe_list} offsets={offs_list}",
-            flush=True,
-        )
-    except Exception as e:  # never let the probe break the forward
-        print(f"[GRPMM] probe error: {e}", flush=True)
-
-
 def _run_experts_grouped_mm_impl(
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -366,14 +115,6 @@ def _run_experts_grouped_mm_impl(
     """
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     assert x.dim() == 2
-    # [GRPMM] env-gated diagnostic: dump per-expert offsets/num_tokens_per_expert
-    # vs the local w1 weight-stack count RIGHT BEFORE torch._grouped_mm (which
-    # raises "matrix batch sizes have to match" when they disagree). No-op unless
-    # SKYRL_GROUPMM_DIAG=1; pure observation, changes no compute. After the
-    # decorator restoration this should print offsets.numel()==w1.shape[0] (==16)
-    # on the torch-EP path (the decorator collapses the 128-wide group counts).
-    if _grpmm_diag_enabled():
-        _grpmm_diag(w1, w2, w3, x, num_tokens_per_expert, offsets)
     h = F.silu(torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets))
     h = h * torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
@@ -807,13 +548,6 @@ class MoE(nn.Module):
             token_indices_experts_sorted,
             num_tokens_per_expert,
         ) = self.reorderer(top_scores, selected_experts_indices)
-
-        # [EPDIAG] EP residual-desync probe: log per-rank num_tokens_per_expert +
-        # routing fingerprint + arrival timestamp RIGHT BEFORE the EP all_to_all
-        # (torchtitan _token_dispatch fires inside self.experts on the EP/torch
-        # path). Env-gated (EPDIAG=1), cheap, removable. See helper above.
-        if _epdiag_enabled():
-            _epdiag_probe(num_tokens_per_expert, selected_experts_indices, routed_experts)
 
         routed_output = self._run_routed_experts(
             x,

@@ -38,11 +38,6 @@ from skyrl_train.utils.ppo_utils import (
     compute_approx_kl,
     build_think_weighted_loss_mask,
 )
-from skyrl_train.models.layers.moe import (
-    _epdiag_enabled as epdiag_enabled,
-    epdiag_set_phase,
-    epdiag_bump_modelfwd,
-)
 from skyrl_train.workers.worker_utils import BatchIterator, reduce_metrics
 from skyrl_train.dataset.replay_buffer import Experience
 from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
@@ -530,14 +525,6 @@ class Worker(DistributedTorchRayActor):
 
         This is a wrapper around `_forward_micro_batch` that runs in micro batches of `cfg.trainer.micro_forward_batch_size_per_gpu`.
         """
-        # [EPDIAG fwd-op audit] Mark the fwd_logprobs phase + reset the per-phase
-        # MoE.forward / model-forward counters, IN THE WORKER PROCESS (moe.py's
-        # module globals are per-process; the trainer/driver is a different
-        # process, so the phase must be set here where MoE.forward runs). This
-        # wrapper is invoked once per fwd_logprobs_values_reward phase per actor;
-        # each `_forward_micro_batch` below bumps modelfwd. Logging only, EPDIAG-gated.
-        if epdiag_enabled():
-            epdiag_set_phase("fwd_logprobs")
         # WORKER_FORWARD_ENTER instrument (diagnosis-confirmation for the async-dispatch
         # drain fix). The MoE-RL wedge stranded every NON-rank-0 policy shard's `forward`
         # task behind the prior weight-sync coroutine on the async actor's single event
@@ -558,51 +545,6 @@ class Worker(DistributedTorchRayActor):
                 f"R3_RESIDENT_SET rank={self._rank} nbytes={int(_r3.nbytes)} "
                 f"dtype={_r3.dtype} shape={tuple(_r3.shape)}"
             )
-        # FSDP-FORWARD UNSHARD FENCE (default OFF -> tensor-value-neutral when on).
-        #
-        # The per-micro-batch loop below issues FSDP2 parameter-unshard all-gathers
-        # over the `mesh_fsdp` shard group with NO collective fence at forward entry
-        # or exit (`_forward_micro_batch` -> `model_wrapper.forward` -> FSDP2
-        # `_pre_forward` unshard). FSDP's unshard is collective over the FSDP shard
-        # group, so EVERY FSDP-group rank must reach the SAME unshard `collective_seq_id`
-        # in lockstep. The per-rank micro-batch COUNT is already identical (the
-        # MeshDispatch split gives equal-sized shards: `len(data) % dp_size == 0` and
-        # group_size is a multiple of dp_size), so the count is NOT the divergence.
-        # The hazard is an UPSTREAM mesh_fsdp `collective_seq_id` SKEW carried into the
-        # forward: the preceding `sync_weights` gather (`broadcast_to_inference_engines`
-        # -> `gather_dtensor_strided_safe` -> `full_tensor()`) issues mesh_fsdp
-        # sub-mesh all-gathers INTERLEAVED with global-default-PG expert all-gathers
-        # and (rank 0 only) the long nranks=N+1 weight Broadcast, with the only barrier
-        # per-yielded-chunk on the DEFAULT PG -- which does NOT order the mesh_fsdp
-        # sub-comm. If any rank's mesh_fsdp seq counter ends up +/-1 vs the group after
-        # that mixed-PG phase, THIS forward's first unshard lands at a different seq on
-        # that rank and the FSDP all-gather desyncs -> the captured CoreWeave MoE hang
-        # (rank 0 alone in `_all_gather_base` seq 614 on mesh_fsdp [0,8,16,24], ranks
-        # 8/16/24 idle; 2026-06-28 FR `rl-q36-35b-w13fix6`). A single CPU/stream barrier
-        # at forward entry re-establishes lockstep entry regardless of any upstream
-        # seq skew. It changes NO tensor values -> correctness/loss-neutral, and is a
-        # strict no-op for single-rank / uninitialized runs. Env-gated for A/B isolation.
-        # NOTE (2026-06-29): default flipped 1 -> 0. The forward-entry fence was
-        # DISPROVEN as the fix for the CoreWeave MoE-RL wedge: FR decode showed the
-        # divergence is UPSTREAM of every line of worker.forward (peers' `forward`
-        # task is never scheduled on the async actor's event loop, so they never reach
-        # this fence), and the a8446a87 fence merely RELOCATED rank 0's lonely hang into
-        # the barrier here. The real fix is the upstream `barrier_all` drain after each
-        # weight-sync (see fully_async_trainer). Keep the code (harmless when off / a
-        # symmetric A/B knob) but default it OFF so it adds no per-forward barrier.
-        if (
-            os.environ.get("SKYRL_FWD_UNSHARD_FENCE", "0") == "1"
-            and self._world_size > 1
-            and torch.distributed.is_initialized()
-        ):
-            # cuda sync first so all PRIOR (weight-sync) mesh_fsdp/default-PG NCCL work
-            # is fully drained on THIS rank before the barrier; then the barrier blocks
-            # forward entry until every rank has likewise drained -> no in-flight
-            # upstream collective can still be racing the forward unshard. (A bare
-            # host-side barrier alone would not order the async NCCL streams.)
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-
         # run in micro batches of cfg.trainer.micro_forward_batch_size_per_gpu
         # TODO (sumanthrh): this can be in the policy/critic impl if the micro batch size can be specific to policy, critic, etc.
         micro_batches = data.chunk(self.cfg.trainer.micro_forward_batch_size_per_gpu)
@@ -1005,13 +947,6 @@ class PolicyWorkerBase(Worker):
     def ppo_train(self, train_data: TrainingInputBatch) -> TrainingOutputBatch:
         global_step = train_data.metadata["global_step"]
 
-        # [EPDIAG fwd-op audit] Mark the train phase + reset the per-phase
-        # MoE.forward / model-forward counters, IN THE WORKER PROCESS (see the
-        # note in Worker.forward). Invoked once per train_critic_and_policy phase
-        # per actor; each training_step below bumps modelfwd. Logging only, gated.
-        if epdiag_enabled():
-            epdiag_set_phase("train")
-
         # Per-batch stale_min for StaleClip (None for sync RL, populated for async).
         stale_min = train_data.metadata.get("stale_min")
         # Lazily instantiate spike-mitigation objects on first call.
@@ -1170,9 +1105,6 @@ class PolicyWorkerBase(Worker):
         """
         Perform one micro-batch of training, accumulate gradients, and step the optimizer only after `accumulation_steps` micro-batches.
         """
-        # [EPDIAG fwd-op audit] One model-forward pass (train). Logging only.
-        if epdiag_enabled():
-            epdiag_bump_modelfwd()
         self.model.train()
         experience.to_device(torch.cuda.current_device())
 
@@ -1487,9 +1419,6 @@ class PolicyWorkerBase(Worker):
         )
 
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
-        # [EPDIAG fwd-op audit] One model-forward pass (fwd_logprobs). Logging only.
-        if epdiag_enabled():
-            epdiag_bump_modelfwd()
         device = torch.cuda.current_device()
         micro_batch.to(device)
         self.model.eval()

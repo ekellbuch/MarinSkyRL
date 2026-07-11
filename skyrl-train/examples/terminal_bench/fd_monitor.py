@@ -90,7 +90,58 @@ def _get_mem_usage() -> tuple:
         return -1, -1, -1, 0.0
 
 
-def _log_status() -> None:
+def _get_cgroup_mem() -> tuple:
+    """Get this container's CGROUP memory current + limit (bytes).
+
+    Added 2026-07-11 for the 80B naive-map policy-node host-RAM OOM: the pod is
+    OOM-killed at the ``--memory`` CGROUP cap (~1303 GiB for ``--memory 1400GB``),
+    which is SMALLER than the node's physical RAM (~2014 GiB). So the
+    ``/proc/meminfo`` node view (``_get_mem_usage``) reads "healthy" (~65% of the
+    node) right up to the kernel cgroup-OOM SIGKILL — it never sees the binding
+    cap. This reads the cgroup's OWN accounting (v2 ``memory.current`` /
+    ``memory.max``, falling back to v1 ``memory.usage_in_bytes`` /
+    ``memory.limit_in_bytes``) so the log shows RSS/usage vs the ACTUAL cap.
+
+    Returns:
+        Tuple of (cur_bytes, max_bytes). ``max_bytes`` is -1 when unlimited
+        ("max" on v2, or a sentinel-huge value on v1). (-1, -1) on any failure.
+    """
+    try:
+        # cgroup v2 (unified hierarchy) — the container sees its own cgroup root.
+        v2_cur = "/sys/fs/cgroup/memory.current"
+        v2_max = "/sys/fs/cgroup/memory.max"
+        if os.path.exists(v2_cur):
+            with open(v2_cur) as f:
+                cur = int(f.read().strip())
+            mx = -1
+            try:
+                with open(v2_max) as f:
+                    raw = f.read().strip()
+                mx = -1 if raw == "max" else int(raw)
+            except Exception:
+                mx = -1
+            return cur, mx
+        # cgroup v1 fallback.
+        v1_cur = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+        v1_max = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+        if os.path.exists(v1_cur):
+            with open(v1_cur) as f:
+                cur = int(f.read().strip())
+            mx = -1
+            try:
+                with open(v1_max) as f:
+                    lim = int(f.read().strip())
+                # v1 "unlimited" is a near-INT64 sentinel; treat >~1 PiB as no cap.
+                mx = -1 if lim > (1 << 50) else lim
+            except Exception:
+                mx = -1
+            return cur, mx
+        return -1, -1
+    except Exception:
+        return -1, -1
+
+
+def _log_status(peaks: dict | None = None) -> None:
     """Log current file descriptor status with the [fd-monitor] prefix."""
     current, soft, hard, percent = _get_fd_usage()
 
@@ -134,8 +185,15 @@ def _log_status() -> None:
         else:
             mlevel = "OK"
         gib = 1048576.0  # KiB per GiB
+        # Track the peak RSS across the process lifetime (the number that matters
+        # for a cgroup-OOM post-mortem — the instantaneous sample rarely catches
+        # the exact pre-kill peak).
+        peak_str = ""
+        if peaks is not None:
+            peaks["rss_kb"] = max(peaks.get("rss_kb", 0), rss_kb)
+            peak_str = f", peak RSS {peaks['rss_kb'] / gib:.2f} GiB"
         print(
-            f"[fd-monitor] [{timestamp}] {mlevel}: RSS {rss_kb / gib:.2f} GiB | "
+            f"[fd-monitor] [{timestamp}] {mlevel}: RSS {rss_kb / gib:.2f} GiB{peak_str} | "
             f"node mem {(total_kb - avail_kb) / gib:.1f}/{total_kb / gib:.1f} GiB used "
             f"({sys_pct:.1f}%), avail {avail_kb / gib:.1f} GiB",
             flush=True,
@@ -147,14 +205,61 @@ def _log_status() -> None:
                 flush=True,
             )
 
+    # CGROUP telemetry — the ACTUAL binding cap on CoreWeave (the `--memory`
+    # limit is smaller than the node's physical RAM, so `node mem` above never
+    # sees the wall that OOM-kills the pod). This is the decisive host-RAM signal
+    # for the 80B GDN-scan policy-node OOM.
+    gib_b = 1073741824.0  # bytes per GiB
+    cg_cur, cg_max = _get_cgroup_mem()
+    if cg_cur >= 0:
+        cg_peak_str = ""
+        if peaks is not None:
+            peaks["cg_cur"] = max(peaks.get("cg_cur", 0), cg_cur)
+            cg_peak_str = f", peak {peaks['cg_cur'] / gib_b:.2f} GiB"
+        if cg_max > 0:
+            cg_pct = cg_cur / cg_max * 100
+            if cg_pct >= 95:
+                clevel = "CRITICAL"
+            elif cg_pct >= 85:
+                clevel = "WARNING"
+            elif cg_pct >= 70:
+                clevel = "INFO"
+            else:
+                clevel = "OK"
+            print(
+                f"[fd-monitor] [{timestamp}] {clevel}: cgroup mem "
+                f"{cg_cur / gib_b:.2f}/{cg_max / gib_b:.2f} GiB ({cg_pct:.1f}% of cap)"
+                f"{cg_peak_str}",
+                flush=True,
+            )
+            if cg_pct >= 85:
+                print(
+                    "[fd-monitor] CGROUP memory pressure HIGH — approaching the "
+                    "--memory cap; OOM-kill imminent (reduce policy ranks/node, "
+                    "GDN scan working set, or n_concurrent_trials)",
+                    flush=True,
+                )
+        else:
+            print(
+                f"[fd-monitor] [{timestamp}] OK: cgroup mem {cg_cur / gib_b:.2f} GiB "
+                f"(no cap){cg_peak_str}",
+                flush=True,
+            )
+
 
 def _run(stop_event: threading.Event, interval: int) -> None:
-    """Background thread loop: log immediately, then every `interval` seconds."""
-    _log_status()
+    """Background thread loop: log immediately, then every `interval` seconds.
+
+    Maintains a per-thread ``peaks`` dict so each sample can report the running
+    peak RSS + peak cgroup usage (the numbers that matter for a cgroup-OOM
+    post-mortem — the instantaneous sample rarely lands on the pre-kill peak).
+    """
+    peaks: dict = {}
+    _log_status(peaks)
     while not stop_event.is_set():
         stop_event.wait(interval)
         if not stop_event.is_set():
-            _log_status()
+            _log_status(peaks)
 
 
 def start_fd_monitor(interval_seconds: int = DEFAULT_FD_MONITOR_INTERVAL) -> threading.Event:

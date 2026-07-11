@@ -699,6 +699,44 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             moe_grouped_gemm=bool(self.cfg.trainer.policy.fsdp_config.get("moe_grouped_gemm", False)),
         )
 
+        self._maybe_start_host_ram_monitor()
+
+    def _maybe_start_host_ram_monitor(self):
+        """Start the periodic host-RAM / cgroup-mem reporter on the POLICY worker.
+
+        Mirrors the fd-monitor already running on the RolloutCoordinator (gen) and
+        the skyrl_entrypoint (head); the policy/training workers were the one path
+        with NO host-RAM telemetry, so a cgroup-OOM there (e.g. the 80B naive-map
+        GDN chunked-scan forward, which host-RAM-OOM'd a policy node at
+        global_step 0) left the peak RAM UNMEASURED. This closes that gap: every
+        policy NODE now emits peak RSS + cgroup mem vs the `--memory` cap.
+
+        Gating (low-overhead, best-effort, never raises into init_model):
+          * ONE rank per node only (``self._local_rank == 0``) — node mem/cgroup
+            is shared across the 8 ranks on a node, so 8x logging would be spam.
+          * env ``SKYRL_POLICY_HOST_RAM_MONITOR`` (default "1"; set "0" to disable).
+          * env ``SKYRL_POLICY_HOST_RAM_MONITOR_INTERVAL`` seconds (default 60 —
+            tighter than the fd-monitor's 120s default so the fast GDN-scan peak
+            is sampled; <=0 disables).
+        """
+        try:
+            if int(os.environ.get("SKYRL_POLICY_HOST_RAM_MONITOR", "1")) == 0:
+                return
+            if getattr(self, "_local_rank", None) != 0:
+                return
+            interval = int(os.environ.get("SKYRL_POLICY_HOST_RAM_MONITOR_INTERVAL", "60"))
+            import socket
+
+            from examples.terminal_bench.fd_monitor import start_fd_monitor
+
+            logger.info(
+                f"[policy-host-ram-monitor] starting on rank={self._rank} "
+                f"host={socket.gethostname()} interval={interval}s"
+            )
+            self._host_ram_monitor_stop = start_fd_monitor(interval)
+        except Exception as e:  # pragma: no cover - best-effort telemetry
+            logger.warning(f"[policy-host-ram-monitor] failed to start: {e}")
+
     async def _save_lora_adapters_and_sync(self, peft_model, lora_sync_path, inference_engine_client):
         """Collect LoRA parameters, save and call inference engine to load."""
         import os

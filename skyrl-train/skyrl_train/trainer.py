@@ -77,6 +77,13 @@ from skyrl_train.callbacks import (
 
 
 class RayPPOTrainer:
+    # Whether this trainer drives the fully-async training loop (overridden True on
+    # FullyAsyncRayPPOTrainer). Gates the DRIVER-side seq_mean_token_sum_norm_global
+    # denominator precompute in train_critic_and_policy: only fully_async needs the
+    # collective moved off the async ppo_train hot path (the 80B gs1 wedge). Sync RL
+    # keeps the legacy in-worker all_reduce (byte-identical).
+    is_fully_async: bool = False
+
     def __init__(
         self,
         cfg: DictConfig,
@@ -1619,6 +1626,26 @@ class RayPPOTrainer:
         # populated alongside the other staleness metrics. Workers treat None
         # as "no signal" and skip damping.
         data.metadata["stale_min"] = self.all_metrics.get("async/staleness_min")
+        # ── Global length-unbiased normalizer (seq_mean_token_sum_norm_global) ──
+        # Precompute the SINGLE global denominator Z on the DRIVER, collective-free, and
+        # stash it in the batch metadata for every policy rank to read (chunk() replicates
+        # metadata to every dp-chunk). This replaces the historical in-ppo_train cross-DP
+        # all_reduce (worker.py), which DEADLOCKS under fully_async + R3-decentral: the 64
+        # policy ranks do NOT co-arrive at ppo_train's top-of-body (staggered R3-chunk
+        # relocation), so the scalar all_reduce over the full policy PG never completes
+        # (the 80B gs1 wedge, NCCL collective #288606 NumelIn=1, py-spy-confirmed at
+        # worker.py's seq_mean_token_sum_norm_global normalizer). Z here is BIT-IDENTICAL
+        # to the old summed-over-ranks value (see ppo_utils.compute_global_loss_denom).
+        # Gated to fully_async so sync RL keeps the exact legacy in-worker all_reduce
+        # (byte-identical); the worker falls back to that path when this key is absent.
+        if self.is_fully_async and self.cfg.trainer.algorithm.loss_reduction == "seq_mean_token_sum_norm_global":
+            actor_infos = self.policy_model.actor_infos
+            ranks_per_dp_group = len(actor_infos) // actor_infos[0].rank.dp_size
+            data.metadata["global_loss_denom"] = ppo_utils.compute_global_loss_denom(
+                data["advantages"],
+                self.cfg.trainer.algorithm.max_seq_len,
+                ranks_per_dp_group,
+            )
         if self.colocate_all:
             if self.critic_model is not None:
                 with Timer("critic_train", self.all_timings):

@@ -324,6 +324,52 @@ def test_validate_cfg_accepts_all_loss_reductions(loss_reduction):
         )
 
 
+def test_global_loss_denom_driver_matches_allreduce_sum():
+    """The DRIVER-side collective-free global loss denominator Z must be BIT-IDENTICAL
+    to the historical in-worker ``all_reduce(sum)`` of per-rank ``local_num_seqs`` over
+    the full policy PG. This is the objective-preservation proof for the 80B gs1 NCCL
+    wedge fix (worker.py seq_mean_token_sum_norm_global normalizer, collective #288606):
+    the fix moves the collective off the async ppo_train hot path to a driver precompute
+    and MUST NOT change Z.
+    """
+    from skyrl_train.utils.ppo_utils import compute_global_loss_denom, count_nonzero_advantage_seqs
+
+    torch.manual_seed(0)
+    max_seq_len = 4096
+    # A range of (world_size, dp_size) mesh geometries, including the 80B
+    # EP8xFSDP8xCP1 = 64-rank shape that hit the wedge.
+    for world_size, dp_size in [(64, 2), (64, 8), (64, 16), (8, 4), (16, 16), (4, 1)]:
+        ranks_per_dp_group = world_size // dp_size
+        # Synthetic full-batch advantages: rows divisible by dp_size, with a deterministic
+        # subset of all-zero rows (excluded / zero-variance) so the nonzero-seq count is
+        # non-trivial and < n_rows.
+        n_rows = dp_size * 5
+        resp_len = 7
+        adv = torch.randn(n_rows, resp_len)
+        adv[::3] = 0.0
+
+        # Reference: emulate the historical per-rank all_reduce(sum). MeshDispatch splits
+        # the full batch into dp_size disjoint row-chunks; every rank in a dp-group holds
+        # the SAME chunk, so summing local counts over ALL world_size ranks ==
+        # ranks_per_dp_group * (per-chunk counts summed over the dp groups).
+        chunks = torch.chunk(adv, dp_size, dim=0)
+        assert len(chunks) == dp_size
+        summed_over_ranks = 0.0
+        for dp in range(dp_size):
+            summed_over_ranks += ranks_per_dp_group * count_nonzero_advantage_seqs(chunks[dp])
+        ref_Z = max(summed_over_ranks, 1.0) * max_seq_len
+
+        # New: driver-side collective-free.
+        new_Z = compute_global_loss_denom(adv, max_seq_len, ranks_per_dp_group)
+
+        assert new_Z == ref_Z, f"(world={world_size}, dp={dp_size}) Z mismatch: {new_Z} != {ref_Z}"
+
+    # All-zero-advantage batch -> clamp(min=1) path still yields a valid denom (matches
+    # the legacy max(global_num_seqs, 1.0) clamp).
+    adv_zero = torch.zeros(8, 5)
+    assert compute_global_loss_denom(adv_zero, max_seq_len, 4) == 1.0 * max_seq_len
+
+
 def test_default_config_declares_global_loss_denom_null():
     """`global_loss_denom` must be DECLARED (default null) in ppo_base_config.yaml.
 

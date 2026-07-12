@@ -996,30 +996,41 @@ class PolicyWorkerBase(Worker):
         )
 
         # ── Global length-unbiased normalizer (seq_mean_token_sum_norm_global only) ──
-        # Compute the SINGLE global denominator Z = global_num_seqs * max_seq_len once,
-        # before the epoch loop, via ONE single-scalar all_reduce(op="sum"). This is the
-        # crux fix for the async/grad-accum size bias: instead of dividing each
-        # micro-batch by accumulation_steps (a count -> mean-of-means), every
-        # micro-batch's masked loss-SUM is divided by this one global denom, so the
-        # realized objective is a single global normalization over the whole DP batch.
+        # Z = global_num_seqs * max_seq_len. The masked per-micro-batch loss-SUM is
+        # divided by this single global denom (instead of a per-microbatch mean-of-means),
+        # so the realized objective is one global normalization over the whole DP batch
+        # (the crux fix for the async/grad-accum size bias).
         #
-        # NCCL-safety (avoids the log-ratio v2/v3 status-dict key-mismatch deadlock):
-        # a single scalar tensor, a fixed code path every rank executes, clamp(min=1)
-        # so a rank with zero non-zero-advantage sequences still contributes a valid
-        # reduce. This is a no-op for every other loss_reduction (gated).
+        # PREFERRED PATH (async-safe): the DRIVER precomputes Z collective-free and passes
+        # it in train_data.metadata["global_loss_denom"] (trainer.train_critic_and_policy,
+        # fully_async). No cross-DP all_reduce fires from inside ppo_train. This is the fix
+        # for the 80B gs1 wedge: under fully_async + R3-decentral the 64 policy ranks do
+        # NOT co-arrive at this top-of-body collective (staggered R3-chunk relocation), so
+        # the historical inline all_reduce over the full policy PG deadlocked (NCCL
+        # collective #288606, ALLREDUCE NumelIn=1). Z is BIT-IDENTICAL to the summed value.
+        #
+        # FALLBACK PATH (metadata key absent -- sync RL / any caller without the driver
+        # precompute): the original per-rank count + single-scalar all_reduce(sum),
+        # BYTE-IDENTICAL to pre-fix. Safe there because sync dispatch co-arrives at
+        # ppo_train. clamp(min=1) so an all-zero-advantage batch still yields a valid
+        # denom. No-op for every other loss_reduction (gated).
         if self.cfg.trainer.algorithm.loss_reduction == "seq_mean_token_sum_norm_global":
-            advantages_all = train_data["advantages"]
-            # Count sequences with a non-zero advantage locally (zero-advantage seqs
-            # -- excluded / k<2 / zero-variance RLOO groups -- contribute no gradient,
-            # so they must not inflate Z).
-            local_num_seqs = float((advantages_all.abs().sum(dim=-1) > 0).sum().item())
-            global_num_seqs = self.strategy.all_reduce(
-                torch.tensor(local_num_seqs, device=torch.cuda.current_device()), op="sum"
-            )
-            global_num_seqs = float(global_num_seqs.item())
-            self.cfg.trainer.algorithm.global_loss_denom = (
-                max(global_num_seqs, 1.0) * self.cfg.trainer.algorithm.max_seq_len
-            )
+            precomputed_denom = train_data.metadata.get("global_loss_denom")
+            if precomputed_denom is not None:
+                self.cfg.trainer.algorithm.global_loss_denom = precomputed_denom
+            else:
+                advantages_all = train_data["advantages"]
+                # Count sequences with a non-zero advantage locally (zero-advantage seqs
+                # -- excluded / k<2 / zero-variance RLOO groups -- contribute no gradient,
+                # so they must not inflate Z).
+                local_num_seqs = float((advantages_all.abs().sum(dim=-1) > 0).sum().item())
+                global_num_seqs = self.strategy.all_reduce(
+                    torch.tensor(local_num_seqs, device=torch.cuda.current_device()), op="sum"
+                )
+                global_num_seqs = float(global_num_seqs.item())
+                self.cfg.trainer.algorithm.global_loss_denom = (
+                    max(global_num_seqs, 1.0) * self.cfg.trainer.algorithm.max_seq_len
+                )
 
         # Clear fragmented GPU memory before training to avoid OOM at step boundaries
         # (matches CriticWorkerBase.ppo_train behavior)

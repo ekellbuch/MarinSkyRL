@@ -1298,6 +1298,42 @@ def reduce_loss(
     return loss
 
 
+def count_nonzero_advantage_seqs(advantages: torch.Tensor) -> float:
+    """Number of sequences (rows) carrying at least one non-zero-advantage token.
+
+    Zero-advantage sequences (excluded / k<2 / zero-variance RLOO groups) contribute
+    no gradient, so they must not inflate the global loss denominator Z.
+
+    BIT-IDENTICAL under any disjoint row partition: each row's ``abs().sum(dim=-1) > 0``
+    is an EXACT all-zero test (a sum of non-negative magnitudes is 0 iff every element
+    is exactly 0 -- no float cancellation possible), independent of device, dtype, and
+    how the rows are chunked across data-parallel ranks. Hence summing this count over
+    disjoint per-rank shards equals computing it once over the full concatenated batch.
+    """
+    return float((advantages.abs().sum(dim=-1) > 0).sum().item())
+
+
+def compute_global_loss_denom(advantages: torch.Tensor, max_seq_len: int, ranks_per_dp_group: int) -> float:
+    """Driver-side, COLLECTIVE-FREE global loss denominator Z for
+    ``seq_mean_token_sum_norm_global``, BIT-IDENTICAL to the historical in-worker
+    ``all_reduce(sum)`` of per-rank ``local_num_seqs`` over the full policy PG.
+
+    Under ``MeshDispatch`` the full batch is split into ``dp_size`` disjoint row-chunks;
+    every rank in a dp-group receives the SAME chunk, so the historical full-PG sum
+    equals ``ranks_per_dp_group * (nonzero-adv count over the full batch)`` -- because
+    the per-chunk counts summed over the dp groups equal the full-batch count
+    (:func:`count_nonzero_advantage_seqs` is partition-invariant). Reproduced here
+    WITHOUT any NCCL collective, so it cannot desync/deadlock under fully_async +
+    R3-decentral (the 80B gs1 wedge at ``worker.py`` ``all_reduce`` #288606 NumelIn=1,
+    where the 64 policy ranks do not co-arrive at ppo_train's top-of-body).
+
+    ``ranks_per_dp_group = world_size // dp_size``. The ``max(., 1.0)`` clamp matches the
+    legacy code so an all-zero-advantage batch still yields a valid (non-zero) denom.
+    """
+    global_num_seqs = ranks_per_dp_group * count_nonzero_advantage_seqs(advantages)
+    return max(global_num_seqs, 1.0) * max_seq_len
+
+
 # NOTE (erictang000): below ported from verl
 @register_advantage_estimator(AdvantageEstimator.REINFORCE_PP)
 def compute_reinforce_plus_plus_outcome_advantage(

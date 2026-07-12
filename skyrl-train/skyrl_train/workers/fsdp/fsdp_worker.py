@@ -22,6 +22,7 @@ from skyrl_train.distributed.fsdp_strategy import FSDPStrategy
 from skyrl_train.utils import get_physical_gpu_id, str_to_torch_dtype
 from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
 from skyrl_train.distributed.fsdp_utils import fsdp_version, get_init_weight_context_manager
+from skyrl_train.distributed import collective_count_diag as _ccdiag
 from skyrl_train.workers.worker import (
     PolicyWorkerBase,
     CriticWorkerBase,
@@ -887,10 +888,16 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         OFF -> byte-identical to the old sync `forward`) or off the event-loop thread
         via `asyncio.to_thread` from the async `forward` entry (flag ON).
         """
+        # Collective-count diagnostic (default OFF): mark this forward region so the
+        # MoE-EP boundary logs only its FIRST all-to-all, and record the default-PG
+        # count BEFORE the root-module unshard all_gather (the gs1 wedge site).
+        _ccdiag.begin_forward_region()
+        _ccdiag.log_phase("forward_impl_enter", rank=self._rank)
         output = super().forward(data)
         # unshard the root FSDP module (https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes)
         if self._world_size > 1 and fsdp_version(self.model.model) == 1:
             self.model.model._handle.reshard(True)
+        _ccdiag.log_phase("forward_impl_exit", rank=self._rank)
         return output
 
     async def forward(
@@ -954,14 +961,21 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         # body). Pre-fix only rank 0 reached the forward; with this fix every dispatched
         # rank's coroutine task is scheduled, so all 32 must log this.
         logger.info(f"WORKER_FORWARD_DISPATCH_RDV rank={self._rank}")
-        if os.environ.get("SKYRL_FORWARD_DISPATCH_FIX", "1") != "1":
-            return self._forward_impl(data)
-        # Yield so this dispatched coroutine is guaranteed a loop turn and is scheduled
-        # even if it arrived while the loop was mid-cycle servicing another coroutine.
-        await asyncio.sleep(0)
-        # Run the heavy sync FSDP forward off the event-loop thread so the blocking
-        # unshard collective cannot re-occupy the loop (head-of-line-block a peer).
-        return await asyncio.to_thread(self._forward_impl, data)
+        # Collective-count diagnostic (default OFF): bracket the whole forward so a
+        # per-rank default-PG count is logged at entry AND exit — the enter/exit diff
+        # localizes an EP-group that issues an extra/fewer default-PG collective.
+        _ccdiag.log_phase("forward_enter", rank=self._rank)
+        try:
+            if os.environ.get("SKYRL_FORWARD_DISPATCH_FIX", "1") != "1":
+                return self._forward_impl(data)
+            # Yield so this dispatched coroutine is guaranteed a loop turn and is scheduled
+            # even if it arrived while the loop was mid-cycle servicing another coroutine.
+            await asyncio.sleep(0)
+            # Run the heavy sync FSDP forward off the event-loop thread so the blocking
+            # unshard collective cannot re-occupy the loop (head-of-line-block a peer).
+            return await asyncio.to_thread(self._forward_impl, data)
+        finally:
+            _ccdiag.log_phase("forward_exit", rank=self._rank)
 
 
 class FSDPCriticWorkerBase(CriticWorkerBase):

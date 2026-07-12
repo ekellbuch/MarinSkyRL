@@ -1,8 +1,14 @@
 name: SkyRL-GPU-E2E-CI
 
 on:
-  schedule:
-    - cron: '5 8 * * *'   # Every day at 08:05 UTC (~00:05 PST / ~01:05 PDT)
+  # ⚠ DAILY SCHEDULE DISABLED 2026-07-12 — the `Basic convergence test` `anyscale job submit`s to
+  # UPSTREAM SkyRL's Anyscale account, which the marin-community/MarinSkyRL fork has no ANYSCALE_CLI_TOKEN
+  # for → every scheduled run fast-failed (~30s) at CLI auth (40+ consecutive red X's since ~2026-06-06,
+  # never reaching any SkyRL code). RESTORE this cron once Marin CI is ready to substitute (a Marin-owned
+  # GPU-E2E: fork Anyscale creds set, or a Marin-cluster runner). Manual runs still work via
+  # workflow_dispatch. (Details: OT-Agent .claude/projects/marinskyrl/marinskyrl.md §CI.)
+  # schedule:
+  #   - cron: '5 8 * * *'   # Every day at 08:05 UTC (~00:05 PST / ~01:05 PDT)
   workflow_dispatch:
 
 permissions:

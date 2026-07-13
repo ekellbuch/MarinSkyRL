@@ -166,6 +166,8 @@ class TerminalBenchGenerator(GeneratorInterface):
         inference_engine_client: InferenceEngineClient,
         tokenizer,
         moe_router_replay: bool = False,
+        use_tis: bool = False,
+        tito_full: Optional[bool] = None,
     ):
         """
         Args:
@@ -177,12 +179,22 @@ class TerminalBenchGenerator(GeneratorInterface):
                 Harbor rollout_details and plumb them through to the training batch
                 (Stage 1 of the FSDP2 EP/router-replay port). Default False keeps the
                 GeneratorOutput byte-identical to today.
+            use_tis: ``trainer.algorithm.use_tis`` — whether Truncated Importance
+                Sampling is on. Full-TITO rollout assembly AUTO-defaults to this
+                (see ``tito_full`` and generators/utils.py::_tito_full_enabled).
+            tito_full: ``trainer.algorithm.tito_full`` — explicit full-TITO override.
+                None = auto (default to ``use_tis``); True/False = force. The env var
+                ``SKYRL_TITO_FULL`` still wins over both. Default None.
         """
         self.base_url = f"http://{generator_cfg.http_endpoint_host}:{generator_cfg.http_endpoint_port}"
         self.generator_cfg = generator_cfg
         self.tokenizer = tokenizer
         self.model_name = generator_cfg.model_name
         self._moe_router_replay = moe_router_replay
+        # Full-TITO rollout assembly resolution inputs (see _tito_full_enabled):
+        # env SKYRL_TITO_FULL wins; else explicit tito_full; else auto -> use_tis.
+        self._use_tis = bool(use_tis)
+        self._tito_full = tito_full
 
         # Core terminal bench config
         self.trials_dir = terminal_bench_cfg.trials_dir
@@ -1584,6 +1596,8 @@ class TerminalBenchGenerator(GeneratorInterface):
                 alignment_stats=alignment_stats,
                 chat_template_kwargs=self._chat_template_kwargs,
                 assistant_prompt_token_ids=assistant_prompt_token_ids,
+                use_tis=self._use_tis,
+                tito_full=self._tito_full,
             )
         else:
             response_ids, loss_mask, rollout_logprobs = get_response_ids_and_loss_mask_from_messages(
@@ -1595,6 +1609,8 @@ class TerminalBenchGenerator(GeneratorInterface):
                 alignment_stats=alignment_stats,
                 chat_template_kwargs=self._chat_template_kwargs,
                 assistant_prompt_token_ids=assistant_prompt_token_ids,
+                use_tis=self._use_tis,
+                tito_full=self._tito_full,
             )
 
         # Determine stop reason

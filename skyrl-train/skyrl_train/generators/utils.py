@@ -1204,8 +1204,8 @@ def _tis_splice_enabled() -> bool:
     return True
 
 
-def _tito_full_enabled() -> bool:
-    """Full token-in-token-out assembly policy (default OFF).
+def _tito_full_enabled(use_tis: bool = False, tito_full: Optional[bool] = None) -> bool:
+    """Full token-in-token-out assembly policy — AUTO-defaults to ``use_tis``.
 
     When ON *and* Harbor's per-turn ``prompt_token_ids`` are available, the
     trajectory ``response_ids`` / ``loss_mask`` / ``rollout_logprobs`` are assembled
@@ -1218,14 +1218,24 @@ def _tito_full_enabled() -> bool:
     residual BPE-boundary re-tokenization drift of prior assistant turns fed back as
     text (Stage 0 catalogue).
 
-    Default OFF ⇒ every existing code path is untouched (byte-identical). The knob is
-    ``SKYRL_TITO_FULL`` (set to a truthy value to enable). Mirrors the EP/CP/splice
-    flag-off byte-identical scaffold discipline.
+    Resolution precedence (params come from the caller's cfg — no globals):
+      1. ``SKYRL_TITO_FULL`` env var — if set, WINS (quick override / testing escape
+         hatch). Truthy ⇒ ON, else OFF.
+      2. else the EXPLICIT config flag ``tito_full`` (``trainer.algorithm.tito_full``)
+         — if not ``None`` (an explicit True/False), use it verbatim.
+      3. else (auto / unset) — DEFAULT TO ``use_tis`` (``trainer.algorithm.use_tis``):
+         TITO-full ON whenever TIS is on, OFF otherwise.
+
+    Non-TIS byte-identical guarantee: ``use_tis=False`` with no explicit flag/env ⇒
+    returns ``False`` ⇒ every existing code path untouched (``torch.equal``). Mirrors
+    the EP/CP/splice flag-off byte-identical scaffold discipline.
     """
     val = os.environ.get("SKYRL_TITO_FULL")
     if val is not None:
         return val in ("1", "true", "True")
-    return False
+    if tito_full is not None:
+        return bool(tito_full)
+    return bool(use_tis)
 
 
 def _normalize_candidate_logprobs(candidate_logprobs):
@@ -1408,7 +1418,7 @@ def _assemble_response_ids_tito_full(
     return response_ids, loss_mask, rollout_logprobs, rollout_routed_experts
 
 
-def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tokenizer, assistant_logprobs=None, custom_chat_template=None, assistant_routed_experts=None, assistant_token_ids=None, alignment_stats: Optional["AlignmentStats"] = None, chat_template_kwargs=None, assistant_prompt_token_ids=None):
+def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tokenizer, assistant_logprobs=None, custom_chat_template=None, assistant_routed_experts=None, assistant_token_ids=None, alignment_stats: Optional["AlignmentStats"] = None, chat_template_kwargs=None, assistant_prompt_token_ids=None, use_tis: bool = False, tito_full: Optional[bool] = None):
     """
     Get the response ids and loss mask from a list of messages.
 
@@ -1471,7 +1481,7 @@ def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tok
     # served. Fails loud → None → falls through to the re-tok + splice path below
     # (byte-identical), so a malformed capture never yields a wrong sequence. Default
     # OFF ⇒ this block is skipped entirely (byte-identical to prior behavior).
-    if _tito_full_enabled() and assistant_prompt_token_ids is not None and assistant_token_ids is not None:
+    if _tito_full_enabled(use_tis=use_tis, tito_full=tito_full) and assistant_prompt_token_ids is not None and assistant_token_ids is not None:
         _tito = _assemble_response_ids_tito_full(
             messages,
             tokenizer,

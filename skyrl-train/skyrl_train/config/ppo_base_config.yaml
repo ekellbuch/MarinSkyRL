@@ -96,6 +96,7 @@ trainer:
       moe_token_dispatcher_type: "alltoall"  # "alltoall" | "deepep"
       moe_router_replay: false             # R3 rollout-routing replay; off = unchanged forward
       moe_grouped_gemm: false              # Stage 3b: swap HF eager MoE for grouped-GEMM (EP=1); off = HF eager untouched
+      use_grouped_mm: false                # runtime grouped-mm MoE swap (fsdp_worker reader, config-driven); off = HF eager untouched
       ep_comm_backend: "torch"             # "torch" | "deepep"; torch = no NVSHMEM dependency
       deepep_num_sms: 20                    # Stage 5: SMs for DeepEP dispatch/combine kernels (deepep backend only)
       deepep_token_chunk_size: null         # Stage 5: tokens per DeepEP dispatch chunk; null = whole batch
@@ -126,6 +127,7 @@ trainer:
       moe_token_dispatcher_type: "alltoall"
       moe_router_replay: false
       moe_grouped_gemm: false
+      use_grouped_mm: false                # runtime grouped-mm MoE swap (fsdp_worker reader, config-driven); off = HF eager untouched
       ep_comm_backend: "torch"
       deepep_num_sms: 20
       deepep_token_chunk_size: null
@@ -163,6 +165,7 @@ trainer:
       moe_token_dispatcher_type: "alltoall"
       moe_router_replay: false
       moe_grouped_gemm: false
+      use_grouped_mm: false                # runtime grouped-mm MoE swap (fsdp_worker reader, config-driven); off = HF eager untouched
       ep_comm_backend: "torch"
       deepep_num_sms: 20
       deepep_token_chunk_size: null
@@ -219,6 +222,15 @@ trainer:
     # Truncated Importance Sampling as proposed in https://fengyao.notion.site/off-policy-rl
     tis_imp_ratio_cap: -1.0
     use_tis: false
+    # Full token-in-token-out rollout assembly (consume Harbor per-turn
+    # prompt_token_ids so the multi-turn MASKED context is assembled from the exact
+    # served ids, no re-tokenization). Resolution precedence (see
+    # generators/utils.py::_tito_full_enabled): (1) env SKYRL_TITO_FULL wins if set;
+    # (2) this explicit flag if non-null (true/false); (3) else AUTO -> defaults to
+    # `use_tis` (TITO-full ON whenever TIS is on, OFF otherwise). null = auto.
+    # Validated flag-on == flag-off byte-identical + policy-invariant on replay
+    # traces; routed_experts stay on the existing aligner (R3 exact-by-id deferred).
+    tito_full: null
     # Loop-behavior reward shaping (Stage B / F5 + F4): master gate for the
     # per-token shaping channel (token_level_shaping) + span tags
     # (response_span_tags). Default false -> the trainer never pulls these from the

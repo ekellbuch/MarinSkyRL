@@ -37,6 +37,8 @@ class TerminalBenchGenerateExp(BasePPOExp):
             moe_router_replay=bool(
                 cfg.trainer.policy.fsdp_config.get("moe_router_replay", False)
             ),
+            use_tis=bool(cfg.trainer.algorithm.get("use_tis", False)),
+            tito_full=cfg.trainer.algorithm.get("tito_full", None),
         )
 
     def _setup_generator(self):

@@ -1264,15 +1264,26 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
             logger.info(f"Exporting `{_net_env}` to ray runtime env: {os.environ[_net_env]}")
             env_vars[_net_env] = os.environ[_net_env]
 
-    # Diagnostic NCCL verbosity override (Option A flight-recorder relaunch).
-    # FORCE NCCL_DEBUG=INFO / NCCL_DEBUG_SUBSYS=COLL,INIT,P2P here, AFTER the
-    # passthrough loop above, so they win over the launcher env. The OT-Agent
-    # launcher (hpc.py) exports NCCL_DEBUG=WARN, which the loop would otherwise
-    # copy into env_vars and suppress the per-collective INIT/COLL/P2P trace we
-    # need to localize the 80B EP all-to-all backward deadlock (job 673119).
-    # Setting them last is the surgical override.
-    env_vars["NCCL_DEBUG"] = "INFO"
-    env_vars["NCCL_DEBUG_SUBSYS"] = "COLL,INIT,P2P"
+    # NCCL verbosity: default to WARN for EVERY Ray worker in this job. This
+    # env_vars dict is the ray.init() job-level runtime_env (see initialize_ray),
+    # which is the ONLY env the vLLM inference-engine actors -- and the
+    # EngineCore/TP-worker subprocesses they spawn -- inherit. Those TP workers run
+    # the per-collective rollout weight-broadcast / AllGather / AllReduce NCCL ops,
+    # so if this is INFO the rank-0 log is drowned in `(AsyncVLLMInferenceEngine
+    # ...) NCCL INFO` chatter. The passthrough loop above already copied NCCL_DEBUG
+    # from the launcher/config env (the iris configs set `NCCL_DEBUG: WARN` in
+    # extra_env) into env_vars; here we only FILL IN WARN when nothing set it, so an
+    # explicit launcher/config value still wins (precedence: extra_env > this
+    # default). WARN keeps the NCCL flight recorder (TORCH_NCCL_DUMP_ON_TIMEOUT +
+    # TORCH_FR_BUFFER_SIZE, set above) fully armed -- a genuine hang still dumps the
+    # stuck-collective trace.
+    #
+    # (Historic: commit 5220e112 FORCED NCCL_DEBUG=INFO / NCCL_DEBUG_SUBSYS here to
+    # localize a one-off 80B EP all-to-all backward deadlock (job 673119). That
+    # per-collective INFO flood is exactly the spam we now suppress. To re-enable
+    # the trace for a diagnostic run, set NCCL_DEBUG=INFO (+ NCCL_DEBUG_SUBSYS) in
+    # the config's extra_env -- the passthrough loop above forwards both.)
+    env_vars.setdefault("NCCL_DEBUG", "WARN")
 
     if SKYRL_LD_LIBRARY_PATH_EXPORT:
         # export `LD_LIBRARY_PATH` to ray runtime env.

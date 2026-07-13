@@ -703,7 +703,11 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 f"[policy-host-ram-monitor] starting on rank={self._rank} "
                 f"host={socket.gethostname()} interval={interval}s"
             )
-            self._host_ram_monitor_stop = start_fd_monitor(interval)
+            # breakdown=True: emit the HOST_RAM_BREAKDOWN attribution line (cgroup
+            # total bucketed across pids + shm + pinned) — the decisive signal for
+            # the 80B gs1 host-RAM OOM. Only the policy monitor (this gated path)
+            # requests it; the gen/head monitors stay byte-identical.
+            self._host_ram_monitor_stop = start_fd_monitor(interval, breakdown=True)
         except Exception as e:  # pragma: no cover - best-effort telemetry
             logger.warning(f"[policy-host-ram-monitor] failed to start: {e}")
 

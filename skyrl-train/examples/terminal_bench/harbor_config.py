@@ -84,6 +84,14 @@ AGENT_SCHEMA = SectionSchema(
     fields={
         # Direct fields on AgentConfig
         "name": FieldMapping("name", default="terminus-2"),  # Maps to AgentConfig.name (Harbor AgentName)
+        # Agent-log push-back control (direct field on AgentConfig, read by Trial._upload_agent_logs).
+        # DEFAULT True (preserves current behavior). Set false to SKIP the best-effort re-upload of
+        # host-side agent logs BACK into the (non-mounted) sandbox after the agent phase — those pushed-back
+        # logs are NOT consumed downstream (verifier reads verifier_dir; artifacts use artifacts_dir; the
+        # trace bundle reads the authoritative HOST copy), and on a remote/object-store env the upload's
+        # retry (max_retries×60-600s backoff) parks failing trials and starves the vLLM engines. Set false
+        # for agentic RL throughput. Direct field, NOT a kwarg (never forwarded to the agent constructor).
+        "upload_agent_logs": FieldMapping("upload_agent_logs", default=True),
         "override_timeout_sec": FieldMapping("override_timeout_sec"),
         "override_setup_timeout_sec": FieldMapping("override_setup_timeout_sec"),
         "max_timeout_sec": FieldMapping("max_timeout_sec"),

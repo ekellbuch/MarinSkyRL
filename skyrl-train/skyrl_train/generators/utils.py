@@ -19,6 +19,25 @@ from skyrl_gym.metrics import aggregate_for_environment
 UNALIGNED_LOGPROB = float("nan")
 
 
+def _lcs_alert_threshold() -> float:
+    """Threshold on ``tis/lcs_fallback_fraction`` above which the LCS guard ALERTS.
+
+    Under full TITO the served-id splice / prompt-id assembly make tier-1
+    exact-by-id alignment exact by construction, so ``align_logprobs_with_lcs`` is
+    a DEFENSIVE GUARD that should fire ~0×. When it fires more than this fraction it
+    signals a real serving↔training tokenizer/template regression and must surface
+    loudly (metric ``tis/lcs_fallback_alert`` = 1.0 + an error log). Override via
+    ``SKYRL_TIS_LCS_ALERT_THRESHOLD`` (default 0.005 = 0.5% of training tokens).
+    """
+    val = os.environ.get("SKYRL_TIS_LCS_ALERT_THRESHOLD")
+    if val is not None:
+        try:
+            return float(val)
+        except ValueError:
+            pass
+    return 0.005
+
+
 class AlignmentStats:
     """Per-assistant-message alignment bookkeeping for TIS logprob mapping.
 
@@ -68,13 +87,19 @@ class AlignmentStats:
 
     def as_metrics(self, prefix: str = "tis/") -> Dict[str, float]:
         n = max(self.n_tokens, 1)
+        lcs_frac = self.n_lcs / n
         return {
             f"{prefix}aligned_tokens": float(self.n_tokens),
             f"{prefix}exact_match_fraction": self.n_exact / n,
-            f"{prefix}lcs_fallback_fraction": self.n_lcs / n,
+            f"{prefix}lcs_fallback_fraction": lcs_frac,
             f"{prefix}unaligned_fraction": self.n_unaligned / n,
             f"{prefix}alignment_fail_count": float(self.n_failed_messages),
             f"{prefix}lcs_fallback_messages": float(self.n_lcs_messages),
+            # Metered LCS guard: 1.0 when the LCS defensive fallback fired on more than
+            # the alert threshold of training tokens (a serving↔training tokenizer/
+            # template regression). ALWAYS emitted (keyset-stable across ranks — the
+            # NumelIn=1 all_reduce-deadlock trap). Under full TITO this should stay 0.
+            f"{prefix}lcs_fallback_alert": 1.0 if lcs_frac > _lcs_alert_threshold() else 0.0,
         }
 
 
@@ -119,12 +144,17 @@ def align_logprobs_with_lcs(
 ) -> List[float]:
     """Align vLLM logprobs to re-tokenized IDs using LCS on token strings.
 
-    LAST-RESORT fallback. Prefer :func:`align_logprobs_by_token_ids`, which is
-    exact. This LCS string-match is used only when the exact token-id path is
-    unavailable (no ``completion_token_ids``) or the ids diverged. It is
-    inherently a guess and CAN misalign, so every invocation is recorded in
-    ``stats`` (``n_lcs`` / ``n_lcs_messages`` / ``n_unaligned``) and surfaced as
-    the ``tis/lcs_fallback_fraction`` metric — it must never silently degrade TIS.
+    RETAINED DEFENSIVE GUARD (metered, not deleted). Prefer
+    :func:`align_logprobs_by_token_ids`, which is exact. Under the served-id splice
+    and full-TITO assembly, tier-1 exact-by-id alignment is exact by construction and
+    this LCS path fires ~0× on real traces (empirically 0/25 across sampled MoE
+    Qwen3-Coder trials — see agent_logs/2026-07-13_tito_rollout_migration.md). It is
+    kept reachable ONLY as a last-resort safety net for a future tokenizer/template
+    regression, and every invocation is recorded in ``stats`` (``n_lcs`` /
+    ``n_lcs_messages`` / ``n_unaligned``) and surfaced as ``tis/lcs_fallback_fraction``
+    + the ``tis/lcs_fallback_alert`` threshold metric (see :func:`_lcs_alert_threshold`)
+    — retiring the silent repair to a METERED GUARD, never removing the signal. It is
+    inherently a guess and CAN misalign, so its firing must always be observable.
 
     Args:
         retokenized_ids: Token IDs from re-tokenizing the response text
@@ -618,6 +648,11 @@ def concatenate_generator_outputs(generator_outputs: List[GeneratorOutput]) -> G
         rollout_metrics["generate/tis/unaligned_fraction"] = sum_unaligned / denom
         rollout_metrics["generate/tis/alignment_fail_count"] = sum_fail
         rollout_metrics["generate/tis/lcs_fallback_messages"] = sum_lcs_msgs
+        # Recompute the metered LCS-guard alert from the recombined fraction so it
+        # stays keyset-stable and consistent with the per-trajectory emission.
+        rollout_metrics["generate/tis/lcs_fallback_alert"] = (
+            1.0 if (sum_lcs / denom) > _lcs_alert_threshold() else 0.0
+        )
 
     result["rollout_metrics"] = rollout_metrics
 

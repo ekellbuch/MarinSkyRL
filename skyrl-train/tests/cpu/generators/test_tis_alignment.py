@@ -85,6 +85,33 @@ def test_metrics_fractions():
     assert math.isclose(m["tis/exact_match_fraction"], 0.8)
     assert math.isclose(m["tis/lcs_fallback_fraction"], 0.1)
     assert math.isclose(m["tis/unaligned_fraction"], 0.1)
+    # Metered LCS guard: 0.1 fallback fraction is above the 0.005 default -> alert trips.
+    assert m["tis/lcs_fallback_alert"] == 1.0
+
+
+def test_lcs_fallback_alert_metric(monkeypatch):
+    monkeypatch.delenv("SKYRL_TIS_LCS_ALERT_THRESHOLD", raising=False)
+    # No LCS -> no alert; always-present (keyset-stable) key.
+    clean = AlignmentStats()
+    clean.n_tokens = 100
+    clean.n_exact = 100
+    mc = clean.as_metrics()
+    assert "tis/lcs_fallback_alert" in mc and mc["tis/lcs_fallback_alert"] == 0.0
+    # A tiny sub-threshold LCS fraction does NOT alert.
+    tiny = AlignmentStats()
+    tiny.n_tokens = 1000
+    tiny.n_exact = 998
+    tiny.n_lcs = 2  # 0.002 < 0.005
+    assert tiny.as_metrics()["tis/lcs_fallback_alert"] == 0.0
+    # Above threshold -> alert.
+    bad = AlignmentStats()
+    bad.n_tokens = 100
+    bad.n_exact = 90
+    bad.n_lcs = 10  # 0.10 > 0.005
+    assert bad.as_metrics()["tis/lcs_fallback_alert"] == 1.0
+    # Env override raises the bar.
+    monkeypatch.setenv("SKYRL_TIS_LCS_ALERT_THRESHOLD", "0.2")
+    assert bad.as_metrics()["tis/lcs_fallback_alert"] == 0.0
 
 
 def test_extract_float_format_no_longer_disables_tis():

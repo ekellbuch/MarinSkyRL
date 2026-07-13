@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 import time
 from collections import deque
@@ -973,15 +974,28 @@ class TerminalBenchGenerator(GeneratorInterface):
                 batch_align.merge(output.alignment_stats)
                 any_align = True
         if any_align:
-            rollout_metrics.update(batch_align.as_metrics(prefix="generate/tis/"))
+            align_metrics = batch_align.as_metrics(prefix="generate/tis/")
+            rollout_metrics.update(align_metrics)
             if batch_align.n_lcs_messages > 0 or batch_align.n_failed_messages > 0:
-                logger.warning(
-                    f"TIS alignment: {batch_align.n_exact}/{batch_align.n_tokens} tokens exact, "
+                # Metered LCS defensive guard: escalate to ERROR when the alert metric
+                # trips (lcs_fallback_fraction over SKYRL_TIS_LCS_ALERT_THRESHOLD),
+                # else WARNING. Under full TITO this should never fire.
+                alert = align_metrics.get("generate/tis/lcs_fallback_alert", 0.0) >= 1.0
+                log_fn = logger.error if alert else logger.warning
+                log_fn(
+                    f"TIS alignment{' ALERT' if alert else ''}: "
+                    f"{batch_align.n_exact}/{batch_align.n_tokens} tokens exact, "
                     f"{batch_align.n_lcs} via LCS fallback, {batch_align.n_unaligned} unaligned; "
                     f"{batch_align.n_lcs_messages} LCS-fallback messages, "
                     f"{batch_align.n_failed_messages} failed messages "
                     f"(of {batch_align.n_messages} assistant messages). "
-                    f"Non-zero LCS/failure means serving↔training tokenizer divergence."
+                    f"Non-zero LCS/failure means serving↔training tokenizer divergence"
+                    + (
+                        f" ABOVE the {os.environ.get('SKYRL_TIS_LCS_ALERT_THRESHOLD', '0.005')} "
+                        f"alert threshold — investigate before trusting TIS."
+                        if alert
+                        else "."
+                    )
                 )
 
         # Per-step error counters for tracked exception types.

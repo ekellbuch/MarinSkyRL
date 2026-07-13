@@ -68,6 +68,33 @@ EPCommBackend = Literal["torch", "deepep"]
 # --------------------------------------------------------------------------- #
 
 
+_LOGGED_MOE_PATHS: set = set()
+
+
+def _log_experts_path(experts, path: str) -> None:
+    """Once-per-distinct-path debug marker for the expert-compute path actually
+    taken (``grouped_mm`` vs ``for_loop``), with the ``w1`` tensor type and the
+    ``use_grouped_mm`` flag. Makes a SILENT for-loop fallback visible — e.g. if
+    ``cpu_offload`` hands the forward a plain tensor so ``isinstance(w1, DTensor)``
+    is False and ``use_grouped_mm`` is off. Fires ONCE per
+    ``(path, w1-type, use_grouped_mm, ep_backend)`` per process (NOT per forward),
+    so it never floods the log."""
+    key = (path, type(experts.w1).__name__, bool(experts.use_grouped_mm), experts.ep_comm_backend)
+    if key in _LOGGED_MOE_PATHS:
+        return
+    _LOGGED_MOE_PATHS.add(key)
+    try:
+        from loguru import logger
+
+        logger.info(
+            f"[MoE-PATH] experts forward via {path} "
+            f"(w1={type(experts.w1).__name__}, use_grouped_mm={bool(experts.use_grouped_mm)}, "
+            f"ep_backend={experts.ep_comm_backend})"
+        )
+    except Exception:
+        pass
+
+
 def _run_experts_for_loop(
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -198,7 +225,9 @@ class GroupedExperts(nn.Module):
             # DeepEP already delivers local-order counts -> call the BARE _impl
             # (NOT the @expert_parallel-decorated entry, which would re-permute/pad
             # an already-dispatched batch). Mirrors prime-rl's _forward_deepep.
+            _log_experts_path(self, "grouped_mm_deepep")
             return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert)
+        _log_experts_path(self, "for_loop_deepep")
         return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
 
     def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
@@ -219,7 +248,9 @@ class GroupedExperts(nn.Module):
         # case — the decorator's ALIGN_SIZE_M pad is needed even single-device. The
         # for-loop is the EP=1 parity oracle.
         if isinstance(self.w1, DTensor) or self.use_grouped_mm:
+            _log_experts_path(self, "grouped_mm")
             return _run_experts_grouped_mm(self.w1, self.w2, self.w3, x, num_tokens_per_expert)
+        _log_experts_path(self, "for_loop")
         return _run_experts_for_loop(self.w1, self.w2, self.w3, x, num_tokens_per_expert)
 
     def init_weights(self, init_std: float = 0.02):

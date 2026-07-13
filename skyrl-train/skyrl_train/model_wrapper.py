@@ -365,6 +365,7 @@ class HFModelWrapper(nn.Module):
         rope_theta: float | None = None,
         moe_router_replay: bool = False,
         moe_grouped_gemm: bool = False,
+        use_grouped_mm: bool = False,
         attn_backend: str = "auto",
         context_parallel_size: int = 1,
         cp_mesh=None,
@@ -611,7 +612,7 @@ class HFModelWrapper(nn.Module):
         if moe_grouped_gemm:
             from skyrl_train.models.layers.moe_swap import swap_moe_blocks_to_grouped
 
-            num_moe_blocks = swap_moe_blocks_to_grouped(self.model)
+            num_moe_blocks = swap_moe_blocks_to_grouped(self.model, use_grouped_mm=use_grouped_mm)
 
         if moe_router_replay:
             from skyrl_train.models.router_replay import (

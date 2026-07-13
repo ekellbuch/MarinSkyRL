@@ -204,7 +204,7 @@ def _moe_attr(hf_block, hf_config, name):
 _ROUTE_NORM_ALWAYS_BLOCKS = {"MixtralSparseMoeBlock"}
 
 
-def _build_moe_for_block(hf_block, hf_config) -> MoE:
+def _build_moe_for_block(hf_block, hf_config, use_grouped_mm: bool = False) -> MoE:
     """Construct a grouped ``MoE`` mirroring the dims of an HF ``*SparseMoeBlock``."""
     dim = hf_block.gate.weight.shape[1]
     num_experts = _moe_attr(hf_block, hf_config, "num_experts")
@@ -236,14 +236,14 @@ def _build_moe_for_block(hf_block, hf_config) -> MoE:
         top_k=top_k,
         route_norm=route_norm,
         score_func="softmax",
-        use_grouped_mm=False,  # EP=1 for-loop parity default; grouped_mm = Stage-4 perf path
+        use_grouped_mm=use_grouped_mm,  # config-driven (fsdp_config.use_grouped_mm): False -> for-loop parity, True -> grouped_mm kernel
         shared_expert_dim=shared_dim,
         shared_expert_gated=shared_gated,
     )
     return moe
 
 
-def swap_moe_blocks_to_grouped(model) -> int:
+def swap_moe_blocks_to_grouped(model, use_grouped_mm: bool = False) -> int:
     """Replace every HF ``*SparseMoeBlock`` in ``model`` with a ``GroupedMoEShim``.
 
     Walks the module tree, and for each parent whose ``.mlp`` is a
@@ -279,7 +279,7 @@ def swap_moe_blocks_to_grouped(model) -> int:
         block = getattr(parent, "mlp", None)
         if block is None or not type(block).__name__.endswith("SparseMoeBlock"):
             continue
-        moe = _build_moe_for_block(block, hf_config)
+        moe = _build_moe_for_block(block, hf_config, use_grouped_mm=use_grouped_mm)
         # Match the source block's device/dtype before copying weights.
         ref_param = block.gate.weight
         moe = moe.to(device=ref_param.device, dtype=ref_param.dtype)

@@ -632,6 +632,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 rope_theta=get_rope_theta_config(self.cfg.trainer),
                 moe_router_replay=bool(self.cfg.trainer.policy.fsdp_config.get("moe_router_replay", False)),
                 moe_grouped_gemm=bool(self.cfg.trainer.policy.fsdp_config.get("moe_grouped_gemm", False)),
+                use_grouped_mm=bool(self.cfg.trainer.policy.fsdp_config.get("use_grouped_mm", False)),
                 attn_backend=self.cfg.trainer.get("attn_backend", "auto"),
                 context_parallel_size=int(self.cfg.trainer.policy.fsdp_config.get("context_parallel_size", 1)),
                 # Stage 4: surface the CP submesh + rotate method so the forward

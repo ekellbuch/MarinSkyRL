@@ -20,8 +20,10 @@ from skyrl_train.generators.utils import (
     align_logprobs_with_lcs,
     extract_logprobs_from_rollout_details,
     extract_token_ids_from_rollout_details,
+    extract_prompt_token_ids_from_rollout_details,
     get_generation_prompt_ids,
     get_response_ids_and_loss_mask_from_messages,
+    _tito_full_enabled,
 )
 
 
@@ -89,6 +91,57 @@ def test_extract_float_format_no_longer_disables_tis():
     rd = [{"logprobs": [[-0.1, -0.2]], "completion_token_ids": [[10, 20]]}]
     assert extract_logprobs_from_rollout_details(rd) == [[-0.1, -0.2]]
     assert extract_token_ids_from_rollout_details(rd) == [[10, 20]]
+
+
+# ---------------------------------------------------------------------------
+# Full TITO: prompt-id extractor + flag scaffold (Stage 2)
+# ---------------------------------------------------------------------------
+def test_extract_prompt_token_ids():
+    rd = [{
+        "prompt_token_ids": [[1, 2, 3], [1, 2, 3, 10, 20, 4, 5]],
+        "completion_token_ids": [[10, 20], [30]],
+        "logprobs": [[-0.1, -0.2], [-0.3]],
+    }]
+    assert extract_prompt_token_ids_from_rollout_details(rd) == [[1, 2, 3], [1, 2, 3, 10, 20, 4, 5]]
+    # absent -> None (None-safe)
+    assert extract_prompt_token_ids_from_rollout_details([{"completion_token_ids": [[10]]}]) is None
+    assert extract_prompt_token_ids_from_rollout_details(None) is None
+    assert extract_prompt_token_ids_from_rollout_details([]) is None
+
+
+def test_tito_full_default_off(monkeypatch):
+    monkeypatch.delenv("SKYRL_TITO_FULL", raising=False)
+    assert _tito_full_enabled() is False
+    monkeypatch.setenv("SKYRL_TITO_FULL", "1")
+    assert _tito_full_enabled() is True
+    monkeypatch.setenv("SKYRL_TITO_FULL", "0")
+    assert _tito_full_enabled() is False
+
+
+def test_tito_assembly_declines_on_inconsistent_stream(monkeypatch):
+    """When the served prompt-id stream violates the prefix invariant, the TITO
+    assembly must DECLINE (return None) so the public function falls back to the
+    re-tok + splice path — never silently assemble a wrong sequence."""
+    from skyrl_train.generators.utils import _assemble_response_ids_tito_full
+
+    class _Tok:
+        eos_token_id = 999
+
+    # prompt[1] does NOT start with prompt[0] + completion[0] -> invariant fails.
+    out = _assemble_response_ids_tito_full(
+        messages=[{"role": "assistant", "content": "a"}, {"role": "user", "content": "b"},
+                  {"role": "assistant", "content": "c"}],
+        tokenizer=_Tok(),
+        generation_prompt_ids=[1, 2],
+        assistant_logprobs=[[-0.1], [-0.2]],
+        assistant_token_ids=[[10], [30]],
+        assistant_prompt_token_ids=[[1, 2], [7, 8, 9]],  # bad prefix
+        assistant_routed_experts=None,
+        alignment_stats=AlignmentStats(),
+        custom_chat_template=None,
+        chat_template_kwargs=None,
+    )
+    assert out is None
 
 
 # ---------------------------------------------------------------------------

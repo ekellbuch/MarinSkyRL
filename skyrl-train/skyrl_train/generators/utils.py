@@ -940,6 +940,48 @@ def extract_token_ids_from_rollout_details(
     return token_ids
 
 
+def extract_prompt_token_ids_from_rollout_details(
+    rollout_details: Optional[List[Dict[str, Any]]],
+) -> Optional[List[List[int]]]:
+    """Extract per-turn ``prompt_token_ids`` from Harbor's rollout_details.
+
+    Sibling of :func:`extract_token_ids_from_rollout_details` (which reads the
+    per-turn *completion* ids). ``prompt_token_ids[t]`` is the EXACT token id
+    sequence the inference engine tokenized as the prompt for turn ``t`` — the
+    full growing context (system + user + every prior assistant completion + every
+    tool observation, plus the assistant generation prompt). Harbor accumulates it
+    per turn in ``chat.py`` (``_prompt_token_ids_list``). By construction it
+    satisfies the prefix invariant
+
+        ``prompt_token_ids[t] == prompt_token_ids[t-1] + completion_token_ids[t-1] + observation[t-1]``
+
+    so consuming it lets the trainer assemble the MASKED context from the exact
+    served ids instead of re-tokenizing it (full TITO — see
+    :func:`_tito_full_enabled`). Returns per-turn ids ``[[id, ...]_turn0, ...]`` or
+    None when absent (None-safe, mirrors the completion extractor).
+    """
+    if not rollout_details or len(rollout_details) == 0:
+        return None
+
+    main_rollout = rollout_details[0]
+    if isinstance(main_rollout, dict):
+        token_ids = main_rollout.get("prompt_token_ids")
+    else:
+        token_ids = getattr(main_rollout, "prompt_token_ids", None)
+
+    if not token_ids:
+        return None
+    if not isinstance(token_ids, list):
+        logger.warning(f"Unexpected prompt_token_ids type: {type(token_ids)}, expected list")
+        return None
+    if len(token_ids) > 0 and not isinstance(token_ids[0], list):
+        logger.warning(
+            f"Unexpected prompt_token_ids[0] type: {type(token_ids[0])}, expected list."
+        )
+        return None
+    return token_ids
+
+
 def extract_routed_experts_from_rollout_details(
     rollout_details: Optional[List[Dict[str, Any]]],
 ) -> Optional[List[Any]]:
@@ -1127,7 +1169,211 @@ def _tis_splice_enabled() -> bool:
     return True
 
 
-def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tokenizer, assistant_logprobs=None, custom_chat_template=None, assistant_routed_experts=None, assistant_token_ids=None, alignment_stats: Optional["AlignmentStats"] = None, chat_template_kwargs=None):
+def _tito_full_enabled() -> bool:
+    """Full token-in-token-out assembly policy (default OFF).
+
+    When ON *and* Harbor's per-turn ``prompt_token_ids`` are available, the
+    trajectory ``response_ids`` / ``loss_mask`` / ``rollout_logprobs`` are assembled
+    directly from the exact served id streams (``prompt_token_ids`` for the masked
+    context, ``completion_token_ids`` for the generated region) with NO
+    re-tokenization of the multi-turn context. This is an ADDITIVE SUPERSET of the
+    served-id splice (``_tis_splice_enabled``): the splice already makes the
+    *generated region* exact-by-construction; TITO-full additionally makes the
+    *masked context* byte-exact to what the inference engine served, closing the
+    residual BPE-boundary re-tokenization drift of prior assistant turns fed back as
+    text (Stage 0 catalogue).
+
+    Default OFF ⇒ every existing code path is untouched (byte-identical). The knob is
+    ``SKYRL_TITO_FULL`` (set to a truthy value to enable). Mirrors the EP/CP/splice
+    flag-off byte-identical scaffold discipline.
+    """
+    val = os.environ.get("SKYRL_TITO_FULL")
+    if val is not None:
+        return val in ("1", "true", "True")
+    return False
+
+
+def _normalize_candidate_logprobs(candidate_logprobs):
+    """Split a per-turn logprob list into (token_strings_or_None, float_logprobs).
+
+    Mirrors the normalization inside the main assembly loop: Harbor's canonical
+    format is plain floats; the dict format (``{"token", "logprob"}``) only carries
+    token strings for the LCS fallback.
+    """
+    token_strings = None
+    if len(candidate_logprobs) > 0 and isinstance(candidate_logprobs[0], dict):
+        if "token" in candidate_logprobs[0]:
+            token_strings = [lp.get("token") for lp in candidate_logprobs]
+        floats = [lp.get("logprob", 0.0) for lp in candidate_logprobs]
+    else:
+        floats = list(candidate_logprobs)
+    return token_strings, floats
+
+
+def _assemble_response_ids_tito_full(
+    messages,
+    tokenizer,
+    generation_prompt_ids,
+    assistant_logprobs,
+    assistant_token_ids,
+    assistant_prompt_token_ids,
+    assistant_routed_experts,
+    alignment_stats,
+    custom_chat_template,
+    chat_template_kwargs,
+):
+    """Full-TITO assembly of ``response_ids``/``loss_mask``/logprobs/routed_experts.
+
+    Builds the ENTIRE trajectory from Harbor's exact per-turn served id streams — NO
+    re-tokenization of the multi-turn context — so the MASKED context is byte-exact to
+    what the inference engine served and the generated region is the exact sampled ids.
+
+    Uses the served-stream prefix invariant
+    ``prompt_token_ids[t] == prompt_token_ids[t-1] + completion_token_ids[t-1] + observation[t-1]``:
+    the full served stream is ``prompt_token_ids[-1] + completion_token_ids[-1]``, and turn
+    ``t``'s generated (loss_mask==1) region sits at offset ``len(prompt_token_ids[t])`` with
+    length ``len(completion_token_ids[t])``. ``response_ids`` is that served stream minus the
+    initial prompt (system+user0, no generation prompt), which by construction ends exactly at
+    ``len(prompt_token_ids[0]) - len(generation_prompt_ids)``.
+
+    FAIL-LOUD, NEVER-GUESS: returns ``None`` (caller falls back to the re-tok + splice path,
+    recording nothing lost) whenever the streams are absent/short/inconsistent or the invariant
+    does not hold — so a malformed capture degrades to today's behavior instead of assembling a
+    wrong sequence. On success returns ``(response_ids, loss_mask, rollout_logprobs,
+    rollout_routed_experts)`` (the last two ``None`` when their inputs were ``None``).
+    """
+    if assistant_prompt_token_ids is None or assistant_token_ids is None:
+        return None
+    n_turns = len(assistant_token_ids)
+    if n_turns == 0 or len(assistant_prompt_token_ids) != n_turns:
+        return None
+    assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
+    if len(assistant_msgs) != n_turns:
+        return None
+    # Every turn must carry non-empty prompt + completion id streams.
+    for t in range(n_turns):
+        p = assistant_prompt_token_ids[t]
+        c = assistant_token_ids[t]
+        if not p or not isinstance(p, list) or not c or not isinstance(c, list):
+            return None
+    # Prefix invariant across turns.
+    for t in range(1, n_turns):
+        prev = list(assistant_prompt_token_ids[t - 1]) + list(assistant_token_ids[t - 1])
+        cur = list(assistant_prompt_token_ids[t])
+        if cur[: len(prev)] != prev:
+            return None
+    gp = list(generation_prompt_ids)
+    gp_len = len(gp)
+    p0 = list(assistant_prompt_token_ids[0])
+    initial_prompt_len = len(p0) - gp_len
+    # Turn-0 prompt must end with the generation prompt (fixes the response/prompt boundary).
+    if initial_prompt_len < 0 or p0[initial_prompt_len:] != gp:
+        return None
+    served_full = list(assistant_prompt_token_ids[-1]) + list(assistant_token_ids[-1])
+    # Every completion region must sit at its expected offset in the served stream.
+    for t in range(n_turns):
+        off = len(assistant_prompt_token_ids[t])
+        comp = list(assistant_token_ids[t])
+        if served_full[off : off + len(comp)] != comp:
+            return None
+
+    response_ids = list(served_full[initial_prompt_len:])
+    total_len = len(response_ids)
+    loss_mask = [0] * total_len
+    rollout_logprobs = None if assistant_logprobs is None else [0.0] * total_len
+
+    # routed_experts sentinel [L, K] shape learned up-front.
+    rollout_routed_experts = None
+    _re_sentinel_row = None
+    if assistant_routed_experts is not None:
+        rollout_routed_experts = [None] * total_len  # placeholder; sentinel-filled below
+        for _turn_re in assistant_routed_experts:
+            if _turn_re and len(_turn_re) > 0:
+                _re_sentinel_row = _sentinel_routed_experts_row(_turn_re[0])
+                break
+
+    for t in range(n_turns):
+        start = len(assistant_prompt_token_ids[t]) - initial_prompt_len
+        comp = list(assistant_token_ids[t])
+        end = start + len(comp)
+        region_tokens = response_ids[start:end]
+        for i in range(start, end):
+            loss_mask[i] = 1
+
+        if assistant_logprobs is not None:
+            alignment_stats.n_messages += 1
+            alignment_stats.n_tokens += len(comp)
+            msg_logprobs = None
+            if t < len(assistant_logprobs):
+                _, floats = _normalize_candidate_logprobs(assistant_logprobs[t])
+                # Exact by construction: region_tokens == comp (served ids).
+                msg_logprobs = align_logprobs_by_token_ids(
+                    region_tokens, comp, floats, stats=alignment_stats
+                )
+            if msg_logprobs is None:
+                # Should not happen given the invariant checks; record loudly.
+                alignment_stats.n_unaligned += len(comp)
+                alignment_stats.n_failed_messages += 1
+                msg_logprobs = [0.0] * len(comp)
+            rollout_logprobs[start:end] = msg_logprobs
+
+        if assistant_routed_experts is not None:
+            msg_re = None
+            if t < len(assistant_routed_experts):
+                candidate_re = assistant_routed_experts[t]
+                if candidate_re:
+                    if _re_sentinel_row is None and len(candidate_re) > 0:
+                        _re_sentinel_row = _sentinel_routed_experts_row(candidate_re[0])
+                    vllm_token_strings = None
+                    if assistant_logprobs and t < len(assistant_logprobs):
+                        strs, _ = _normalize_candidate_logprobs(assistant_logprobs[t])
+                        vllm_token_strings = strs
+                    # Stage 3 keeps R3 on the existing LCS aligner (Stage 4 adds the
+                    # exact-by-id path); routed_experts rides the same region.
+                    msg_re = align_routed_experts_with_lcs(
+                        region_tokens, candidate_re, tokenizer, vllm_token_strings=vllm_token_strings
+                    )
+            if msg_re is None or len(msg_re) != len(comp):
+                msg_re = _re_sentinel_rows(len(comp), _re_sentinel_row)
+            rollout_routed_experts[start:end] = msg_re
+
+    # Fill any remaining (masked / non-generated) routed_experts positions with sentinels.
+    if rollout_routed_experts is not None:
+        for i in range(total_len):
+            if rollout_routed_experts[i] is None:
+                rollout_routed_experts[i] = (
+                    _re_sentinel_row if _re_sentinel_row is not None else [[SENTINEL_EXPERT_ID]]
+                )
+
+    # Byte-parity tail: the re-tok path appends the FINAL assistant turn's trailing
+    # template tokens after its EOS (e.g. the ``\n`` after ``<|im_end|>``). The served
+    # stream has no next prompt to contain them, so recover them from a single re-tok of
+    # the last assistant message and append (masked) — makes the clean case byte-identical
+    # to the re-tok path while the body stays exact-from-served-ids.
+    last_msg = assistant_msgs[-1]
+    cur = encode_messages_subset(
+        [last_msg], tokenizer, custom_chat_template, chat_template_kwargs=chat_template_kwargs
+    )
+    if tokenizer.eos_token_id in cur:
+        _le = len(cur) - 1 - cur[::-1].index(tokenizer.eos_token_id)
+        trailing = cur[_le + 1 :]
+    else:
+        trailing = []
+    if trailing:
+        response_ids.extend(trailing)
+        loss_mask.extend([0] * len(trailing))
+        if rollout_logprobs is not None:
+            rollout_logprobs.extend([0.0] * len(trailing))
+        if rollout_routed_experts is not None:
+            rollout_routed_experts.extend(_re_sentinel_rows(len(trailing), _re_sentinel_row))
+
+    assert len(loss_mask) == len(response_ids)
+    assert rollout_logprobs is None or len(rollout_logprobs) == len(response_ids)
+    assert rollout_routed_experts is None or len(rollout_routed_experts) == len(response_ids)
+    return response_ids, loss_mask, rollout_logprobs, rollout_routed_experts
+
+
+def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tokenizer, assistant_logprobs=None, custom_chat_template=None, assistant_routed_experts=None, assistant_token_ids=None, alignment_stats: Optional["AlignmentStats"] = None, chat_template_kwargs=None, assistant_prompt_token_ids=None):
     """
     Get the response ids and loss mask from a list of messages.
 
@@ -1182,6 +1428,37 @@ def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tok
     generation_prompt_ids = get_generation_prompt_ids(
         tokenizer, custom_chat_template=custom_chat_template, chat_template_kwargs=chat_template_kwargs
     )
+
+    # --- Full TITO assembly (default OFF, additive superset of the splice) ---
+    # When SKYRL_TITO_FULL is on AND Harbor's per-turn prompt_token_ids are present,
+    # assemble the WHOLE trajectory from the exact served id streams (no re-tok of the
+    # multi-turn context), making the MASKED context byte-exact to what the engine
+    # served. Fails loud → None → falls through to the re-tok + splice path below
+    # (byte-identical), so a malformed capture never yields a wrong sequence. Default
+    # OFF ⇒ this block is skipped entirely (byte-identical to prior behavior).
+    if _tito_full_enabled() and assistant_prompt_token_ids is not None and assistant_token_ids is not None:
+        _tito = _assemble_response_ids_tito_full(
+            messages,
+            tokenizer,
+            generation_prompt_ids,
+            assistant_logprobs,
+            assistant_token_ids,
+            assistant_prompt_token_ids,
+            assistant_routed_experts,
+            alignment_stats,
+            custom_chat_template,
+            chat_template_kwargs,
+        )
+        if _tito is not None:
+            _rids, _lmask, _rlp, _rre = _tito
+            if assistant_routed_experts is None:
+                return _rids, _lmask, _rlp
+            return _rids, _lmask, _rlp, _rre
+        else:
+            logger.warning(
+                "SKYRL_TITO_FULL on but prompt-id assembly declined (missing/inconsistent "
+                "served id streams or prefix invariant failed); falling back to re-tok + splice."
+            )
 
     # ARCH-GATED (qwen3_5/3.6 only): the Qwen3.5/3.6 chat template injects an EMPTY
     # ``<think>\n\n</think>`` block into the assistant generation prompt, which the

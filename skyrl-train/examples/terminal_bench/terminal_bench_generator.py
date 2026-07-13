@@ -15,6 +15,7 @@ from skyrl_train.generators.utils import (
     detect_qwen3_5_empty_think_prefix,
     extract_logprobs_from_rollout_details,
     extract_token_ids_from_rollout_details,
+    extract_prompt_token_ids_from_rollout_details,
     extract_routed_experts_from_rollout_details,
     normalize_token_ids,
     AlignmentStats,
@@ -1524,6 +1525,11 @@ class TerminalBenchGenerator(GeneratorInterface):
         # Exact-alignment ids: Harbor's per-turn completion_token_ids, index-aligned
         # with assistant_logprobs. Enables the exact (no re-tokenization guess) TIS path.
         assistant_token_ids = extract_token_ids_from_rollout_details(rollout_details)
+        # Full-TITO context ids: Harbor's per-turn prompt_token_ids (the exact served
+        # context stream). Consumed only when SKYRL_TITO_FULL is on (default OFF ⇒ no
+        # behavior change); lets the trainer assemble the MASKED context from exact ids
+        # instead of re-tokenizing. None-safe (absent on non-token-id captures).
+        assistant_prompt_token_ids = extract_prompt_token_ids_from_rollout_details(rollout_details)
         # Accumulate per-message exact/LCS/fail counts; surfaced as tis/* metrics.
         alignment_stats = AlignmentStats() if assistant_logprobs is not None else None
 
@@ -1563,6 +1569,7 @@ class TerminalBenchGenerator(GeneratorInterface):
                 assistant_token_ids=assistant_token_ids,
                 alignment_stats=alignment_stats,
                 chat_template_kwargs=self._chat_template_kwargs,
+                assistant_prompt_token_ids=assistant_prompt_token_ids,
             )
         else:
             response_ids, loss_mask, rollout_logprobs = get_response_ids_and_loss_mask_from_messages(
@@ -1573,6 +1580,7 @@ class TerminalBenchGenerator(GeneratorInterface):
                 assistant_token_ids=assistant_token_ids,
                 alignment_stats=alignment_stats,
                 chat_template_kwargs=self._chat_template_kwargs,
+                assistant_prompt_token_ids=assistant_prompt_token_ids,
             )
 
         # Determine stop reason

@@ -29,7 +29,10 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf
-from tqdm import tqdm
+try:  # log-capture-safe progress on non-TTY (CoreWeave/SLURM); falls back if skyrl_train absent
+    from skyrl_train.utils.progress import tqdm
+except Exception:
+    from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler

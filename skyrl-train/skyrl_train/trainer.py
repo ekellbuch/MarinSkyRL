@@ -13,7 +13,7 @@ import torch
 from loguru import logger
 from omegaconf import DictConfig
 from ray.util.placement_group import PlacementGroup, placement_group
-from tqdm import tqdm
+from skyrl_train.utils.progress import tqdm
 from transformers import AutoTokenizer
 from collections import defaultdict
 

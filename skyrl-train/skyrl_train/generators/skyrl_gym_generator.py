@@ -11,7 +11,7 @@ from uuid import uuid4
 import skyrl_gym
 from typing import Callable, List, Dict, Any, Optional, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor
-from tqdm.asyncio import tqdm
+from skyrl_train.utils.progress import tqdm
 from dataclasses import dataclass
 from loguru import logger
 

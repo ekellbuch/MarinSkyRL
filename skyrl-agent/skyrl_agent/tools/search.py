@@ -17,7 +17,10 @@ import numpy as np
 import requests
 from datasets import load_dataset
 from tevatron.retriever.searcher import FaissFlatSearcher
-from tqdm import tqdm
+try:  # log-capture-safe progress on non-TTY (CoreWeave/SLURM); falls back if skyrl_train absent
+    from skyrl_train.utils.progress import tqdm
+except Exception:
+    from tqdm import tqdm
 
 from skyrl_agent.tools.base import BaseTool, register_tool
 

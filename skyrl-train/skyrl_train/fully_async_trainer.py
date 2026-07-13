@@ -18,7 +18,7 @@ import traceback
 import sys
 from loguru import logger
 from skyrl_train.trainer import RayPPOTrainer
-from tqdm import tqdm
+from skyrl_train.utils.progress import tqdm
 from skyrl_train.utils import Timer, get_system_memory_metrics
 from skyrl_train.utils.ppo_utils import normalize_advantages_dict
 from skyrl_train.training_batch import TrainingInputBatch

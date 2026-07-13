@@ -10,7 +10,7 @@ import os
 from datetime import timedelta
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
-from tqdm import tqdm
+from skyrl_train.utils.progress import tqdm
 from omegaconf import OmegaConf
 
 from megatron.bridge import AutoBridge

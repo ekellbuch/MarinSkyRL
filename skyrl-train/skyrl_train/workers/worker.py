@@ -5,7 +5,7 @@ import os
 import socket
 from datetime import timedelta
 from typing import Dict, Optional, Type, List, Any, Callable
-from tqdm import tqdm
+from skyrl_train.utils.progress import tqdm
 from collections import defaultdict
 
 import ray

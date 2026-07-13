@@ -6,7 +6,7 @@ import copy
 from uuid import uuid4
 import skyrl_gym
 from typing import Callable, List, Dict, Any, Optional, Tuple
-from tqdm.asyncio import tqdm
+from skyrl_train.utils.progress import tqdm
 
 from skyrl_train.generators.base import GeneratorInput, GeneratorOutput, TrajectoryID
 from skyrl_train.generators.skyrl_gym_generator import SkyRLGymGenerator, AgentLoopOutput

@@ -32,7 +32,10 @@ from skyrl_train.dataset import PromptDataset
 import asyncio
 from pathlib import Path
 import ray
-from tqdm import tqdm
+try:  # log-capture-safe progress on non-TTY (CoreWeave/SLURM); falls back if skyrl_train absent
+    from skyrl_train.utils.progress import tqdm
+except Exception:
+    from tqdm import tqdm
 
 from skyrl_train.training_batch import TrainingInputBatch
 from skyrl_train.generators.utils import prepare_generator_input, get_metrics_from_generator_output

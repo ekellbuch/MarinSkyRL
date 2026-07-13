@@ -1,5 +1,5 @@
 import torch
-from tqdm import tqdm
+from skyrl_train.utils.progress import tqdm
 from typing import Dict, List, Any
 from pathlib import Path
 from loguru import logger

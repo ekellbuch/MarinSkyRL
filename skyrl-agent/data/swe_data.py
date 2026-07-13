@@ -1,7 +1,10 @@
 import os
 from datasets import load_dataset, Dataset
 import argparse
-from tqdm import tqdm
+try:  # log-capture-safe progress on non-TTY (CoreWeave/SLURM); falls back if skyrl_train absent
+    from skyrl_train.utils.progress import tqdm
+except Exception:
+    from tqdm import tqdm
 from collections import defaultdict
 
 

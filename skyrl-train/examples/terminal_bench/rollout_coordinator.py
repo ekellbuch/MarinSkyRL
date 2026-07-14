@@ -51,6 +51,8 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 import ray
@@ -254,6 +256,28 @@ class RolloutCoordinator:
 
     async def startup(self) -> None:
         """Create the coordinator's QueueOrchestrator (mirrors generator.startup)."""
+        # Widen THIS actor-loop's default ThreadPoolExecutor. litellm.acompletion runs
+        # its whole SYNCHRONOUS preamble (param validation, get_optional_params, provider
+        # config, header/body build) via loop.run_in_executor(None, ...) — the loop's
+        # default ~min(32, cpu+4)-wide pool — before awaiting the async httpx POST. With
+        # ~n_concurrent_trials/num_coordinators trials multiplexed on this one loop, that
+        # 32-wide pool serializes the completion preambles and starves the vLLM engines
+        # (bursty saturation, ~1/3 TDP — v0i round-3 py-spy). Widen it so all in-flight
+        # completions dispatch concurrently. Tunable via SKYRL_COORDINATOR_EXECUTOR_WORKERS
+        # (default 256). Best-effort: never fail startup on this.
+        try:
+            workers = int(os.environ.get("SKYRL_COORDINATOR_EXECUTOR_WORKERS", "256"))
+            asyncio.get_running_loop().set_default_executor(
+                ThreadPoolExecutor(max_workers=workers, thread_name_prefix="coord-exec")
+            )
+            _log().info(
+                f"[RolloutCoordinator {self._shard_idx}] default executor widened to "
+                f"max_workers={workers} (litellm acompletion preamble concurrency)"
+            )
+        except Exception as e:
+            _log().warning(
+                f"[RolloutCoordinator {self._shard_idx}] set_default_executor failed: {e}"
+            )
         await self._generator.startup()
         _log().info(f"[RolloutCoordinator {self._shard_idx}] startup complete")
 

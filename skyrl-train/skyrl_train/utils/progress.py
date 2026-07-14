@@ -151,12 +151,19 @@ class _LoggingProgress:
             return True
         if (now - self._last_emit_t) < _MIN_INTERVAL:
             return False
+        # Heartbeat is checked BEFORE the unchanged-counter early-return below: a
+        # FROZEN counter must still emit periodically, otherwise a stalled bar goes
+        # silent and becomes indistinguishable in the log from a healthy idle one.
+        # That silence is exactly what hid the v0d generation-buffer wedge (stuck at
+        # 31/64 for ~4h with zero log lines). Emitting "31/64 [Xs]" every _HEARTBEAT
+        # keeps a stall visible + greppable (same n, growing elapsed). Env-tunable via
+        # SKYRL_PROGRESS_HEARTBEAT_S.
+        if (now - self._last_emit_t) >= _HEARTBEAT:
+            return True
         if self.n == self._last_emit_n:
             return False
         bucket = self._bucket()
         if bucket != self._last_bucket:
-            return True
-        if (now - self._last_emit_t) >= _HEARTBEAT:
             return True
         return False
 

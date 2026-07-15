@@ -9,6 +9,7 @@ Run:
 """
 
 import pytest
+import numpy as np
 import torch
 from transformers import AutoTokenizer
 
@@ -287,6 +288,196 @@ def test_training_input_batch_noop_vs_present(char_tokenizer):
         assert torch.equal(off_a[k], on[k])
     # The added field satisfies the Stage-1 invariant shape[:2] == loss_mask.shape.
     assert tuple(on["rollout_routed_experts"].shape[:2]) == tuple(on["loss_mask"].shape)
+
+
+# ===========================================================================
+# Fix B (SKYRL_R3_TENSOR_CAPTURE) — np.int16 array-carrier PARITY GATE.
+#
+# These are the mandatory byte-identical gates from the fix spec §3(i)(ii): the
+# collated rollout_routed_experts tensor (and the whole TrainingInputBatch) must be
+# (a) flag-off == today's nested-list behavior, and (b) flag-on (array carrier) ==
+# flag-off, BIT-FOR-BIT. Only the container type of the ids on the wire changes.
+# ===========================================================================
+
+
+def _sample_nested(n, seed0):
+    """A per-sample [n, L, K] nested-list routed_experts block (real rows)."""
+    return [_real_row(seed0 + i) for i in range(n)]
+
+
+@pytest.mark.parametrize("num_experts", [None, 128, 512], ids=["none", "uint8", "int16"])
+def test_fixB_collator_flag_parity_byte_identical(char_tokenizer, monkeypatch, num_experts):
+    """PRIMARY GATE: flag-off (nested lists) and flag-on (np.int16 arrays) produce a
+    BIT-FOR-BIT identical rollout_routed_experts tensor + identical every-other
+    returned tensor, across the deterministic-dtype variants (uint8 / int16) and the
+    None per-batch-max fallback."""
+    prompts = [[97, 98, 99], [49, 50, 51, 52, 53]]
+    responses = [[100, 101, 102], [54, 55, 56, 57, 58]]
+    rewards = [torch.tensor([0.0, 1.0, 0.0]), torch.tensor([1.0, 0, 0, 0, 0])]
+    loss_masks = [[1, 1, 0], [1, 1, 1, 0, 0]]
+
+    re_nested = [_sample_nested(3, 0), _sample_nested(5, 10)]
+    # Flag-on carrier: per-sample contiguous np.int16 arrays (what the capture
+    # boundary now emits). Same ids/rows, different container type only.
+    re_arrays = [np.asarray(s, dtype=np.int16) for s in re_nested]
+
+    # (a) flag OFF -> nested-list path (today's behavior).
+    monkeypatch.delenv("SKYRL_R3_TENSOR_CAPTURE", raising=False)
+    off = convert_prompts_responses_to_batch_tensors(
+        char_tokenizer, prompts, responses, rewards, loss_masks, None, re_nested, num_experts=num_experts
+    )
+    # (b) flag ON -> array-carrier path.
+    monkeypatch.setenv("SKYRL_R3_TENSOR_CAPTURE", "1")
+    on = convert_prompts_responses_to_batch_tensors(
+        char_tokenizer, prompts, responses, rewards, loss_masks, None, re_arrays, num_experts=num_experts
+    )
+
+    t_off, t_on = off[6], on[6]
+    assert t_off is not None and t_on is not None
+    assert t_off.dtype == t_on.dtype, f"dtype drift: {t_off.dtype} vs {t_on.dtype}"
+    assert t_off.shape == t_on.shape == (2, 5, L, K)
+    assert torch.equal(t_off, t_on), "flag-on routed_experts tensor must be byte-identical to flag-off"
+    # Every OTHER returned tensor is untouched by the flag.
+    for a, b in zip(off, on):
+        if a is None and b is None:
+            continue
+        assert torch.equal(a, b)
+
+
+def test_fixB_training_input_batch_flag_parity(char_tokenizer, monkeypatch):
+    """Full TrainingInputBatch parity: same key set + every tensor torch.equal between
+    the flag-off (nested) and flag-on (array) builds."""
+    from skyrl_train.training_batch import TrainingInputBatch
+
+    prompts = [[97, 98, 99], [49, 50, 51, 52, 53]]
+    responses = [[100, 101, 102], [54, 55, 56, 57, 58]]
+    rewards = [torch.tensor([0.0, 1.0, 0.0]), torch.tensor([1.0, 0, 0, 0, 0])]
+    loss_masks = [[1, 1, 0], [1, 1, 1, 0, 0]]
+    logprobs = [[0.0] * len(r) for r in responses]
+    re_nested = [_sample_nested(3, 0), _sample_nested(5, 10)]
+    re_arrays = [np.asarray(s, dtype=np.int16) for s in re_nested]
+
+    def build(routed_experts, num_experts=512):
+        (seq, attn, resp_mask, rew, lm, lp, re_t, _tls, _rst) = convert_prompts_responses_to_batch_tensors(
+            char_tokenizer, prompts, responses, rewards, loss_masks, logprobs, routed_experts, num_experts=num_experts
+        )
+        batch = TrainingInputBatch(
+            {
+                "sequences": seq,
+                "attention_mask": attn,
+                "response_mask": resp_mask,
+                "rewards": rew,
+                "loss_mask": lm,
+                "rollout_logprobs": lp,
+            }
+        )
+        if re_t is not None:
+            batch["rollout_routed_experts"] = re_t
+        return batch
+
+    monkeypatch.delenv("SKYRL_R3_TENSOR_CAPTURE", raising=False)
+    off = build(re_nested)
+    monkeypatch.setenv("SKYRL_R3_TENSOR_CAPTURE", "1")
+    on = build(re_arrays)
+
+    assert set(off.keys()) == set(on.keys())
+    assert "rollout_routed_experts" in on
+    for k in off.keys():
+        assert torch.equal(off[k], on[k]), f"key {k} diverged between flag-off and flag-on"
+
+
+def test_fixB_align_array_twin_parity(monkeypatch):
+    """align_routed_experts_with_lcs array twin: .tolist() bit-identical to the
+    list branch across the LCS-mismatch, exact-1:1, and empty cases."""
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    retok_ids = [101, 102, 103, 104]
+    vllm_rows = [_real_row(i) for i in range(5)]  # N+1 (count mismatch -> positional LCS)
+
+    def _off(retok, rows):
+        monkeypatch.delenv("SKYRL_R3_TENSOR_CAPTURE", raising=False)
+        return align_routed_experts_with_lcs(retok, rows, tokenizer)
+
+    def _on(retok, rows):
+        monkeypatch.setenv("SKYRL_R3_TENSOR_CAPTURE", "1")
+        return align_routed_experts_with_lcs(retok, np.asarray(rows, dtype=np.int16), tokenizer)
+
+    # Count-mismatch positional LCS.
+    off = _off(retok_ids, vllm_rows)
+    on = _on(retok_ids, vllm_rows)
+    assert isinstance(on, np.ndarray)
+    assert on.dtype == np.int16
+    assert np.asarray(off, dtype=np.int16).tolist() == on.tolist()
+
+    # Exact 1:1 direct copy.
+    off_eq = _off(retok_ids, vllm_rows[:4])
+    on_eq = _on(retok_ids, vllm_rows[:4])
+    assert np.asarray(off_eq, dtype=np.int16).tolist() == on_eq.tolist()
+
+    # Empty vLLM rows -> [] both branches (caller sentinel-pads).
+    monkeypatch.delenv("SKYRL_R3_TENSOR_CAPTURE", raising=False)
+    assert align_routed_experts_with_lcs(retok_ids, [], tokenizer) == []
+    monkeypatch.setenv("SKYRL_R3_TENSOR_CAPTURE", "1")
+    assert align_routed_experts_with_lcs(retok_ids, np.zeros((0, L, K), dtype=np.int16), tokenizer) == []
+
+
+def test_fixB_end_to_end_alignment_and_collate_parity(char_tokenizer, monkeypatch):
+    """END-TO-END gate: multi-turn get_response_ids_and_loss_mask_from_messages +
+    collator, flag-off (nested per-turn) vs flag-on (np.int16 per-turn arrays), must
+    yield a byte-identical collated routed_experts tensor. Exercises extract-shape,
+    sentinel-fill, LCS alignment, AND the collator — the correctness-sensitive path."""
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    generation_prompt_ids = get_generation_prompt_ids(tokenizer)
+
+    messages = [
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello there"},
+        {"role": "user", "content": "How are you?"},
+        {"role": "assistant", "content": "Good"},
+    ]
+
+    def num_generated(content):
+        msg = [{"role": "assistant", "content": content}]
+        ids = encode_messages_subset(msg, tokenizer)
+        last_eos = len(ids) - 1 - ids[::-1].index(tokenizer.eos_token_id)
+        return last_eos + 1 - len(generation_prompt_ids)
+
+    n1 = num_generated("Hello there")
+    n2 = num_generated("Good")
+    re_turn1 = [_real_row(10 + i) for i in range(n1)]
+    re_turn2 = [_real_row(50 + i) for i in range(n2)]
+
+    def assemble(per_turn):
+        _, _, _, routed = get_response_ids_and_loss_mask_from_messages(
+            messages, tokenizer, assistant_routed_experts=per_turn
+        )
+        return routed
+
+    # Flag OFF: nested per-turn lists.
+    monkeypatch.delenv("SKYRL_R3_TENSOR_CAPTURE", raising=False)
+    routed_off = assemble([re_turn1, re_turn2])
+    # Flag ON: per-turn np.int16 arrays (what extract_routed_experts_from_rollout_details emits).
+    monkeypatch.setenv("SKYRL_R3_TENSOR_CAPTURE", "1")
+    routed_on = assemble([np.asarray(re_turn1, dtype=np.int16), np.asarray(re_turn2, dtype=np.int16)])
+
+    # Collate each sample-of-one with the MATCHING flag state.
+    prompts = [[1, 2, 3]]
+    responses = [list(range(100, 100 + len(routed_off)))]
+    rewards = [torch.zeros(len(routed_off))]
+    loss_masks = [[1] * len(routed_off)]
+
+    monkeypatch.delenv("SKYRL_R3_TENSOR_CAPTURE", raising=False)
+    t_off = convert_prompts_responses_to_batch_tensors(
+        char_tokenizer, prompts, responses, rewards, loss_masks, None, [routed_off], num_experts=512
+    )[6]
+    monkeypatch.setenv("SKYRL_R3_TENSOR_CAPTURE", "1")
+    t_on = convert_prompts_responses_to_batch_tensors(
+        char_tokenizer, prompts, responses, rewards, loss_masks, None, [routed_on], num_experts=512
+    )[6]
+
+    assert t_off is not None and t_on is not None
+    assert t_off.shape == t_on.shape
+    assert t_off.dtype == t_on.dtype
+    assert torch.equal(t_off, t_on), "end-to-end flag-on collated tensor must be byte-identical to flag-off"
 
 
 def test_concat_cross_sample_sentinel_matches_LK():

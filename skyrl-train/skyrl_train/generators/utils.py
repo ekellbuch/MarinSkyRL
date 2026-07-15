@@ -537,9 +537,9 @@ def concatenate_generator_outputs(generator_outputs: List[GeneratorOutput]) -> G
         _concat_sentinel_row = None
         for output in generator_outputs:
             re_out = output.get("rollout_routed_experts")
-            if re_out:
+            if re_out is not None and len(re_out) > 0:
                 for sample_re in re_out:
-                    if sample_re and len(sample_re) > 0:
+                    if sample_re is not None and len(sample_re) > 0:
                         _concat_sentinel_row = _sentinel_routed_experts_row(sample_re[0])
                         break
             if _concat_sentinel_row is not None:
@@ -1065,10 +1065,52 @@ def extract_routed_experts_from_rollout_details(
         return None
 
     logger.debug(f"Extracted routed_experts from rollout_details: {len(routed_experts)} turns")
+    if _r3_tensor_capture_enabled():
+        # Fix B capture repackage: tensorize each turn's [gen_len, L, K] to a
+        # contiguous np.int16 array HERE, at the earliest capture point, so every
+        # downstream Ray crossing ships it out-of-band (no nested-list msgpack
+        # deserialize). Empty/degenerate turns pass through untouched so the
+        # sentinel-shape learning downstream is unchanged.
+        out = []
+        for turn_re in routed_experts:
+            if turn_re is not None and len(turn_re) > 0:
+                out.append(_as_routed_experts_array(turn_re))
+            else:
+                out.append(turn_re)
+        return out
     return routed_experts
 
 
 SENTINEL_EXPERT_ID = 0  # sentinel for unmatched / non-generated token rows in routed_experts
+
+# Fix B: int16 array dtype for the routed-experts carrier (512 experts -> max id 511
+# needs 9 bits, so uint8 overflows; int16 is near-minimal and matches the collator's
+# deterministic narrow). See _r3_tensor_capture_enabled.
+_ROUTED_EXPERTS_ARRAY_DTYPE = np.int16
+
+
+def _r3_tensor_capture_enabled() -> bool:
+    """Fix B (SKYRL_R3_TENSOR_CAPTURE, default OFF) — carry ``routed_experts`` as
+    ``np.int16`` arrays end-to-end instead of nested ``List[List[List[List[int]]]]``.
+
+    When OFF (default) every routed-experts code path below is BYTE-IDENTICAL to the
+    historical nested-list behavior (the array branches are never taken). When ON,
+    each per-token ``[L, K]`` row is an ``np.int16`` array from the capture boundary
+    onward, so Ray ships it OUT-OF-BAND (zero-copy, GIL-releasing memcpy) — killing
+    the driver-side ``_deserialize_msgpack_data`` GIL-hold that both slows the 80B
+    forward and root-causes the #6936 gs1 watchdog stall. The collated
+    ``[B, resp_len, L, K]`` int16 tensor is bit-for-bit identical either way (only the
+    CONTAINER TYPE of the ids on the wire changes). Mirrors the existing
+    ``SKYRL_R3_RESIDENT`` / ``SKYRL_R3_DECENTRAL`` env-flag discipline.
+    """
+    return os.environ.get("SKYRL_R3_TENSOR_CAPTURE", "0") == "1"
+
+
+def _as_routed_experts_array(turn_re: Any) -> "np.ndarray":
+    """Coerce ONE turn's nested ``[gen_len, L, K]`` routed-experts list to a
+    contiguous ``np.int16`` array (Fix B capture repackage). Idempotent on arrays."""
+    arr = np.asarray(turn_re, dtype=_ROUTED_EXPERTS_ARRAY_DTYPE)
+    return np.ascontiguousarray(arr)
 
 
 def align_routed_experts_with_lcs(
@@ -1105,6 +1147,15 @@ def align_routed_experts_with_lcs(
         List of ``[L, K]`` rows aligned to ``retokenized_ids`` (one per token).
         Unmatched tokens get a sentinel ``[L, K]`` row.
     """
+    if _r3_tensor_capture_enabled() and isinstance(vllm_routed_experts, np.ndarray):
+        # Fix B array path: identical LCS/positional alignment + sentinel placement,
+        # expressed as np.int16 array-row slice-assign instead of list-row copy. The
+        # returned [n_retok, L, K] array's .tolist() is bit-identical to the list
+        # branch's output (see test_align_flag_parity).
+        return _align_routed_experts_with_lcs_array(
+            retokenized_ids, vllm_routed_experts, tokenizer, vllm_token_strings
+        )
+
     if not vllm_routed_experts:
         # No routed_experts to align — caller sentinel-pads; return [] so the
         # per-turn extend uses a sentinel block sized to the generated tokens.
@@ -1152,8 +1203,65 @@ def align_routed_experts_with_lcs(
     return aligned
 
 
-def _sentinel_routed_experts_row(template_row: Any) -> List[List[int]]:
-    """Build a sentinel ``[L, K]`` row matching the shape of ``template_row``."""
+def _align_routed_experts_with_lcs_array(
+    retokenized_ids: List[int],
+    vllm_routed_experts: "np.ndarray",
+    tokenizer,
+    vllm_token_strings: Optional[List[str]] = None,
+) -> Any:
+    """Fix B array twin of :func:`align_routed_experts_with_lcs` — SAME alignment
+    semantics (LCS-over-token-strings / exact 1:1 direct copy / positional-index LCS
+    proxy) and SAME sentinel placement, on an ``np.int16`` ``[n_vllm, L, K]`` input,
+    returning an ``np.int16`` ``[n_retok, L, K]`` array (row-for-row identical to the
+    list branch). Empty inputs return ``[]`` exactly like the list branch so the
+    caller's sentinel-fallback fires identically."""
+    n_vllm = int(vllm_routed_experts.shape[0]) if vllm_routed_experts.ndim >= 1 else 0
+    if n_vllm == 0:
+        return []
+    if not retokenized_ids:
+        return []
+
+    # Infer [L, K] from the first vLLM row; the sentinel canvas is zeros of that shape.
+    sentinel_row = _sentinel_routed_experts_row(vllm_routed_experts[0])  # np.int16 [L, K]
+    L, K = int(sentinel_row.shape[0]), int(sentinel_row.shape[1])
+    n_retok = len(retokenized_ids)
+    aligned = np.zeros((n_retok, L, K), dtype=_ROUTED_EXPERTS_ARRAY_DTYPE)
+
+    if vllm_token_strings is not None and len(vllm_token_strings) == n_vllm:
+        retok_strings = tokenizer.convert_ids_to_tokens(retokenized_ids)
+        matcher = SequenceMatcher(None, retok_strings, vllm_token_strings)
+        for a_start, b_start, size in matcher.get_matching_blocks():
+            if size:
+                aligned[a_start : a_start + size] = vllm_routed_experts[b_start : b_start + size]
+        return aligned
+
+    if n_vllm == n_retok:
+        # Exact 1:1 — direct copy (same values/rows as the list branch's per-index copy).
+        return np.ascontiguousarray(vllm_routed_experts.astype(_ROUTED_EXPERTS_ARRAY_DTYPE, copy=True))
+
+    matcher = SequenceMatcher(None, list(range(n_retok)), list(range(n_vllm)))
+    matched_any = False
+    for a_start, b_start, size in matcher.get_matching_blocks():
+        if size:
+            aligned[a_start : a_start + size] = vllm_routed_experts[b_start : b_start + size]
+            matched_any = True
+    if not matched_any:
+        logger.debug(
+            f"routed_experts LCS: no positional match (retok={n_retok}, vLLM={n_vllm}); "
+            f"all rows sentinel."
+        )
+    return aligned
+
+
+def _sentinel_routed_experts_row(template_row: Any) -> Any:
+    """Build a sentinel ``[L, K]`` row matching the shape of ``template_row``.
+
+    Fix B: when ``template_row`` is an ``np.ndarray`` (the array-carrier path), the
+    sentinel is a zeros ``np.int16`` array of the SAME ``[L, K]`` shape, so every
+    downstream row stays an array (out-of-band shippable). Values (all
+    ``SENTINEL_EXPERT_ID``) and shape are identical to the nested-list sentinel."""
+    if isinstance(template_row, np.ndarray):
+        return np.zeros(template_row.shape, dtype=_ROUTED_EXPERTS_ARRAY_DTYPE)
     # template_row is a [L, K] nested list. Mirror its L x K shape with sentinels.
     if not isinstance(template_row, (list, tuple)) or len(template_row) == 0:
         # Degenerate / unknown shape — fall back to a single [1, 1] sentinel.
@@ -1176,6 +1284,13 @@ def _re_sentinel_rows(n: int, sentinel_row: Optional[List[List[int]]]) -> List[L
     """
     if n <= 0:
         return []
+    if isinstance(sentinel_row, np.ndarray):
+        # Fix B: contiguous [n, L, K] int16 sentinel block. Consumers .extend() /
+        # slice-assign this, which iterates axis-0 into per-token [L, K] array rows
+        # — identical rows/values to the nested-list list-of-copies below.
+        return np.broadcast_to(sentinel_row, (n,) + sentinel_row.shape).astype(
+            _ROUTED_EXPERTS_ARRAY_DTYPE, copy=True
+        )
     if sentinel_row is None:
         sentinel_row = [[SENTINEL_EXPERT_ID]]
     return [list(sentinel_row) for _ in range(n)]
@@ -1333,7 +1448,7 @@ def _assemble_response_ids_tito_full(
     if assistant_routed_experts is not None:
         rollout_routed_experts = [None] * total_len  # placeholder; sentinel-filled below
         for _turn_re in assistant_routed_experts:
-            if _turn_re and len(_turn_re) > 0:
+            if _turn_re is not None and len(_turn_re) > 0:
                 _re_sentinel_row = _sentinel_routed_experts_row(_turn_re[0])
                 break
 
@@ -1366,7 +1481,7 @@ def _assemble_response_ids_tito_full(
             msg_re = None
             if t < len(assistant_routed_experts):
                 candidate_re = assistant_routed_experts[t]
-                if candidate_re:
+                if candidate_re is not None and len(candidate_re) > 0:
                     if _re_sentinel_row is None and len(candidate_re) > 0:
                         _re_sentinel_row = _sentinel_routed_experts_row(candidate_re[0])
                     vllm_token_strings = None
@@ -1537,7 +1652,7 @@ def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tok
     _re_sentinel_row = None
     if assistant_routed_experts is not None:
         for _turn_re in assistant_routed_experts:
-            if _turn_re and len(_turn_re) > 0:
+            if _turn_re is not None and len(_turn_re) > 0:
                 _re_sentinel_row = _sentinel_routed_experts_row(_turn_re[0])
                 break
     assistant_msg_idx = 0
@@ -1780,7 +1895,7 @@ def get_response_ids_and_loss_mask_from_messages(messages: ConversationType, tok
                 msg_routed_experts = None
                 if assistant_msg_idx < len(assistant_routed_experts):
                     candidate_re = assistant_routed_experts[assistant_msg_idx]
-                    if candidate_re:
+                    if candidate_re is not None and len(candidate_re) > 0:
                         # Lazily learn the [L, K] sentinel shape from the first real row.
                         if _re_sentinel_row is None and len(candidate_re) > 0:
                             _re_sentinel_row = _sentinel_routed_experts_row(candidate_re[0])

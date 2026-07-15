@@ -1,8 +1,26 @@
 from typing import List, Tuple, Optional
+import os
+import numpy as np
 import torch
 from loguru import logger
 from transformers import AutoTokenizer
 from jaxtyping import Float, Integer
+
+
+def _r3_tensor_capture_enabled() -> bool:
+    """Fix B (SKYRL_R3_TENSOR_CAPTURE, default OFF) — is the np.int16 array-carrier
+    path for ``rollout_routed_experts`` armed?
+
+    When OFF (default) the collator's routed_experts branch is BYTE-IDENTICAL to the
+    historical nested-``List[List[List[List[int]]]]`` + ``torch.tensor()`` path. When
+    ON the capture side (``generators/utils.py``) hands us per-sample ``np.int16``
+    arrays (shipped by Ray out-of-band, zero-copy) and we collate by array
+    ``stack``/pad instead of a GIL-held ``torch.tensor(list-of-1.5e9-ints)``. The
+    resulting ``[B, resp_len, L, K]`` int16 tensor is bit-for-bit identical either
+    way — only the CONTAINER TYPE of the ids on the wire changes. Mirrors the
+    existing ``SKYRL_R3_RESIDENT`` / ``SKYRL_R3_DECENTRAL`` env-flag discipline.
+    """
+    return os.environ.get("SKYRL_R3_TENSOR_CAPTURE", "0") == "1"
 
 
 def _routed_experts_dtype_for_num_experts(num_experts: Optional[int]) -> Optional[torch.dtype]:
@@ -31,6 +49,73 @@ def _routed_experts_dtype_for_num_experts(num_experts: Optional[int]) -> Optiona
     if num_experts <= (torch.iinfo(torch.int16).max + 1):
         return torch.int16
     return torch.int64
+
+
+def _collate_routed_experts_from_arrays(
+    routed_experts: List["np.ndarray"],
+    max_output_len: int,
+    num_experts: Optional[int],
+) -> "torch.Tensor":
+    """Fix B collator (SKYRL_R3_TENSOR_CAPTURE=1) — build the
+    ``[B, resp_len, L, K]`` int16 routed-experts transport tensor from per-sample
+    ``np.int16`` arrays by array stack + sentinel-0 right-pad, BYTE-IDENTICALLY to
+    the nested-list ``torch.tensor(padded_re, dtype=long).to(int16)`` branch, but
+    without the GIL-held Python-object element walk.
+
+    Each ``sample_re`` is a per-sample ``[resp_len_i, L, K]`` int16 array (or a list
+    of per-token ``[L, K]`` int16 arrays that ``np.asarray`` stacks to the same).
+    Mirrors the nested-list branch exactly: ``L, K`` = the WIDEST real row across all
+    samples; each sample is right-padded on the response axis to ``max_output_len``
+    with sentinel-0 rows (or truncated); the deterministic dtype narrow
+    (``_routed_experts_dtype_for_num_experts``) is applied unchanged.
+    """
+    # Normalize every sample to a 3-D [n, l, k] int16 array and learn the widest
+    # [L, K] (matches the nested-list "scan ALL samples for the WIDEST real row").
+    L, K = 1, 1
+    sample_arrs: List["np.ndarray"] = []
+    for sample_re in routed_experts:
+        arr = np.asarray(sample_re)
+        if arr.size == 0:
+            arr = np.zeros((0, 1, 1), dtype=np.int16)
+        elif arr.ndim == 2:
+            # Degenerate per-token rows collapsed to [n, x] — treat each as [x, 1].
+            arr = arr.reshape(arr.shape[0], arr.shape[1], 1)
+        elif arr.ndim != 3:
+            arr = arr.reshape(arr.shape[0], -1, 1) if arr.ndim >= 1 else np.zeros((0, 1, 1), dtype=np.int16)
+        L = max(L, arr.shape[1])
+        K = max(K, arr.shape[2])
+        sample_arrs.append(arr)
+
+    B = len(sample_arrs)
+    # Preallocated sentinel-0 canvas == the nested-list branch's per-sample
+    # sentinel_row right-pad. Slice-assign each sample's real rows in.
+    out = np.zeros((B, max_output_len, L, K), dtype=np.int16)
+    for b, arr in enumerate(sample_arrs):
+        n = min(arr.shape[0], max_output_len)
+        if n > 0:
+            out[b, :n, : arr.shape[1], : arr.shape[2]] = arr[:n].astype(np.int16, copy=False)
+
+    routed_experts_tensor = torch.from_numpy(out)  # int16 [B, max_output_len, L, K]
+
+    _re_dtype = _routed_experts_dtype_for_num_experts(num_experts)
+    if _re_dtype is None:
+        # Same NON-DETERMINISTIC per-batch-max fallback as the nested-list branch
+        # (num_experts unknown / non-MoE); values are identical so the pick matches.
+        _max_expert_id = int(out.max()) if out.size else 0
+        if _max_expert_id <= torch.iinfo(torch.uint8).max:
+            _re_dtype = torch.uint8
+        elif _max_expert_id <= torch.iinfo(torch.int16).max:
+            _re_dtype = torch.int16
+        else:
+            _re_dtype = torch.int64
+        logger.warning(
+            "convert_prompts_responses_to_batch_tensors: num_experts is None; "
+            "using the NON-DETERMINISTIC per-batch-max dtype pick for "
+            "rollout_routed_experts (chose {}). This is safe for non-MoE / "
+            "unknown-config cases but must NOT be hit on a MoE-RL run — thread "
+            "the model's num_experts through to make the dtype rank-invariant.".format(_re_dtype)
+        )
+    return routed_experts_tensor.to(_re_dtype)
 
 
 def _verify_inputs(
@@ -197,7 +282,18 @@ def convert_prompts_responses_to_batch_tensors(
     # rows are sentinel [L, K] (all zeros). 4-D is accepted by TensorBatch since
     # _check_consistency only validates dim-0.
     routed_experts_tensor = None
-    if routed_experts:
+    if routed_experts and _r3_tensor_capture_enabled():
+        # Fix B array-carrier path (SKYRL_R3_TENSOR_CAPTURE=1): the ids arrive as
+        # per-sample np.int16 arrays (Ray-shipped out-of-band, GIL-released), so we
+        # collate by np.stack + slice-assign pad → torch.from_numpy, NOT the GIL-held
+        # element-walk of torch.tensor(nested-1.5e9-int-list). The produced
+        # [B, resp_len, L, K] int16 tensor is BYTE-IDENTICAL to the nested-list
+        # branch below (same ids, same sentinel-0 right-pad, same deterministic
+        # dtype narrow) — only how we GET there changes.
+        routed_experts_tensor = _collate_routed_experts_from_arrays(
+            routed_experts, action_mask.size(1), num_experts
+        )
+    elif routed_experts:
         max_output_len = action_mask.size(1)
         # Infer the true [L, K] per-token row shape by scanning ALL samples for the
         # WIDEST real row, not just routed_experts[0][0]. Samples/rows that lack the

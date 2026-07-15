@@ -55,6 +55,28 @@ dependencies = [
 [tool.uv]
 required-version = ">=0.8.10"
 
+# Megatron CUDA build deps import the ambient torch at build time, so they cannot be built
+# under PEP-517 isolation (the isolated env has no torch). Only relevant when a wheel is
+# unavailable and uv falls back to the sdist (e.g. a from-source kaniko rebuild); the lock
+# itself resolves these from the prebuilt wheels in [tool.uv.sources].
+no-build-isolation-package = [
+    "transformer-engine",
+    "transformer-engine-torch",
+]
+
+# Strip Megatron transitive pins that fight this tree's stack (all scoped so the base/fsdp2
+# resolution is untouched):
+#  - megatron-bridge/megatron-core[dev] request transformer-engine[core_cu13]; this image is
+#    CUDA 12.8, so drop the cu13 core (transformer-engine-cu12 is added to the megatron extra).
+#  - megatron-core[dev] pins flashinfer-python~=0.5.0, which the vllm extra's ==0.6.8.post1
+#    excludes; force our version so megatron + vllm co-resolve in ONE environment.
+#  - nvidia-resiliency-ext is an unpinned megatron-bridge transitive we do not use.
+override-dependencies = [
+    "transformer-engine-cu13 ; sys_platform == 'never'",
+    "flashinfer-python==0.6.8.post1 ; sys_platform == 'linux'",
+    "nvidia-resiliency-ext ; sys_platform == 'never'",
+]
+
 # flash-attn has no prebuilt wheel for this torch/CUDA line (2.11 + cu13): Dao-AILab publishes
 # classic flash-attn wheels only up to cu12/torch2.8, so uv builds it from the sdist. That build
 # needs torch present (match-runtime supplies it), and compiling the CUDA kernels would take tens of
@@ -67,6 +89,10 @@ required-version = ">=0.8.10"
 # instead (see ci/marin_nightly/run_h100.sh) -- a genuine absence is safe where this stub is not.
 [tool.uv.extra-build-dependencies]
 flash-attn = [{requirement = "torch", match-runtime = true}]
+# TransformerEngine's sdist builds its CUDA extension against the ambient torch (with build_tools
+# + ninja). Only exercised on a from-source fallback; the lock uses the prebuilt wheels below.
+transformer-engine = [{requirement = "torch", match-runtime = true}, "build_tools", "ninja"]
+transformer-engine-torch = [{requirement = "torch", match-runtime = true}, "build_tools", "ninja"]
 
 [tool.uv.extra-build-variables]
 flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE"}
@@ -97,6 +123,13 @@ torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "a1fdd7e" }
 # (Jupiter/GH200) an aarch64-native build already exists in envs/rl, supplied out-of-band, so
 # the URL below is inert there (gated by the marker on the `deepep` extra). x86_64-only.
 deep-ep = { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_x86_64.whl" }
+# Megatron backend (see the `megatron` extra). These three are sdist-only on PyPI and build CUDA
+# extensions against torch at install time (uv can't resolve their metadata on the Mac), so they
+# resolve from prebuilt torch-2.11 / cu128 / cp312 / x86_64 wheels — the erictang000 forks upstream
+# SkyRL's megatron extra also uses, matching the gpu-rl image ABI. x86_64-only (the H100 runtime).
+transformer-engine-torch = { url = "https://github.com/erictang000/TransformerEngine/releases/download/v2.11.0-torch2.11/transformer_engine_torch-2.11.0-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
+causal-conv1d = { url = "https://github.com/erictang000/causal-conv1d/releases/download/v1.6.1.post4-torch2.11/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
+mamba-ssm = { url = "https://github.com/erictang000/mamba/releases/download/v2.3.1-torch2.11/mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
 
 # vllm is the only inference extra. Three others (sglang, mcore, flashrl) used to sit here and
 # none of them could be installed: each pinned a torch or transformers version that the base
@@ -167,6 +200,42 @@ ep = [
 deepep = [
     "torchtitan",
     "deep-ep ; platform_machine == 'x86_64'",
+]
+
+# Megatron training backend — the alternative to the default FSDP2 policy trainer, for the
+# Megatron-vs-FSDP2 comparison (skyrl_train/workers/megatron, built on megatron.bridge.AutoBridge).
+# Isolated in its own extra so the default (fsdp2) install and CPU CI are unaffected; every dep is
+# gated to linux/x86_64 (the CoreWeave H100 gpu-rl runtime), so the lock captures it there and it
+# never builds on the Mac / aarch64.
+#
+# megatron-bridge is pinned to 0.3.0 — the LAST release that accepts transformers <5 (0.4.0
+# requires >=5.0, 0.5.0 requires >=5.8.1). This tree is written against the transformers 4.x API
+# (peft 0.17 cannot import against transformers 5), so 0.3.0 is the only Megatron line that
+# co-resolves with the base transformers pin. It accepts torch>=2.6 (no ceiling), so torch stays on
+# the base/vllm 2.11 line — vLLM is deliberately NOT re-pinned here (generation uses the base `vllm`
+# extra / the from-source fork build in the gpu-rl image), which avoids the old mcore torch==2.9.1
+# vLLM ceiling entirely.
+#
+# transformer-engine-torch / mamba-ssm / causal-conv1d are sdist-only on PyPI and build their CUDA
+# extensions against torch at install time, so uv cannot resolve their metadata on the Mac. They
+# resolve from prebuilt torch-2.11 / cu128 / cp312 / x86_64 wheels (erictang000 forks — the same
+# wheels upstream SkyRL's megatron extra uses, and the exact ABI of our gpu-rl image; see
+# [tool.uv.sources]). transformer-engine's CUDA core is cu13 by default; overridden to -cu12 to
+# match the cu128 runtime (see [tool.uv] override-dependencies).
+megatron = [
+    "megatron-bridge==0.3.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "megatron-core>=0.16.1,<0.17 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "transformer-engine[pytorch]==2.11.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # Declared directly (not just via transformer-engine[pytorch]) so the [tool.uv.sources] URL is
+    # honored — uv ignores sources for transitive-only packages.
+    "transformer-engine-torch==2.11.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # cu12 CUDA core to match the cu128 runtime (cu13 core overridden to `never`).
+    "transformer-engine-cu12==2.11.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # GDN / Mamba-hybrid kernels (Qwen3-Next, Qwen3.6-35B-A3B) under megatron.
+    "mamba-ssm>=2.2,<3 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "causal-conv1d>=1.5,<2 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flash-linear-attention ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "nvidia-modelopt ; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 

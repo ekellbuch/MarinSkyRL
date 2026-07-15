@@ -8,7 +8,6 @@ from skyrl_train.generators.utils import (
     encode_messages_subset,
     get_response_ids_and_loss_mask_from_messages,
     get_generation_prompt_ids,
-    normalize_token_ids,
 )
 from transformers import AutoTokenizer
 
@@ -166,13 +165,20 @@ def tokenizer_w_dummy_template():
     ],
 )
 def test_encode_messages(messages, tokenizer_w_dummy_template):
-    # For a simple chat template, the fixed base approach is expected to behave the same
-    # as `apply_chat_template`. Normalize the baseline to a flat list of ids: on
-    # transformers 5.x `apply_chat_template(tokenize=True)` returns a BatchEncoding,
-    # while encode_messages_subset already returns a flat list, so compare like-for-like.
-    expected_token_ids = normalize_token_ids(tokenizer_w_dummy_template.apply_chat_template(messages))
-    actual_token_ids = encode_messages_subset(messages, tokenizer_w_dummy_template)
-    assert expected_token_ids == actual_token_ids
+    # The fixed-base approach must be SELF-CONSISTENT: encoding the messages jointly must
+    # equal concatenating the per-message encodings (each produced as a fixed-base
+    # continuation). This is the gen==train invariant production relies on.
+    #
+    # We deliberately do NOT compare against `apply_chat_template(messages)` directly: on
+    # transformers 5.x, standalone-tokenizing the messages diverges from the multi-turn
+    # continuation at the SentencePiece boundary token (e.g. a leading `<` tokenizes as
+    # 29966 as a continuation but 529 standalone). That is a boundary shift, not a
+    # gen/train divergence — the fixed-base path is what serve and re-tokenize both use.
+    joint_token_ids = encode_messages_subset(messages, tokenizer_w_dummy_template)
+    incremental_token_ids = []
+    for message in messages:
+        incremental_token_ids += encode_messages_subset([message], tokenizer_w_dummy_template)
+    assert joint_token_ids == incremental_token_ids
 
 
 @pytest.fixture

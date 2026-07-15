@@ -170,11 +170,14 @@ sandboxes = [
 # Torch comes from the cu130 index, matching that SIF. CUDA 13 wheels need an NVIDIA driver
 # >= 580; the trainer already assumes this line (see distributed/utils.py, which parses
 # "2.11.0+cu130").
-# flash-attn is only needed for the NON-CP paths after Stage 2 (CP uses SDPA), so a slightly
-# older 2.6.3 paired with torch 2.11 is fine.
+# flash-attn is only needed for the NON-CP paths after Stage 2 (CP uses SDPA). Its version is left
+# UNPINNED here: the CoreWeave gpu-rl image installs a compiled flash-attn wheel (2.8.3, torch2.11/
+# cu128) via `--no-deps`, so the lock's flash-attn version is never the one the image runs; and on
+# the general-user path flash-attn is a metadata-declared sdist stub (no kernels). Pinning it to
+# 2.6.3 only misrepresented the runtime, so the pin is dropped (base already declares it unpinned).
 vllm = [
     "vllm==0.20.2",
-    "flash-attn==2.6.3",
+    "flash-attn",
     "torch==2.11.0",
     # vllm 0.20.2 hard-pins flashinfer-python==0.6.8.post1, and flashinfer raises at import if the
     # jit-cache it finds is a different version -- so the jit-cache must be pinned to the same version,

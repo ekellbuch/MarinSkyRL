@@ -4903,7 +4903,7 @@ requires-dist = [
     { name = "deepspeed", marker = "extra == 'deepspeed'", specifier = "==0.17.6" },
     { name = "fastapi" },
     { name = "flash-attn" },
-    { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.6.3" },
+    { name = "flash-attn", marker = "extra == 'vllm'" },
     { name = "flash-linear-attention", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'" },
     { name = "flashinfer-jit-cache", marker = "extra == 'vllm'", specifier = "==0.6.8.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-python", marker = "extra == 'vllm'", specifier = "==0.6.8.post1" },

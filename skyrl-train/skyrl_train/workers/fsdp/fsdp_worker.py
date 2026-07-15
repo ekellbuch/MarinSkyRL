@@ -238,6 +238,18 @@ class FSDPWeightExtractor(WeightExtractor):
                 plan.append(("param", new_name))
 
         for kind, key in plan:
+            # Re-sync all policy ranks on the default WORLD PG (SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
+            # before each plan item's mesh_fsdp gather. init_device_mesh's mesh_fsdp submesh PG
+            # inherits torch's default 600s timeout; the GIL-heavy convert_tt_layer_to_hf (prev
+            # item) + the plan-build can skew one rank's arrival at the next `_all_gather_base`
+            # past 600s -> #6936 SIGABRT (the r4h gs1 death). `plan` is built in deterministic
+            # state_dict() order identical on every rank (see the docstring above), so this
+            # barrier is hit the same count + order on all ranks = deadlock-free; it lifts the
+            # effective per-gather sync window from the 600s submesh default to the WORLD
+            # timeout. Mirrors Fix-1(a) (worker.py ppo_train entry: cuda.synchronize + barrier).
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
             if kind == "param":
                 param = passthrough[key]
                 tensor = self._gather_tensor(param).to(dtype).detach().contiguous()

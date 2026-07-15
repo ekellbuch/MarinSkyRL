@@ -1109,6 +1109,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             sys.exit(1)
 
     async def async_sync_policy_weights_to_inference_engines(self):
+        # Pre-broadcast drain: hard-sync every policy shard rank's event loop BEFORE the
+        # weight-extract gather that broadcast_to_inference_engines runs. extract_weights
+        # fires mesh_fsdp `_all_gather_base` collectives (fsdp_worker._gather_tensor) on a
+        # submesh PG that inherits torch's default 600s timeout (WORLD PG is
+        # SKYRL_WORKER_NCCL_TIMEOUT_IN_S); pre-gather per-rank skew (the streamed extract's
+        # plan-build / a GDN backward slow-path) then makes a laggard miss the 600s window
+        # -> waiter ranks SIGABRT (the r4h gs1 death, #6936 _all_gather_base at the
+        # policy_train->sync_weights transition). Symmetric to the POST-broadcast drain at
+        # the call sites + the ppo_train entry barrier (worker.py); reuses the proven
+        # async-loop-safe barrier_all (WORLD PG >> the 600s submesh default).
+        await self._drain_policy_event_loops()
         return await self.policy_model.async_run_method(
             "pass_through", "broadcast_to_inference_engines", self.inference_engine_client
         )

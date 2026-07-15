@@ -432,16 +432,18 @@ class SkyRLGymGenerator(GeneratorInterface):
             # Close the environment
             await self._run_in_executor_if_available(env.close)
 
-        # init_prompts is a BATCH (list of conversations); use return_dict so the
-        # batched input_ids (list[list[int]]) come back cleanly on transformers 5.x
-        # (where a bare tokenize=True returns a BatchEncoding). normalize_token_ids
-        # is NOT used here — its singleton-unwrap would corrupt a 1-element batch.
-        prompt_token_ids = self.tokenizer.apply_chat_template(
+        # init_prompts is a BATCH (list of conversations), so this returns per-sample
+        # rows (list[list[int]]). On transformers 5.x a bare tokenize=True yields a
+        # BatchEncoding (mapping) rather than the list rows; extract input_ids in that
+        # case. normalize_token_ids is NOT used here — its singleton-unwrap would
+        # corrupt a one-element batch — and we key off the mapping interface (not
+        # return_dict) so a tokenizer/mock that already returns list rows is unchanged.
+        prompt_encodings = self.tokenizer.apply_chat_template(
             init_prompts,
             add_generation_prompt=True,
-            return_dict=True,
             tokenize=True,
-        )["input_ids"]
+        )
+        prompt_token_ids = prompt_encodings["input_ids"] if hasattr(prompt_encodings, "keys") else prompt_encodings
         rollout_metrics = get_rollout_metrics(responses, rewards, env_metrics, env_classes)
 
         if self.generator_cfg.apply_overlong_filtering:

@@ -215,7 +215,12 @@ COPY skyrl-gym ${SKYRL_HOME}/skyrl-train/skyrl-gym
 # all linux/x86_64-gated with the erictang cu128 wheels honored via [tool.uv.sources]).
 # No UV_CONSTRAINT / rl_env_constraints: the lock IS the constraint.
 # =============================================================================
-ENV RL_ENV_DIR=/opt/skyrl/envs/rl
+# RL venv path MUST match the OT-Agent iris launcher's hardcoded
+# RL_PYTHON=/opt/openthoughts/envs/rl/bin/python (rl/cloud/launch_rl_iris.py) —
+# the same path the standard FSDP2 gpu-rl image uses. Building it under
+# /opt/skyrl/envs/rl made every task die with
+# "/opt/openthoughts/envs/rl/bin/python: No such file or directory".
+ENV RL_ENV_DIR=/opt/openthoughts/envs/rl
 ENV UV_PROJECT_ENVIRONMENT=${RL_ENV_DIR}
 # =============================================================================
 # RE-LAYERED uv sync (packaging only — SAME lock, SAME closure, SAME versions).

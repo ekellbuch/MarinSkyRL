@@ -17,18 +17,22 @@
 
 import functools
 from contextlib import nullcontext
+from datetime import timedelta
 from typing import Union
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed import DeviceMesh
+from torch.distributed.distributed_c10d import _set_pg_timeout
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp._runtime_utils import _lazy_init
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 from transformers.trainer_pt_utils import get_module_class_from_name
 from torch.distributed.device_mesh import init_device_mesh
 from collections import OrderedDict
+
+from skyrl_train.utils.constants import get_worker_nccl_timeout_s
 
 from packaging import version
 from peft.utils.save_and_load import get_peft_model_state_dict
@@ -354,9 +358,7 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             for mesh_dim, placement in enumerate(placements):
                 if isinstance(placement, (Shard, _StridedShard)):
                     num_chunks = mesh.size(mesh_dim)
-                    shards, _ = placement._split_tensor(
-                        cur, num_chunks, with_padding=False, contiguous=True
-                    )
+                    shards, _ = placement._split_tensor(cur, num_chunks, with_padding=False, contiguous=True)
                     cur = shards[coord[mesh_dim]]
                 # Replicate / Partial: no narrowing on this mesh dim.
             return cur.contiguous()
@@ -557,7 +559,9 @@ def fsdp2_get_full_state_dict(model: torch.nn.Module, cpu_offload=True, rank0_on
 
     # All ranks must participate in the collective operation
     options = StateDictOptions(
-        full_state_dict=True, cpu_offload=cpu_offload, broadcast_from_rank0=False  # We want to get, not set
+        full_state_dict=True,
+        cpu_offload=cpu_offload,
+        broadcast_from_rank0=False,  # We want to get, not set
     )
 
     # This must be called on all ranks for the collective operation to work
@@ -635,9 +639,7 @@ def apply_ep(model, device_mesh, ep_comm_backend="torch", sequence_parallel_size
     assert ep_comm_backend in ("torch", "deepep"), (
         f"ep_comm_backend must be 'torch' or 'deepep'; got {ep_comm_backend!r}"
     )
-    assert sequence_parallel_size == 1, (
-        "SP+EP is deferred (scope §5): apply_ep requires sequence_parallel_size==1"
-    )
+    assert sequence_parallel_size == 1, "SP+EP is deferred (scope §5): apply_ep requires sequence_parallel_size==1"
 
     from torch.distributed.tensor.parallel import parallelize_module
 
@@ -701,9 +703,7 @@ def apply_ep(model, device_mesh, ep_comm_backend="torch", sequence_parallel_size
             fsdp_size = fsdp_mesh.size()
             if num_experts is not None and ep_size > 1 and fsdp_size > 1:
                 experts_per_ep_rank = num_experts // ep_size
-                assert num_experts % ep_size == 0, (
-                    f"num_experts={num_experts} must be divisible by ep_size={ep_size}"
-                )
+                assert num_experts % ep_size == 0, f"num_experts={num_experts} must be divisible by ep_size={ep_size}"
                 assert experts_per_ep_rank % fsdp_size == 0, (
                     f"fsdp_size={fsdp_size} must divide num_experts//ep_size="
                     f"{experts_per_ep_rank} (num_experts={num_experts}, ep_size={ep_size}); "
@@ -859,6 +859,28 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
     return total_norm
 
 
+def _apply_worker_nccl_timeout_to_submesh_pgs(device_mesh) -> None:
+    """Set every submesh process group's collective timeout to the worker NCCL timeout.
+
+    ``init_device_mesh`` builds one sub-``ProcessGroup`` per mesh dim with ``new_group()``,
+    which does not inherit the WORLD PG's timeout: each sub-PG takes NCCL's default 600s.
+    The WORLD PG is initialized with ``SKYRL_WORKER_NCCL_TIMEOUT_IN_S`` (see ``worker.py``),
+    so without this the fsdp/ep/cp/ddp submesh collectives run under a much shorter watchdog
+    than the world collectives do. Weight-extract gathers over the fsdp submesh are preceded
+    by GIL-heavy per-expert conversion whose per-rank skew can exceed 600s on large MoE
+    models, tripping the shorter watchdog and aborting the run. Aligning every submesh PG to
+    the worker timeout keeps a single, adequate liveness bound across all process groups.
+    """
+    dim_names = device_mesh.mesh_dim_names
+    if not dim_names:
+        return
+    timeout = timedelta(seconds=get_worker_nccl_timeout_s())
+    for dim_name in dim_names:
+        pg = device_mesh.get_group(dim_name)
+        if pg is not None:
+            _set_pg_timeout(timeout, pg)
+
+
 def create_device_mesh(world_size, fsdp_size, ep_size=1, cp_size=1, device_type="cuda"):
     """Build the FSDP2 device mesh.
 
@@ -901,6 +923,7 @@ def create_device_mesh(world_size, fsdp_size, ep_size=1, cp_size=1, device_type=
             device_mesh = init_device_mesh(
                 device_type, mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"]
             )
+        _apply_worker_nccl_timeout_to_submesh_pgs(device_mesh)
         return device_mesh
 
     # CP and/or EP active: build a 3-D or 4-D mesh keeping fsdp < cp < ep.
@@ -928,10 +951,11 @@ def create_device_mesh(world_size, fsdp_size, ep_size=1, cp_size=1, device_type=
     # Total numel must equal world_size (ddp absorbs the residual; assert anyway).
     import math
 
-    assert (
-        math.prod(mesh_shape) == world_size
-    ), f"mesh_shape={tuple(mesh_shape)} numel={math.prod(mesh_shape)} != world_size={world_size}"
+    assert math.prod(mesh_shape) == world_size, (
+        f"mesh_shape={tuple(mesh_shape)} numel={math.prod(mesh_shape)} != world_size={world_size}"
+    )
     device_mesh = init_device_mesh(device_type, mesh_shape=tuple(mesh_shape), mesh_dim_names=mesh_dim_names)
+    _apply_worker_nccl_timeout_to_submesh_pgs(device_mesh)
     return device_mesh
 
 
@@ -1157,7 +1181,6 @@ class PrecisionType:
 
 # Reference: https://github.com/volcengine/verl/blob/main/verl/utils/fsdp_utils.py
 def layered_summon_lora_params(fsdp_module) -> OrderedDict:
-
     def __prefix_submodules(module, prefix):
         for name, submodule in module.named_modules():
             if name.startswith(prefix) and "." not in name[len(prefix) :]:

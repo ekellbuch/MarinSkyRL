@@ -24,8 +24,16 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
 
 def init_megatron_optim_config(optim_config: dict, optimizer_config_kwargs: dict) -> OptimizerConfig:
+    # megatron-core only recognizes 'adam' / 'sgd' as standard optimizers (anything
+    # else routes to `_get_megatron_emerging_optimizer`, which raises
+    # `ValueError: Unsupported emerging optimizer: AdamW`). megatron's 'adam' IS
+    # AdamW (decoupled weight decay via weight_decay), so normalize the common
+    # HF-style names to 'adam'.
+    _optim_name = str(optim_config.get("optimizer", "adam")).lower()
+    if _optim_name == "adamw":
+        _optim_name = "adam"
     optim_args = {
-        "optimizer": optim_config.get("optimizer", "adam"),
+        "optimizer": _optim_name,
         "lr": optim_config.get("lr"),
         "min_lr": optim_config.get("min_lr", 0.0),
         "clip_grad": optim_config.get("max_grad_norm", 1.0),

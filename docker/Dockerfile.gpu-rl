@@ -193,12 +193,18 @@ ENV UV_RETRIES=5
 ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
 
 # =============================================================================
-# skyrl-train + skyrl-gym (the trainer + its gym dep). skyrl-train/skyrl-gym is a
-# symlink -> ../skyrl-gym, so both are copied as siblings and the symlink resolves.
+# skyrl-train + skyrl-gym (the trainer + its gym dep). In the repo,
+# skyrl-train/skyrl-gym is a symlink -> ../skyrl-gym; skyrl-train's uv.lock resolves
+# the member as `editable = "skyrl-gym"` relative to skyrl-train, i.e. at
+# /opt/skyrl/skyrl-train/skyrl-gym. kaniko's COPY does not yield a resolvable
+# skyrl-gym there via the symlink, so `uv sync --frozen` fails to find the
+# distribution. Materialize skyrl-gym as a REAL directory at that nested path:
+# copy skyrl-train first (which brings the dangling symlink), then copy skyrl-gym
+# over it so the real tree replaces the symlink exactly where the frozen lock looks.
 # =============================================================================
 ENV SKYRL_HOME=/opt/skyrl
-COPY skyrl-gym ${SKYRL_HOME}/skyrl-gym
 COPY skyrl-train ${SKYRL_HOME}/skyrl-train
+COPY skyrl-gym ${SKYRL_HOME}/skyrl-train/skyrl-gym
 
 # =============================================================================
 # RL environment — installed DIRECTLY from skyrl-train's uv.lock (single source of

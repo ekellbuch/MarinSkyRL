@@ -228,33 +228,36 @@ ENV UV_PROJECT_ENVIRONMENT=${RL_ENV_DIR}
 # packages one bucket at a time via `--no-install-package` (each package is
 # installed by the FIRST sync that stops excluding it; the FINAL sync excludes
 # nothing and guarantees the closure is exactly the lock — zero drift). Heavy
-# buckets sized so no single layer exceeds ~3.5 GB (matches the FSDP2 image
-# shape: many layers, max < 3.5 GB). `--no-install-package P` for a P absent
-# from the resolution (e.g. the megatron-only wheels on an fsdp2 build) is a
-# harmless no-op. Ordering: small-everything-else first, then the heavies.
-#   HB1 flashinfer-jit-cache(1333) | HB2 torch(820) | HB3 cudnn(658)
-#   HB4 cublas(594) | HB5 mamba-ssm+causal-conv1d(719) | HB6 nccl+flashinfer-cubin+TE-cu12(880)
-#   HB7 cusparse+cusparselt+cusolver(843) | HB8 vllm+cufft+triton+nvshmem+nvrtc(895)  [wheel MB]
+# buckets sized so no single layer exceeds ~4 GB (matches the FSDP2 image shape:
+# many layers). `--no-install-package P` for a P absent from the resolution
+# (e.g. the megatron-only wheels on an fsdp2 build) is a harmless no-op.
+# ⚠ torch is NEVER deferred: flash-attn (and TE) declare a `match-runtime = true`
+# torch build dependency (pyproject [tool.uv.extra-build-dependencies]), so the
+# flash-attn sdist build in the FIRST sync fails ("torch was declared as an extra
+# build dependency ... not found in the resolution") if torch is not installed
+# yet. torch therefore rides layer 0 with the small packages.
+#   L0 small + torch(820) | HB1 flashinfer-jit-cache(1333) | HB2 cudnn(658)
+#   HB3 cublas(594) | HB4 mamba-ssm+causal-conv1d(719) | HB5 nccl+flashinfer-cubin+TE-cu12(880)
+#   HB6 cusparse+cusparselt+cusolver(843) | FINAL vllm+cufft+triton+nvshmem+nvrtc(895)  [wheel MB]
 # =============================================================================
 ENV RL_SYNC="uv sync --frozen --extra vllm --extra ep"
-# layer 0: everything EXCEPT the heavies (all the small packages)
+# layer 0: all small packages + torch (torch required in-resolution for the
+# flash-attn sdist build's match-runtime build dep); defer the 16 heavies.
 RUN cd ${SKYRL_HOME}/skyrl-train && \
     if [ "${INSTALL_MEGATRON}" = "1" ]; then MEG="--extra megatron"; else MEG=""; fi && \
     ${RL_SYNC} ${MEG} \
       --no-install-package flashinfer-jit-cache \
-      --no-install-package torch \
       --no-install-package nvidia-cudnn-cu12 \
       --no-install-package nvidia-cublas-cu12 \
       --no-install-package mamba-ssm --no-install-package causal-conv1d \
       --no-install-package nvidia-nccl-cu12 --no-install-package flashinfer-cubin --no-install-package transformer-engine-cu12 \
       --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-cusolver-cu12 \
       --no-install-package vllm --no-install-package nvidia-cufft-cu12 --no-install-package triton --no-install-package nvidia-nvshmem-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 && \
-    echo "uv sync layer 0 (small pkgs) done (megatron=${INSTALL_MEGATRON})"
+    echo "uv sync layer 0 (small pkgs + torch) done (megatron=${INSTALL_MEGATRON})"
 # layer 1: + flashinfer-jit-cache (HB1)
 RUN cd ${SKYRL_HOME}/skyrl-train && \
     if [ "${INSTALL_MEGATRON}" = "1" ]; then MEG="--extra megatron"; else MEG=""; fi && \
     ${RL_SYNC} ${MEG} \
-      --no-install-package torch \
       --no-install-package nvidia-cudnn-cu12 \
       --no-install-package nvidia-cublas-cu12 \
       --no-install-package mamba-ssm --no-install-package causal-conv1d \
@@ -262,18 +265,7 @@ RUN cd ${SKYRL_HOME}/skyrl-train && \
       --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-cusolver-cu12 \
       --no-install-package vllm --no-install-package nvidia-cufft-cu12 --no-install-package triton --no-install-package nvidia-nvshmem-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 && \
     echo "uv sync layer 1 (flashinfer-jit-cache) done"
-# layer 2: + torch (HB2)
-RUN cd ${SKYRL_HOME}/skyrl-train && \
-    if [ "${INSTALL_MEGATRON}" = "1" ]; then MEG="--extra megatron"; else MEG=""; fi && \
-    ${RL_SYNC} ${MEG} \
-      --no-install-package nvidia-cudnn-cu12 \
-      --no-install-package nvidia-cublas-cu12 \
-      --no-install-package mamba-ssm --no-install-package causal-conv1d \
-      --no-install-package nvidia-nccl-cu12 --no-install-package flashinfer-cubin --no-install-package transformer-engine-cu12 \
-      --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-cusolver-cu12 \
-      --no-install-package vllm --no-install-package nvidia-cufft-cu12 --no-install-package triton --no-install-package nvidia-nvshmem-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 && \
-    echo "uv sync layer 2 (torch) done"
-# layer 3: + nvidia-cudnn-cu12 (HB3)
+# layer 2: + nvidia-cudnn-cu12 (HB2)
 RUN cd ${SKYRL_HOME}/skyrl-train && \
     if [ "${INSTALL_MEGATRON}" = "1" ]; then MEG="--extra megatron"; else MEG=""; fi && \
     ${RL_SYNC} ${MEG} \
@@ -282,8 +274,8 @@ RUN cd ${SKYRL_HOME}/skyrl-train && \
       --no-install-package nvidia-nccl-cu12 --no-install-package flashinfer-cubin --no-install-package transformer-engine-cu12 \
       --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-cusolver-cu12 \
       --no-install-package vllm --no-install-package nvidia-cufft-cu12 --no-install-package triton --no-install-package nvidia-nvshmem-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 && \
-    echo "uv sync layer 3 (cudnn) done"
-# layer 4: + nvidia-cublas-cu12 (HB4)
+    echo "uv sync layer 2 (cudnn) done"
+# layer 3: + nvidia-cublas-cu12 (HB3)
 RUN cd ${SKYRL_HOME}/skyrl-train && \
     if [ "${INSTALL_MEGATRON}" = "1" ]; then MEG="--extra megatron"; else MEG=""; fi && \
     ${RL_SYNC} ${MEG} \
@@ -291,30 +283,30 @@ RUN cd ${SKYRL_HOME}/skyrl-train && \
       --no-install-package nvidia-nccl-cu12 --no-install-package flashinfer-cubin --no-install-package transformer-engine-cu12 \
       --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-cusolver-cu12 \
       --no-install-package vllm --no-install-package nvidia-cufft-cu12 --no-install-package triton --no-install-package nvidia-nvshmem-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 && \
-    echo "uv sync layer 4 (cublas) done"
-# layer 5: + mamba-ssm + causal-conv1d (HB5)  [megatron-only]
+    echo "uv sync layer 3 (cublas) done"
+# layer 4: + mamba-ssm + causal-conv1d (HB4)  [megatron-only]
 RUN cd ${SKYRL_HOME}/skyrl-train && \
     if [ "${INSTALL_MEGATRON}" = "1" ]; then MEG="--extra megatron"; else MEG=""; fi && \
     ${RL_SYNC} ${MEG} \
       --no-install-package nvidia-nccl-cu12 --no-install-package flashinfer-cubin --no-install-package transformer-engine-cu12 \
       --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-cusolver-cu12 \
       --no-install-package vllm --no-install-package nvidia-cufft-cu12 --no-install-package triton --no-install-package nvidia-nvshmem-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 && \
-    echo "uv sync layer 5 (mamba-ssm, causal-conv1d) done"
-# layer 6: + nvidia-nccl-cu12 + flashinfer-cubin + transformer-engine-cu12 (HB6)
+    echo "uv sync layer 4 (mamba-ssm, causal-conv1d) done"
+# layer 5: + nvidia-nccl-cu12 + flashinfer-cubin + transformer-engine-cu12 (HB5)
 RUN cd ${SKYRL_HOME}/skyrl-train && \
     if [ "${INSTALL_MEGATRON}" = "1" ]; then MEG="--extra megatron"; else MEG=""; fi && \
     ${RL_SYNC} ${MEG} \
       --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-cusolver-cu12 \
       --no-install-package vllm --no-install-package nvidia-cufft-cu12 --no-install-package triton --no-install-package nvidia-nvshmem-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 && \
-    echo "uv sync layer 6 (nccl, flashinfer-cubin, transformer-engine-cu12) done"
-# layer 7: + nvidia-cusparse-cu12 + nvidia-cusparselt-cu12 + nvidia-cusolver-cu12 (HB7)
+    echo "uv sync layer 5 (nccl, flashinfer-cubin, transformer-engine-cu12) done"
+# layer 6: + nvidia-cusparse-cu12 + nvidia-cusparselt-cu12 + nvidia-cusolver-cu12 (HB6)
 RUN cd ${SKYRL_HOME}/skyrl-train && \
     if [ "${INSTALL_MEGATRON}" = "1" ]; then MEG="--extra megatron"; else MEG=""; fi && \
     ${RL_SYNC} ${MEG} \
       --no-install-package vllm --no-install-package nvidia-cufft-cu12 --no-install-package triton --no-install-package nvidia-nvshmem-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 && \
-    echo "uv sync layer 7 (cusparse, cusparselt, cusolver) done"
-# layer 8: FINAL — no exclusions; installs the remaining heavies (HB8) AND
-# guarantees the closure is EXACTLY the lock (zero drift by construction).
+    echo "uv sync layer 6 (cusparse, cusparselt, cusolver) done"
+# layer 7: FINAL — no exclusions; installs the remaining heavies AND guarantees
+# the closure is EXACTLY the lock (zero drift by construction).
 RUN cd ${SKYRL_HOME}/skyrl-train && \
     if [ "${INSTALL_MEGATRON}" = "1" ]; then MEG="--extra megatron"; else MEG=""; fi && \
     ${RL_SYNC} ${MEG} && \

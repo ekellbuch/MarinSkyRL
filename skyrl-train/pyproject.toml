@@ -55,7 +55,19 @@ dependencies = [
     "skyrl-gym",
     "flash-attn",
     "polars",
-    "s3fs",
+    # S3 client stack for the cloud.iris controller (Ray S3 object-spilling + the S3
+    # rendezvous/checkpoint boto3 path). s3fs 2026.4.0 pulls aiobotocore 3.7.0, which
+    # raises the botocore cap high enough for the boto3 S3 client (the older
+    # aiobotocore 2.20.0 → botocore 1.36.x raised
+    # `ClientArgsCreator.compute_endpoint_resolver_builtin_defaults() missing 3
+    # required positional arguments`); smart_open is Ray's object-spilling external
+    # storage impl (absent → the Ray head dies `ModuleNotFoundError: smart_open`);
+    # boto3 is the S3 client itself (was a post-hoc Dockerfile pip install — now in
+    # the lock so `uv sync --frozen` produces the whole S3 stack, no drift).
+    "s3fs==2026.4.0",
+    "aiobotocore==3.7.0",
+    "smart_open==8.0.0",
+    "boto3",
     "fastapi",
     "uvicorn",
 ]

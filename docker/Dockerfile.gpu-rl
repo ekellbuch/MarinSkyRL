@@ -335,12 +335,29 @@ RUN if [ "${INSTALL_MEGATRON}" = "1" ]; then \
 # torchtitan EP>1 assert (the `ep` extra installed it with tyro from the lock).
 RUN ${RL_ENV_DIR}/bin/python -c "from torchtitan.distributed.expert_parallel import ExpertParallel; print('torchtitan ExpertParallel import OK (apply_ep EP>1 unblocked)')"
 
+# S3 client stack for the cloud.iris controller (Ray S3 object-spilling + the S3
+# rendezvous/checkpoint boto3 path). The frozen lock resolves s3fs 2025.3.0 ->
+# aiobotocore 2.20.0, which caps botocore at 1.36.x (too old — the controller's
+# boto3 S3 client then raises
+# `ClientArgsCreator.compute_endpoint_resolver_builtin_defaults() missing 3 required
+# positional arguments`) and never pulls smart_open (so Ray's object-spilling head
+# dies with `ModuleNotFoundError: No module named 'smart_open'`). Reproduce the
+# known-good OT-Agent gpu-rl SEQUENTIAL end state: bump s3fs -> aiobotocore 3.7.0
+# (raises the botocore cap) + add smart_open FIRST, then the boto3 install below
+# re-pins botocore to a compatible version. These are pure-python / S3-only and do
+# not touch the torch/vllm/megatron stack.
+RUN uv pip install --python ${RL_ENV_DIR}/bin/python \
+        "s3fs==2026.4.0" "smart_open==8.0.0"
+
 # Harbor (agentic rollout) + boto3 (S3 checkpoints). Harbor is dependency-agnostic,
 # so installing it WITH its deps (litellm/daytona) cannot perturb the synced stack.
+# boto3 here re-pins botocore to the compatible 1.43.x (matching aiobotocore 3.7.0's
+# <1.43.1-then-bumped end state), clearing the compute_endpoint_resolver skew.
 RUN uv pip install --python ${RL_ENV_DIR}/bin/python \
         "harbor[daytona] @ git+https://github.com/marin-community/harbor.git@${HARBOR_COMMIT}" \
         boto3 && \
-    ${RL_ENV_DIR}/bin/python -c "import harbor, importlib.metadata as m, boto3; print('harbor', m.version('harbor'), '| boto3', boto3.__version__)" && \
+    ${RL_ENV_DIR}/bin/python -c "import harbor, importlib.metadata as m, boto3, smart_open, s3fs; print('harbor', m.version('harbor'), '| boto3', boto3.__version__, '| smart_open', smart_open.__version__, '| s3fs', s3fs.__version__)" && \
+    ${RL_ENV_DIR}/bin/python -c "import boto3; boto3.client('s3', endpoint_url='https://example.invalid'); print('boto3 s3 client ctor OK (compute_endpoint_resolver skew cleared)')" && \
     echo "baked harbor commit: ${HARBOR_COMMIT}"
 
 # =============================================================================

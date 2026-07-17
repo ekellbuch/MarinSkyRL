@@ -269,6 +269,12 @@ class LocalRLRunner:
                 else:
                     api_base = capability_api_base(self.config.ingress_host, endpoint_name)
                     mint_where = "local controller"
+                # Publish the capability URL as the harbor-specific HARBOR_MODEL_ENDPOINT.
+                # opencode (harbor agents/installed/opencode.py::_build_register_config_command)
+                # reads its served-model baseURL from HARBOR_MODEL_ENDPOINT. We deliberately do
+                # NOT touch OPENAI_BASE_URL: that var is reserved for genuine OpenAI traffic (the
+                # LLM-judge verifiers on the worker read it), so overloading it with a vLLM
+                # endpoint would silently misroute every judge call to vLLM.
                 os.environ["HARBOR_MODEL_ENDPOINT"] = api_base
                 injected = inject_ingress_agent_key()
                 print(

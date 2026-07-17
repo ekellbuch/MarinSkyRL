@@ -386,6 +386,19 @@ SKYRL_HOME = "/opt/skyrl"
 # self-contained here (cloud.iris.*) — no OpenThoughts-Agent workspace is required in-pod.
 APP_DIR = "/app"
 
+# marin-iris wheel installed into the RL venv at pod bootstrap for the controller-ingress
+# registration path (GAP D). The gpu-rl image bakes ONLY MarinSkyRL + harbor, never iris (a
+# marin-monorepo pkg), so cloud.iris.ingress_utils' `import iris.cluster.client.* / iris.rpc.*`
+# would ModuleNotFoundError in driver init. This dev build is validated against the live
+# marin controller's registration/mint RPC protocol; override via --iris-ref.
+DEFAULT_IRIS_VERSION = "marin-iris==0.2.49.dev202607160749"
+# The frozen known-good RL-env pin set, baked into the image (Dockerfile.gpu-rl
+# `ENV UV_CONSTRAINT=/opt/openthoughts/docker/rl_env_constraints.txt`). The marin-iris
+# install is `--constraint`ed against it so no baked pin (grpcio/protobuf/pyarrow/pydantic/
+# numpy/google-auth/…) can be downgraded. This is the image-baked absolute path (NOT the
+# synced /app workspace, which is MarinSkyRL and does not carry this OT-Agent artifact).
+RL_ENV_CONSTRAINTS = "/opt/openthoughts/docker/rl_env_constraints.txt"
+
 
 def _resolve_cluster_config_default() -> str:
     """Find the marin repo's cw-us-east-02a cluster YAML."""
@@ -399,6 +412,126 @@ def _resolve_cluster_config_default() -> str:
         if c.exists():
             return str(c)
     return rel
+
+
+def _resolve_parent_cluster_config(cluster_config: Optional[str]) -> Optional[str]:
+    """Path to the PARENT (marin) cluster YAML for federated submission.
+
+    The marin meta-scheduler config (marin.yaml) that owns iris.oa.dev and lists the
+    CoreWeave clusters as delegation peers. Defaults to the ``marin.yaml`` sibling of
+    ``--cluster-config`` (they live in the same ``lib/iris/config/`` dir); falls back
+    to the same search roots as :func:`_resolve_cluster_config_default`.
+    """
+    if cluster_config:
+        sib = Path(cluster_config).with_name("marin.yaml")
+        if sib.exists():
+            return str(sib)
+    rel = "lib/iris/config/marin.yaml"
+    for c in (
+        Path.home() / "Documents/marin" / rel,
+        Path("/Users/benjaminfeuer/Documents/marin") / rel,
+        Path(os.environ.get("MARIN_ROOT", "")) / rel,
+    ):
+        if c.exists():
+            return str(c)
+    return None
+
+
+def _cluster_dashboard_host(cluster_config_path: Optional[str]) -> Optional[str]:
+    """Bare host of a cluster config's ``dashboard_url`` — the public host of the
+    controller that OWNS endpoints registered on that cluster. None if unreadable."""
+    if not cluster_config_path:
+        return None
+    try:
+        import yaml
+        from urllib.parse import urlparse
+
+        with open(cluster_config_path) as f:
+            raw = yaml.safe_load(f) or {}
+        url = raw.get("dashboard_url")
+        return urlparse(url).hostname if url else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def validate_controller_ingress_reachability(args: argparse.Namespace) -> None:
+    """Fail loud BEFORE submit when ``--ingress-mode controller`` would produce a
+    capability URL a Daytona sandbox CANNOT reach — the Exp2 opencode-RL blocker
+    (ported from OT-Agent 8fdabb12, extended for the federated remediation).
+
+    opencode runs in a Daytona sandbox and reaches the co-located vLLM over the public
+    internet at ``https://<ingress_host>/proxy/t/<token>/<endpoint>/v1``. The endpoint
+    is REGISTERED on the controller of the cluster the job runs on and the token is
+    minted with that controller's key, so the capability URL only resolves when
+    ``<ingress_host>`` is a controller that can BOTH route to the endpoint AND be
+    reached from Daytona:
+
+      * A **directly-submitted CoreWeave** job cannot: the peer controller's own host
+        (``dashboard_url``, e.g. ``iris-cw-us-east-02a.oa.dev``) is IP-locked to the
+        marin egress; and iris.oa.dev (marin) only FEDERATES ``/proxy`` to a CoreWeave
+        endpoint for a job it DELEGATED. A direct submit → iris.oa.dev has no route →
+        404 → opencode never reaches vLLM → RecordProxy captures 0 traffic, the job
+        burns an H100 node making 0 trials.
+      * The **federated** path (``--target-cluster <peer>``) fixes it: marin delegates
+        the job to the peer child, so ``has_received_job_from_peer`` passes and marin
+        federation-proxies ``/proxy``. The endpoint is registered on the peer AND
+        MIRRORED onto marin by FederationSync; the capability token is minted at the
+        PARENT (iris.oa.dev) for the mirrored endpoint. So controller-ingress on
+        CoreWeave is ALLOWED iff ``--target-cluster`` is set and ``--ingress-host`` is
+        the marin host.
+
+    Escape hatch (once a further remediation is wired): ``OTAGENT_ALLOW_INGRESS_HOST_MISMATCH=1``.
+    """
+    if getattr(args, "ingress_mode", "direct") != "controller":
+        return
+    if os.environ.get("OTAGENT_ALLOW_INGRESS_HOST_MISMATCH") == "1":
+        print(
+            "[rl-iris] WARNING: OTAGENT_ALLOW_INGRESS_HOST_MISMATCH=1 — skipping the "
+            "controller-ingress reachability guard.",
+            flush=True,
+        )
+        return
+
+    cluster = str(getattr(args, "cluster", "") or "")
+    ingress_host = str(getattr(args, "ingress_host", "") or "")
+    target_cluster = str(getattr(args, "target_cluster", "") or "")
+    dash_host = _cluster_dashboard_host(getattr(args, "cluster_config", None))
+    is_coreweave = cluster.startswith("cw-") or (dash_host or "") not in ("", "iris.oa.dev")
+
+    if is_coreweave:
+        # The ONLY reachable CoreWeave topology: federated submission through marin.
+        if not target_cluster:
+            raise SystemExit(
+                "[rl-iris] BLOCKED: --ingress-mode controller on a directly-submitted "
+                f"CoreWeave job (--cluster={cluster or '?'}, controller host="
+                f"{dash_host or '?'}) is NOT reachable from a Daytona sandbox.\n"
+                "  The capability URL would 404: iris.oa.dev only federates /proxy for a "
+                "job it DELEGATED, and the CoreWeave controller's own host is IP-locked. "
+                "opencode would never reach vLLM (0 trials, RecordProxy captures nothing) "
+                "— the 2026-07-16 Exp2 blocker.\n"
+                "  Fix: pass --target-cluster " + (cluster or "<peer>") + " to federate "
+                "the job through the marin meta-scheduler (keep --ingress-host iris.oa.dev), "
+                "so marin delegates it to the peer and federation-proxies /proxy.\n"
+                "  Override (only once another remediation is wired): "
+                "OTAGENT_ALLOW_INGRESS_HOST_MISMATCH=1."
+            )
+        if ingress_host and ingress_host != "iris.oa.dev":
+            raise SystemExit(
+                f"[rl-iris] BLOCKED: federated CoreWeave controller-ingress needs "
+                f"--ingress-host iris.oa.dev (the marin parent that owns the mirrored "
+                f"endpoint + signs the token), got --ingress-host {ingress_host}. A "
+                "peer-signed token 401s at iris.oa.dev (federation trust is "
+                "unidirectional: cw trusts marin, not the reverse)."
+            )
+        return
+    # Non-CoreWeave (e.g. a marin-local submission): the host must match the controller
+    # that owns the endpoint.
+    if ingress_host and dash_host and ingress_host != dash_host and not target_cluster:
+        raise SystemExit(
+            f"[rl-iris] BLOCKED: --ingress-host {ingress_host} does not match this "
+            f"cluster's controller host {dash_host} (--cluster={cluster}). Override with "
+            "OTAGENT_ALLOW_INGRESS_HOST_MISMATCH=1."
+        )
 
 
 def _default_secrets_env() -> Optional[str]:
@@ -633,6 +766,98 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Force scheduling on non-preemptible workers.",
     )
+    # ----------------------------------------------------------------------- #
+    # Cross-cluster ingress / federated submission (Exp2 opencode-RL fix #1).   #
+    #                                                                           #
+    # The default (direct) path is UNCHANGED: submit straight to --cluster's    #
+    # own controller (byte-identical to before). The federated path is opt-in   #
+    # via --target-cluster: submit through the marin meta-scheduler             #
+    # (iris.oa.dev) with a `cluster EQ <peer>` constraint so marin DELEGATES    #
+    # the whole job to the peer child and can then federation-proxy /proxy      #
+    # requests to the peer's endpoint. This is the ONLY topology in which a     #
+    # Daytona sandbox can reach a co-located CoreWeave vLLM through a single    #
+    # public host (iris.oa.dev): the peer controller's own host is IP-locked    #
+    # with no off-cluster surface, and marin only federates /proxy for a job it #
+    # delegated (controller has_received_job_from_peer). See                    #
+    # validate_controller_ingress_reachability() + .claude/ops/iris/iris_ingress.md. #
+    # ----------------------------------------------------------------------- #
+    parser.add_argument(
+        "--ingress-mode",
+        "--ingress_mode",
+        dest="ingress_mode",
+        default="direct",
+        choices=["direct", "controller"],
+        help="How the co-located served model (RecordProxy/vLLM) is exposed to a "
+        "Daytona sandbox. 'direct' (default) = legacy path, no controller-ingress "
+        "wiring (byte-identical). 'controller' = register the endpoint with the iris "
+        "controller and serve it through the /proxy/t/<token>/... capability URL; on a "
+        "CoreWeave cluster this REQUIRES --target-cluster (federated submission) so the "
+        "capability URL is reachable — see validate_controller_ingress_reachability().",
+    )
+    parser.add_argument(
+        "--ingress-host",
+        "--ingress_host",
+        dest="ingress_host",
+        default=None,
+        help="Public controller-ingress host the sandbox-facing capability URL is built "
+        "against (only used with --ingress-mode controller). For the federated CoreWeave "
+        "path this MUST be the marin meta-scheduler host 'iris.oa.dev' (the parent that "
+        "owns the mirrored endpoint + signs the token), NOT the peer's own host.",
+    )
+    parser.add_argument(
+        "--target-cluster",
+        "--target_cluster",
+        dest="target_cluster",
+        default=None,
+        help="Federate the whole job to this peer cluster via the marin meta-scheduler "
+        "instead of submitting directly to --cluster's controller. Appends a "
+        "`cluster EQ <peer>` constraint and submits through the marin controller "
+        "(iris.oa.dev, IAP-gated — needs `iris login`), so marin delegates the job to "
+        "the peer child and can federation-proxy /proxy to the peer's endpoint. Required "
+        "to make --ingress-mode controller reachable from Daytona on CoreWeave. Leave "
+        "unset for the default direct submission.",
+    )
+    parser.add_argument(
+        "--parent-cluster-config",
+        "--parent_cluster_config",
+        dest="parent_cluster_config",
+        default=None,
+        help="Path to the PARENT (marin) iris cluster YAML used for federated submission "
+        "when --target-cluster is set. Defaults to the marin.yaml sibling of "
+        "--cluster-config. The direct path never reads this.",
+    )
+    parser.add_argument(
+        "--record-literal",
+        "--record_literal",
+        dest="record_literal",
+        action="store_true",
+        default=False,
+        help="Co-locate harbor's RecordProxy in front of vLLM in the pod so agent "
+        "completions are captured to literal.jsonl (opencode-RL literal interceptor). "
+        "Forwarded to the in-pod runner; requires --ingress-mode controller.",
+    )
+    parser.add_argument(
+        "--parent-controller-config-in-pod",
+        "--parent_controller_config_in_pod",
+        dest="parent_controller_config_in_pod",
+        default=None,
+        help="In-pod path to the parent (marin) cluster YAML the in-pod worker mints "
+        "against, if it differs from the launch-host --parent-cluster-config path. "
+        "Defaults to the launch-host resolved marin.yaml path (must be materialized "
+        "in-pod — see the OTAGENT_PARENT_CONTROLLER_CONFIG forwarding NOTE).",
+    )
+    parser.add_argument(
+        "--forward-marin-login",
+        "--forward_marin_login",
+        dest="forward_marin_login",
+        action="store_true",
+        default=False,
+        help="Federated in-pod mint credential: forward the operator's cached marin "
+        "`iris login` record (~/.config/marin/credentials/marin.json, carrying a "
+        "long-lived edge_refresh_token) into the pod env so the in-pod worker can mint "
+        "at iris.oa.dev. SECRET rides in the job env spec — explicit opt-in. Omit to "
+        "instead provision an allowlisted service-account credential in-pod.",
+    )
     parser.add_argument(
         "--secrets-env",
         "--secrets_env",
@@ -665,6 +890,16 @@ def create_parser() -> argparse.ArgumentParser:
         "MarinSkyRL fix that landed AFTER the image was built without waiting for an "
         "image rebuild (deps are baked, but skyrl-train is an editable git clone, so "
         "a checkout is live). Default: unset = use whatever commit the image baked.",
+    )
+    parser.add_argument(
+        "--iris-ref",
+        "--iris_ref",
+        dest="iris_ref",
+        default=DEFAULT_IRIS_VERSION,
+        help="marin-iris pip spec installed into the RL venv at pod bootstrap for the "
+        "controller-ingress registration/mint path (GAP D: iris is NOT baked into the "
+        "gpu-rl image). Only installed under --ingress-mode controller (direct mode is "
+        f"byte-identical, no install). Default: {DEFAULT_IRIS_VERSION}.",
     )
     # ----------------------------------------------------------------------- #
     # MarinSkyRL runtime-knob flags (deslop stage 3). Each promotes a live      #
@@ -1029,6 +1264,27 @@ def build_task_command(args: argparse.Namespace) -> List[str]:
     for override in args.skyrl_override or []:
         train_cmd.extend(["--skyrl_override", override])
 
+    # Cross-cluster ingress (opencode-RL literal capture): forward the ingress flags to
+    # the in-pod runner (cloud.iris.run_rl), which stands up the RecordProxy + registers
+    # + mints the capability URL. Only emitted under --ingress-mode controller; the
+    # default (direct) path adds nothing (byte-identical run_rl invocation).
+    if getattr(args, "ingress_mode", "direct") == "controller":
+        train_cmd.extend(["--ingress_mode", "controller"])
+        if getattr(args, "ingress_host", None):
+            train_cmd.extend(["--ingress_host", args.ingress_host])
+        if getattr(args, "record_literal", False):
+            train_cmd.append("--record_literal")
+        if getattr(args, "target_cluster", None):
+            train_cmd.extend(["--target_cluster", args.target_cluster])
+            # Parent (marin) config the in-pod worker mints against. Prefer an explicit
+            # in-pod path; else pass the resolved marin.yaml path (must be materialized
+            # in-pod — see the OTAGENT_PARENT_CONTROLLER_CONFIG env forwarding + NOTE).
+            parent_cfg_in_pod = getattr(args, "parent_controller_config_in_pod", None) or (
+                args.parent_cluster_config or _resolve_parent_cluster_config(args.cluster_config)
+            )
+            if parent_cfg_in_pod:
+                train_cmd.extend(["--parent_controller_config", parent_cfg_in_pod])
+
     # Durable Harbor rollout artifacts. The config default (trials_dir: null) resolves to a
     # node-local path on the rank-0 pod (/app/experiments/<run>/trace_jobs); point
     # terminal_bench_config.trials_dir at the durable shared store (s3://, creds auto-injected)
@@ -1153,6 +1409,52 @@ def build_task_command(args: argparse.Namespace) -> List[str]:
             f'echo "[rl-iris] {SKYRL_HOME} is not a git tree (baked image already pinned) — using baked MarinSkyRL; --skyrl-ref not applied"; '
             f"fi; "
         )
+    # GAP D fix: install marin-iris into the RL venv at bootstrap for the controller-
+    # ingress registration/mint path. cloud.iris.ingress_utils hard-imports
+    # iris.cluster.client.* / iris.rpc.*, but the gpu-rl image bakes ONLY MarinSkyRL +
+    # harbor (never iris, a marin-monorepo pkg) -> `ModuleNotFoundError: No module named
+    # 'iris'` in driver init. This is the lightweight analog of --skyrl-ref (no ~40-min
+    # kaniko rebuild): marin-iris is a pure-python wheel, installed live. Only needed in
+    # controller mode (direct mode never imports iris), so gate on ingress_mode ==
+    # controller -> the default direct path is byte-identical (no install, no env change).
+    #   - NO [controller] extra: the CLIENT registration path (EndpointClient + rpc stubs)
+    #     needs neither kubernetes<36 nor Secret-Manager (it loads grpc + connectrpc +
+    #     rigging + finelog only), so skipping it avoids the biggest dep-conflict source.
+    #   - --constraint the image-baked frozen RL-env set: iris's deps are all already
+    #     present with satisfied >= bounds, so uv adds only the pure-python leaves and no
+    #     baked pin is downgraded; torch/vllm/flash_attn aren't in iris's tree.
+    #   - GAP E#2 boto guard: the marin-iris solve DOWNGRADES the (deliberately-unpinned)
+    #     botocore cluster (1.43.46 -> 1.43.0), breaking `from botocore.docs.utils import
+    #     DocumentModifiedShape` (accelerate imports it transitively -> a MASKED
+    #     "accelerate circular import" that killed every prior controller-ingress smoke).
+    #     Snapshot the baked boto pins with `uv pip freeze` (the venv is uv-managed, NO
+    #     pip module) BEFORE the install and force-restore them (--no-deps) AFTER.
+    #   - Under `set -e` + a hard import of the exact registration path AND torch/vllm/
+    #     flash_attn + DocumentModifiedShape asserts: a clobbered pin KILLS the job loud
+    #     at bootstrap rather than dying deep in driver init.
+    iris_refresh = ""
+    if getattr(args, "ingress_mode", "direct") == "controller":
+        ispec = getattr(args, "iris_ref", None) or DEFAULT_IRIS_VERSION
+        iris_refresh = (
+            f"_BOTO_BAKED=$(uv pip freeze --python {shlex.quote(RL_PYTHON)} 2>/dev/null | "
+            f"grep -iE '^(botocore|boto3|s3transfer|awscli)==' | tr '\\n' ' ' || true); "
+            f'echo "[rl-iris] boto baked pins: $_BOTO_BAKED"; '
+            f"uv pip install --python {shlex.quote(RL_PYTHON)} "
+            f"--constraint {shlex.quote(RL_ENV_CONSTRAINTS)} {shlex.quote(ispec)}; "
+            f'if [ -n "$_BOTO_BAKED" ]; then uv pip install --python '
+            f"{shlex.quote(RL_PYTHON)} --no-deps $_BOTO_BAKED; fi; "
+            f'{RL_PYTHON} -c "import importlib.metadata as m; '
+            f"import iris.cluster.client.endpoint_client, iris.cluster.client.job_info, "
+            f"iris.rpc.controller_connect, iris.cluster.types; "
+            f"print('[rl-iris] marin-iris now', m.version('marin-iris'), "
+            f"'(controller-ingress import OK)')\"; "
+            f'{RL_PYTHON} -c "import botocore; from botocore.docs.utils import '
+            f"DocumentModifiedShape; print('[rl-iris] boto cluster intact: botocore', "
+            f'botocore.__version__)"; '
+            f'{RL_PYTHON} -c "import torch, vllm, flash_attn, flash_attn_2_cuda; '
+            f"print('[rl-iris] post-iris pins intact: torch', torch.__version__, "
+            f"'vllm', vllm.__version__)\"; "
+        )
     ctrl = shlex.join(controller_cmd)
     # TileLang JIT-cache warm-start shim (Fix A) — GDN/FlashQLA runs only.
     # SKYRL_GDN_FLASHQLA=1 lazily JIT-compiles the FlashQLA GatedDeltaNet TileLang
@@ -1200,6 +1502,7 @@ def build_task_command(args: argparse.Namespace) -> List[str]:
     bash = (
         f"set -e; cd {APP_DIR}; "
         f"{skyrl_refresh}"
+        f"{iris_refresh}"
         f"export SKYRL_HOME={shlex.quote(SKYRL_HOME)}; "
         f"export PYTHONPATH={shlex.quote(pythonpath)}:${{PYTHONPATH:-}}; "
         f"export VLLM_USE_V1=1; "
@@ -1212,6 +1515,12 @@ def main() -> int:
     parser = create_parser()
     args = parser.parse_args()
     normalize(args)
+
+    # Fail loud (before any submit / GPU allocation) when controller-ingress would
+    # produce a capability URL the Daytona sandbox cannot reach — the Exp2 blocker
+    # (opencode never reaches vLLM on CoreWeave via a directly-submitted job). The
+    # default direct path returns immediately (byte-identical).
+    validate_controller_ingress_reachability(args)
 
     if not args.job_name:
         args.job_name = f"rl-iris-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -1312,6 +1621,9 @@ def main() -> int:
     replicas, coscheduling = resolve_multinode_defaults(None, args.gpu_variant, args.num_nodes)
 
     resources_proto = resources.to_proto()
+    # --target-cluster (federated submission) appends a `cluster EQ <peer>` constraint
+    # so the marin meta-scheduler DELEGATES the whole job to the peer child (see the
+    # submission block below). None on the default direct path (byte-identical).
     constraints = build_job_constraints(
         resources_proto=resources_proto,
         tpu_variants=[],
@@ -1319,6 +1631,7 @@ def main() -> int:
         regions=None,
         zone=None,
         preemptible=args.preemptible,
+        target_cluster=args.target_cluster,
     )
 
     priority_band = {
@@ -1414,6 +1727,81 @@ def main() -> int:
         if v:
             env_vars[k] = v
 
+    # Federated controller-ingress pod plumbing (opencode-RL literal capture): the in-pod
+    # worker mints the capability token at the PARENT (marin/iris.oa.dev) for the mirrored
+    # endpoint, which needs (a) the parent cluster config path and (b) IAP credentials to
+    # authenticate to iris.oa.dev. We forward the config path + any launch-host IAP cred
+    # env so the in-pod _ParentControllerClient can re-mint the IAP OIDC token.
+    #
+    # ⚠ POST-LOGIN VALIDATION ITEM (cannot be exercised until `iris login` succeeds): the
+    # parent config FILE and a usable IAP credential must actually be PRESENT in the pod.
+    # The marin.yaml is not baked into the gpu-rl image, and forwarding a user refresh
+    # token into a pod is a secret-handling decision. Today we forward the path + known
+    # IAP-cred env vars; materializing marin.yaml in-pod (bake / workspace-sync / write
+    # from a forwarded value) and choosing the IAP cred mechanism (allowlisted SA vs.
+    # forwarded refresh token) are the remaining operator/deploy steps. Direct submission
+    # (no --target-cluster) forwards none of this.
+    if getattr(args, "target_cluster", None) and getattr(args, "ingress_mode", "direct") == "controller":
+        from cloud.iris.ingress_utils import (
+            PARENT_CONTROLLER_CONFIG_ENV,
+            PARENT_CONTROLLER_CONFIG_YAML_ENV,
+            PARENT_CREDENTIALS_JSON_ENV,
+        )
+
+        parent_cfg = (
+            getattr(args, "parent_controller_config_in_pod", None)
+            or args.parent_cluster_config
+            or _resolve_parent_cluster_config(args.cluster_config)
+        )
+        if parent_cfg:
+            env_vars[PARENT_CONTROLLER_CONFIG_ENV] = parent_cfg
+            # marin.yaml is not baked into the gpu-rl image and is not part of the
+            # synced workspace, so the path above won't resolve in-pod. Forward the
+            # file CONTENT (write-from-env, mirroring --forward-marin-login) so the
+            # in-pod worker (materialize_parent_controller_config) writes it to a real
+            # path and repoints the env. marin.yaml carries no secrets (signing_key is
+            # a gcp-secret:// ref resolved server-side). When parent_cfg is an explicit
+            # in-pod path (baked/synced), os.path.isfile is False on the launch host →
+            # no content forwarded (operator owns materialization).
+            if os.path.isfile(parent_cfg):
+                with open(parent_cfg) as _pf:
+                    env_vars[PARENT_CONTROLLER_CONFIG_YAML_ENV] = _pf.read()
+        for k in (
+            "IRIS_IAP_REFRESH_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "IRIS_EDGE_REFRESH_TOKEN",
+        ):
+            v = os.environ.get(k)
+            if v:
+                env_vars[k] = v
+        # In-pod parent-mint IAP credential. The cw pod has no cached `iris login` and no
+        # marin-allowlisted ambient SA, so the in-pod mint at iris.oa.dev fails
+        # UNAUTHENTICATED unless we supply a credential. --forward-marin-login opts INTO
+        # forwarding the operator's cached login record (`~/.config/marin/credentials/
+        # <cluster>.json`, carrying a long-lived edge_refresh_token) into the pod env; the
+        # in-pod worker materializes it (ingress_utils.materialize_parent_credentials) so
+        # rigging's load_credentials mints under the operator's identity. This is a SECRET
+        # exposure (the token rides in the job's env spec) — hence explicit opt-in. The
+        # deploy-choice alternative is to provision an allowlisted GCP service-account
+        # credential into the pod (ADC/key) instead and NOT forward the token.
+        if getattr(args, "forward_marin_login", False):
+            login_path = os.path.expanduser("~/.config/marin/credentials/marin.json")
+            if os.path.isfile(login_path):
+                with open(login_path) as _f:
+                    env_vars[PARENT_CREDENTIALS_JSON_ENV] = _f.read()
+                print(
+                    "[rl-iris] --forward-marin-login: forwarding the cached marin login "
+                    "record into the pod env (edge_refresh_token) for the in-pod parent "
+                    "mint. SECRET rides in the job env spec.",
+                    flush=True,
+                )
+            else:
+                raise SystemExit(
+                    "[rl-iris] --forward-marin-login set but no cached login at "
+                    f"{login_path}. Run `iris --cluster=marin login` first, or drop the "
+                    "flag and provision an allowlisted service-account credential in-pod."
+                )
+
     # Load the cluster config (pydantic IrisClusterConfig) and build the provider
     # bundle, then discover + tunnel to the controller. This mirrors the marin
     # CLI's own path (iris/cli/connect.py::require_controller_url): for a local
@@ -1421,17 +1809,63 @@ def main() -> int:
     # controller_address() (defaults.worker.controller_address) if set, else fall
     # back to the backend's discover_controller(). cw-us-east-02a's controller
     # kind is "coreweave" (non-local, no IAP auth) → the discover path.
-    iris_config = load_config(args.cluster_config)
-    bundle = provider_bundle(iris_config)
-    if iris_config.controller.controller_kind() == "local":
-        controller_address = LocalCluster(iris_config).start()
-    else:
-        controller_address = iris_config.controller_address() or bundle.controller.discover_controller(
-            iris_config.controller
+    #
+    # FEDERATED submission (--target-cluster set): submit through the PARENT (marin)
+    # meta-scheduler instead of the peer's own controller. We load marin.yaml (whose
+    # dashboard_url is the IAP-gated iris.oa.dev) and tunnel THERE; the `cluster EQ
+    # <peer>` constraint appended above makes marin delegate the whole job to the peer
+    # child. This is what lets marin later federation-proxy /proxy to the peer's
+    # (mirrored) endpoint — the only Daytona-reachable CoreWeave ingress topology.
+    # Reaching iris.oa.dev requires IAP creds (`iris login` with an @openathena.ai
+    # account, or an allowlisted service account); tunnel()/IrisClient handle the auth.
+    submit_cluster_config = args.cluster_config
+    if args.target_cluster:
+        parent_cfg = args.parent_cluster_config or _resolve_parent_cluster_config(args.cluster_config)
+        if not parent_cfg:
+            raise SystemExit(
+                "[rl-iris] --target-cluster set but no parent (marin) cluster config "
+                "could be resolved. Pass --parent-cluster-config <path to marin.yaml>."
+            )
+        submit_cluster_config = parent_cfg
+        print(
+            f"[rl-iris] Federated submission: delegating to peer '{args.target_cluster}' "
+            f"via the marin meta-scheduler ({parent_cfg}).",
+            flush=True,
         )
+    from contextlib import contextmanager as _contextmanager
 
-    with bundle.controller.tunnel(address=controller_address) as controller_url:
-        client = IrisClient.remote(controller_url, workspace=PROJECT_ROOT)
+    @_contextmanager
+    def _direct_client():
+        # Direct submission to --cluster's own controller. On CoreWeave the loopback SSH
+        # tunnel presents as the trusted local_admin identity (no IAP login needed) —
+        # byte-identical to before.
+        iris_config = load_config(submit_cluster_config)
+        bundle = provider_bundle(iris_config)
+        if iris_config.controller.controller_kind() == "local":
+            controller_address = LocalCluster(iris_config).start()
+        else:
+            controller_address = iris_config.controller_address() or bundle.controller.discover_controller(
+                iris_config.controller
+            )
+        with bundle.controller.tunnel(address=controller_address) as controller_url:
+            yield IrisClient.remote(controller_url, workspace=PROJECT_ROOT)
+
+    if args.target_cluster:
+        # Federated submission MUST carry the IAP *user* identity: the controller rejects
+        # a loopback/local_admin tunnel identity for a federated job ("a local_admin
+        # (CIDR/loopback) identity cannot submit a federated job"), because delegation
+        # forwards the submitter's identity to the peer for its owner check. Connect to
+        # the marin parent exactly as the `iris job run` CLI does — open_iris_client
+        # threads the IAP ClientCredentials (iris JWT + IAP OIDC token) from the cached
+        # `iris login`, so the submission carries the user identity rather than loopback.
+        # Requires a completed `iris --cluster=marin login` (@openathena.ai).
+        from iris.cli.connect import open_iris_client
+
+        client_cm = open_iris_client(config_file=Path(submit_cluster_config), workspace=PROJECT_ROOT)
+    else:
+        client_cm = _direct_client()
+
+    with client_cm as client:
         entrypoint = Entrypoint.from_command(*command)
         job = client.submit(
             entrypoint=entrypoint,

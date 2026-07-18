@@ -585,8 +585,24 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         torch.cuda.empty_cache()
 
+        # #1685 fix ported from fsdp_worker.broadcast_to_inference_engines (FlashInfer-CUTLASS
+        # w13 gate/up swap skipped on the megatron RL update path -> MoE token-salad): bracket
+        # the WHOLE multi-chunk sync with vLLM's layerwise reload so per-chunk model.load_weights
+        # DEFER processing and a single finalize re-runs process_weights_after_loading
+        # (re-applying swap_w13_to_w31) EXACTLY once. Without it the engine holds checkpoint
+        # [gate;up] while the FlashInfer-CUTLASS kernel reads [up;gate]. Swap-inert on
+        # triton/dense backends, so byte-identical there. Gated by env for safety. Rank-0 drives
+        # the engine RPC (same global-rank-0 semantics the broadcast/update loop uses below).
+        _w13_bracket = not self.use_cuda_ipc and os.environ.get("SKYRL_W13_RELOAD_BRACKET", "1") == "1"
+
         # Extract weights using the initialized extractor
         if not self.use_cuda_ipc:
+            # Open the layerwise-reload bracket (rank 0 drives the engine RPC).
+            if _w13_bracket and torch.distributed.get_rank() == 0:
+                await inference_engine_client.begin_weight_reload()
+            if _w13_bracket:
+                torch.distributed.barrier()
+
             # Broadcast path: one chunk per parameter
             # NOTE: need to optimize this to use buckets for non-colocated weight sync as well
             for chunk in self.weight_extractor.extract_weights(generator_dtype):
@@ -615,6 +631,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 if torch.distributed.get_rank() == 0:
                     await update_weight_task
                 torch.distributed.barrier()
+
+            # Close the layerwise-reload bracket: finalize_layerwise_reload re-runs
+            # process_weights_after_loading over every layer ONCE -> re-applies the
+            # FlashInfer-CUTLASS w13 [gate;up]->[up;gate] swap the per-chunk loads skipped.
+            if _w13_bracket:
+                torch.distributed.barrier()
+                if torch.distributed.get_rank() == 0:
+                    await inference_engine_client.finish_weight_reload()
         else:
             # CUDA IPC path: one chunk per bucket (for packing)
             device = torch.cuda.current_device()

@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import re
@@ -45,6 +44,9 @@ from harbor.models.trial.result import TrialResult
 
 # Schema-driven Harbor config mapping
 from examples.terminal_bench.harbor_config import HarborConfigBuilder
+
+# Incremental, trial-indexed reader for the shared opencode literal log.
+from examples.terminal_bench.literal_log_store import LiteralLogStore
 
 # Maximum restart attempts for orchestrator recovery
 MAX_ORCHESTRATOR_RESTART_ATTEMPTS = 3
@@ -228,6 +230,9 @@ class TerminalBenchGenerator(GeneratorInterface):
         except Exception:  # pragma: no cover - defensive: cfg may not be a mapping
             _cfg_literal_log = ""
         self._literal_log_path = _cfg_literal_log or os.environ.get("OTAGENT_LITERAL_LOG_PATH") or None
+        # Incremental, trial-indexed reader over that shared log (owns its own lock +
+        # typed cursor state). Read-only; the writer is the external harbor RecordProxy.
+        self._literal_log_store = LiteralLogStore()
         self.generator_cfg = generator_cfg
         self.tokenizer = tokenizer
         self.model_name = generator_cfg.model_name
@@ -1304,37 +1309,6 @@ class TerminalBenchGenerator(GeneratorInterface):
             return False
         return bool(main.get("logprobs"))
 
-    def _load_literal_log_entries(self, log_path: str) -> List[Dict[str, Any]]:
-        """Parse the shared RecordProxy literal log (JSONL) into entry dicts.
-
-        Cached by (path, size) so a batch of N concurrent trials parses the growing
-        log at most once per size (avoids O(N * logsize) re-reads). Returns [] on any
-        read/parse failure — correlation then no-ops and TIS flags the trial honestly.
-        """
-        try:
-            size = os.stat(log_path).st_size
-        except OSError:
-            return []
-        key = (log_path, size)
-        cache = getattr(self, "_literal_log_cache", None)
-        if cache is not None and cache[0] == key:
-            return cache[1]
-        entries: List[Dict[str, Any]] = []
-        try:
-            with open(log_path) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            return []
-        self._literal_log_cache = (key, entries)
-        return entries
-
     def _maybe_correlate_opencode_rollout_details(
         self,
         result: "TrialResult",
@@ -1367,7 +1341,9 @@ class TerminalBenchGenerator(GeneratorInterface):
         log_path = self._literal_log_path or os.environ.get("OTAGENT_LITERAL_LOG_PATH")
         if not log_path:
             return rollout_details
-        entries = self._load_literal_log_entries(log_path)
+        # Per-trial indexed lookup (O(this trial's entries)); build_rollout_details_for_trial
+        # re-filters by trial_id, so the result is identical to scanning the whole log.
+        entries = self._literal_log_store.entries_for_trial(log_path, trial_id)
         if not entries:
             return rollout_details
         try:
@@ -1432,7 +1408,9 @@ class TerminalBenchGenerator(GeneratorInterface):
         log_path = self._literal_log_path or os.environ.get("OTAGENT_LITERAL_LOG_PATH")
         if not log_path:
             return None
-        entries = self._load_literal_log_entries(log_path)
+        # Per-trial indexed lookup (O(this trial's entries)); already trial-scoped, so the
+        # comprehension only applies the remaining status-200 / completion-bearing filter.
+        entries = self._literal_log_store.entries_for_trial(log_path, trial_id)
         if not entries:
             return None
         # Same selection as build_rollout_details_for_trial (trial-scoped, status-200,

@@ -36,15 +36,23 @@ except ImportError:
     pytest.skip("harbor without the literal rollout_build bridge", allow_module_level=True)
 
 
+# The incremental reader itself is unit-tested standalone in test_literal_log_store.py
+# (no harbor dependency). Here we only exercise the harbor-facing correlation +
+# chat_history helpers, injecting a real store exactly as TerminalBenchGenerator.__init__
+# does — the reader is a collaborator, not a bound method on the fake self.
+from terminal_bench.literal_log_store import LiteralLogStore  # noqa: E402
+
 _correlate = TerminalBenchGenerator._maybe_correlate_opencode_rollout_details
-_load = TerminalBenchGenerator._load_literal_log_entries
+
+
+def _attach_store(s):
+    s._literal_log_store = LiteralLogStore()
+    return s
 
 
 def _fake_self(collect=True, literal_log_path=None):
     s = types.SimpleNamespace(_collect_rollout_details=collect, _literal_log_path=literal_log_path)
-    # bind the log loader so the correlate helper can call self._load_literal_log_entries
-    s._load_literal_log_entries = types.MethodType(_load, s)
-    return s
+    return _attach_store(s)
 
 
 def _result(trial_id, rollout_details=None):
@@ -141,15 +149,6 @@ def test_noop_when_trial_absent_from_log(tmp_path, monkeypatch):
     assert _correlate(_fake_self(), _result("Z"), None) is None
 
 
-def test_load_entries_caches_by_size(tmp_path):
-    p = _write_log(tmp_path, [_entry("A", 1.0, [1], [10], [-0.1])])
-    s = _fake_self()
-    first = s._load_literal_log_entries(p)
-    second = s._load_literal_log_entries(p)
-    assert first == second and len(first) == 1
-    assert getattr(s, "_literal_log_cache")[0][0] == p
-
-
 # --- opencode chat_history reconstruction (feeds _process_trial_result) ---------
 
 _build_chat = TerminalBenchGenerator._maybe_build_opencode_chat_history
@@ -169,8 +168,7 @@ def _chat_self(collect=True, tokenizer=None, literal_log_path=None):
         tokenizer=tokenizer or _FakeTokenizer(),
         _literal_log_path=literal_log_path,
     )
-    s._load_literal_log_entries = types.MethodType(_load, s)
-    return s
+    return _attach_store(s)
 
 
 def test_chat_history_resolves_log_from_cfg_path_when_env_unset(tmp_path, monkeypatch):

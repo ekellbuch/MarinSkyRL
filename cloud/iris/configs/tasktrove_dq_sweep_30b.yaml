@@ -40,7 +40,7 @@ terminal_bench:
     # stay bounded by opencode's limit.context sliding window (harbor #11).
     opencode_config: {}
     override_setup_timeout_sec: 600  # opencode installs via nvm + npm at setup
-    override_timeout_sec: 1800
+    override_timeout_sec: 1800  # 30min: ABOVE the healthy-trial p90 (~19min) so real trials finish; the harbor kill-path fix (--harbor-ref, server-side `timeout`) now FORCIBLY reaps a runaway at this deadline (was a no-op before → 0 completions). A shorter ceiling would murder healthy trials mid-task.
 
     override_cpus: 1
     override_memory_mb: 2048
@@ -197,7 +197,11 @@ trainer:
   ref:
     model:
       # POLICY §2 base model (also passed as the policy --model_path at launch).
-      path: Qwen/Qwen3-30B-A3B-Thinking-2507
+      # PIVOTED to Coder-Instruct (operator 2026-07-18): better agentic tool-use; the
+      # -Thinking-2507 model looped/never self-terminated opencode (v8-v11) → all trials
+      # AgentTimeout→reward 0. Coder-Instruct is the base config's NATIVE model (reverses
+      # the earlier Coder→Thinking swap); same Qwen3MoE arch → TP4/EP4 geometry unchanged.
+      path: Qwen/Qwen3-Coder-30B-A3B-Instruct
     megatron_config:
       tensor_model_parallel_size: 4
       pipeline_model_parallel_size: 2
@@ -288,7 +292,11 @@ generator:
   enable_ray_prometheus_stats: false
   vllm_stats_interval: 1
   append_eos_token_after_stop_str_in_multi_turn: true
-  max_turns: 999999
+  # BOUNDED turn cap (fullgate proven-green value). 999999 (unbounded) let the
+  # -Thinking-/compaction-off opencode agent loop without self-terminating until the
+  # override_timeout_sec wall -> verifier never ran -> 0 result.json -> 0 completions.
+  # Reference healthy trial = ~8 sequential calls; 30 is a generous safety net.
+  max_turns: 30
 
   sampling_params:
     max_generate_length: 16384
@@ -298,18 +306,26 @@ generator:
 
   engine_init_kwargs:
     max_model_len: 131072
-    custom_chat_template_chat_completion_path: chat_templates/qwen3_thinking_acc.jinja2
+    # NO custom chat template: Qwen/Qwen3-Coder-30B-A3B-Instruct's NATIVE HF chat_template
+    # emits the Qwen3-Coder XML function-call format the qwen3_coder parser expects. Omitting
+    # custom_chat_template_chat_completion_path makes the vLLM chat endpoint pass chat_template=None
+    # (vllm_engine.py:1630), so it falls back to the model's tokenizer template. The old
+    # qwen3_thinking_acc.jinja2 was a -Thinking- artifact that FORCED the hermes <tool_call>{json}
+    # format onto Coder (which was not trained for it → tool_use=0). (The 32GPU coder throughput
+    # config keeps that jinja only because it drives TERMINUS-2, which parses tool calls itself
+    # and never hits the vLLM OpenAI tool parser — opencode does, so the format must match.)
     disable_custom_all_reduce: true
     enable_return_routed_experts: true
     async_scheduling: false
     # opencode sends tool_choice:"auto"; without tool-calling enabled the engine returns
     # '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser',
-    # opencode exits 1, every rollout = NonZeroAgentExit reward 0. The terminus-2 30B base
-    # omits these (added only to the 8B opencode smoke by #29). hermes = the Qwen3
-    # dense/THINKING <tool_call> format (our model is Qwen3-30B-A3B-Thinking-2507, NOT
-    # Qwen3-Coder → hermes, not qwen3_coder). Model/harness issue, backend-independent.
+    # opencode exits 1, every rollout = NonZeroAgentExit reward 0. qwen3_coder = the native
+    # Qwen3-Coder XML function-call parser (registered in the pinned vLLM 0.20.2:
+    # tool_parsers/__init__.py "qwen3_coder"), matching the model's native chat_template above.
+    # hermes was the -Thinking- <tool_call>{json} format — never matched Coder's output (v13
+    # tool_use=0). Model/harness setting, backend-independent.
     enable_auto_tool_choice: true
-    tool_call_parser: hermes
+    tool_call_parser: qwen3_coder
 
 data:
   train_data: []

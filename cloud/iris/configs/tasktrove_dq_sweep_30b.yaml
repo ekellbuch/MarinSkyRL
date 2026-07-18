@@ -62,7 +62,15 @@ terminal_bench:
       - VerifierOutputParseError
       - VerifierRuntimeError
 
-    n_concurrent_trials: 288
+    # TUNED 288 -> 64 (keep1-v8 fix): the vLLM engine has only 48 decode slots
+    # (max_num_seqs 24 x num_inference_engines 2), so decode throughput is identical at
+    # 64 or 288 — the extra 240 trials just queue >5 min and get Daytona-idle-reaped
+    # (harbor auto_stop_interval_mins=5, delete-on-stop; opencode's HTTP model turns do
+    # NOT reset the exec-based idle timer, unlike terminus-2), yielding "Sandbox not
+    # found" on 100% of trials. 64 > 48 keeps engines saturated with no queue-idle.
+    # (To make higher concurrency actually pay: raise max_num_seqs and/or fix harbor's
+    # idle-reap to reset on model-endpoint activity — see agent_log follow-ups.)
+    n_concurrent_trials: 64
 
     log_level: INFO
 

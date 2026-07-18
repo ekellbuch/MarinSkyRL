@@ -924,6 +924,19 @@ def create_parser() -> argparse.ArgumentParser:
         f"byte-identical, no install). Default: {DEFAULT_IRIS_VERSION}.",
     )
     parser.add_argument(
+        "--boto-pin",
+        "--boto_pin",
+        dest="boto_pin",
+        default=None,
+        help="Override the boto snapshot restored after the marin-iris solve with an "
+        "explicit space-separated pin set, e.g. "
+        '"botocore==1.43.48 boto3==1.43.48 s3transfer==0.19.1". Use when a fresh image '
+        "baked a NEWER botocore that renamed DocumentModifiedShape->DocumentedShape "
+        "(breaks the iris/s3 integration sentinel). Default: freeze+restore the image's "
+        "baked boto (correct for the fullgate e8b48241 image). Only applies under "
+        "--ingress-mode controller.",
+    )
+    parser.add_argument(
         "--harbor-ref",
         "--harbor_ref",
         dest="harbor_ref",
@@ -1505,10 +1518,25 @@ def build_task_command(args: argparse.Namespace) -> List[str]:
     iris_refresh = ""
     if getattr(args, "ingress_mode", "direct") == "controller":
         ispec = getattr(args, "iris_ref", None) or DEFAULT_IRIS_VERSION
+        # Boto snapshot source. Default: freeze the IMAGE's baked boto and restore it
+        # after the marin-iris solve (the GAP E#2 guard). BUT a fresh image can bake a
+        # NEWER botocore that renamed `DocumentModifiedShape`->`DocumentedShape` (the
+        # megatron-98f4dfe0 image, built off current main), so restoring the baked pin
+        # still fails the `DocumentModifiedShape` sentinel + our iris/s3 integration.
+        # `--boto-pin "botocore==X boto3==Y s3transfer==Z"` OVERRIDES the snapshot with an
+        # explicit, known-good set (the fullgate e8b48241 image's 1.43.48/1.43.48/0.19.1)
+        # so drifted-boto images get force-repinned to the validated versions.
+        boto_pin = getattr(args, "boto_pin", None)
+        if boto_pin:
+            boto_capture = f"_BOTO_BAKED={shlex.quote(boto_pin)}; "
+        else:
+            boto_capture = (
+                f"_BOTO_BAKED=$(uv pip freeze --python {shlex.quote(RL_PYTHON)} 2>/dev/null | "
+                f"grep -iE '^(botocore|boto3|s3transfer|awscli)==' | tr '\\n' ' ' || true); "
+            )
         iris_refresh = (
-            f"_BOTO_BAKED=$(uv pip freeze --python {shlex.quote(RL_PYTHON)} 2>/dev/null | "
-            f"grep -iE '^(botocore|boto3|s3transfer|awscli)==' | tr '\\n' ' ' || true); "
-            f'echo "[rl-iris] boto baked pins: $_BOTO_BAKED"; '
+            boto_capture
+            + f'echo "[rl-iris] boto baked pins: $_BOTO_BAKED"; '
             f"uv pip install --python {shlex.quote(RL_PYTHON)} {shlex.quote(ispec)}; "
             f'if [ -n "$_BOTO_BAKED" ]; then uv pip install --python '
             f"{shlex.quote(RL_PYTHON)} --no-deps $_BOTO_BAKED; fi; "

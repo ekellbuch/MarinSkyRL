@@ -62,6 +62,11 @@ terminal_bench:
       - VerifierOutputParseError
       - VerifierRuntimeError
 
+    # Prod concurrency (demand target). Paired IN LOCKSTEP with the decode-capacity
+    # supply lever below (max_num_seqs x num_inference_engines) per marinskyrl.md — never
+    # permute this alone. The old Daytona idle-reap that made 288 fail (keep1-v8) is fixed
+    # at the harbor layer (auto_stop_interval_mins 5->0, ride via --harbor-ref), so
+    # sandboxes now survive the queue depth; decode capacity (raised below) sets throughput.
     n_concurrent_trials: 288
 
     log_level: INFO
@@ -237,12 +242,24 @@ generator:
 
   enforce_eager: false
 
-  inference_engine_tensor_parallel_size: 8
-  num_inference_engines: 2
+  # Inference GEOMETRY repartitioned 2xTP8/DCP2 -> 4xTP4/DCP1/EP4 (keep1-v10, KV-131k
+  # validated). TP8 was TP-comm waste for a 30B-A3B (~3B active) AND mis-aligned to the
+  # model's 4 KV heads (replicates 2x unless DCP2 rescues). TP4 = 4 KV heads split EXACTLY
+  # 1/GPU (no replication, DCP unnecessary=1), 4 independent schedulers over 16 GPUs (2x
+  # aggregate slots vs v9's 48, halved TP all-reduce group = the real win). KV-at-131k:
+  # a full 131k seq = 12 GiB across the model -> 3.0 GiB/GPU at TP4 = 6.4% of the ~47 GB
+  # pool (15.7x margin; ~15-17 full-131k seqs/engine). TP2 rejected (~5 seqs/engine @131k).
+  # Mirrors the proven sibling 64GPU_qwen3_6_35b_a3b.yaml (8xTP4/DCP1/EP4). 4xTP4=16 GPUs.
+  inference_engine_tensor_parallel_size: 4
+  num_inference_engines: 4
 
-  inference_engine_expert_parallel_size: 1
+  # EP-shard the 128 experts (32/GPU) — standard MoE-inference path at TP4 (was 1).
+  inference_engine_expert_parallel_size: 4
 
-  inference_engine_decode_context_parallel_size: 2
+  # DCP=1: at TP4 each GPU already holds exactly 1 KV head, so no decode-context split is
+  # needed (DCP existed to de-replicate KV at TP8). DCP1 + enable_return_routed_experts is
+  # the proven routed-experts path (35B sibling) — removes the routed-experts x DCP interaction.
+  inference_engine_decode_context_parallel_size: 1
 
   inference_engine_mp_backend: false
 
@@ -251,6 +268,12 @@ generator:
 
   gpu_memory_utilization: 0.80
 
+  # Per-engine decode slots. 24 x 4 engines = 96 aggregate (2x v9's 48). 24 is 1.5x the
+  # pure-131k KV capacity (~15-17/engine), backstopped by chunked-prefill + vLLM preemption
+  # (opencode contexts are bounded to ~113k and mostly short, KV was 1-8%). Push to 32
+  # (128 aggregate) after confirming KV-cache-usage stays off-ceiling in the sweep — the
+  # engines are slot-bound, not KV-bound. Drop gpu_memory_utilization 0.80->0.75 or this
+  # value first on any KV-bind OOM (never TP).
   max_num_seqs: 24
   max_num_batched_tokens: 16384
 

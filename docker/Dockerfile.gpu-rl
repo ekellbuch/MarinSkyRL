@@ -222,9 +222,17 @@ COPY skyrl-gym ${SKYRL_HOME}/skyrl-train/skyrl-gym
 RUN cd ${SKYRL_HOME} && \
     git init -q -b main && \
     git remote add origin https://github.com/marin-community/MarinSkyRL.git && \
-    git -c user.email=build@openthoughts.ai -c user.name=gpu-rl-build add -A && \
-    git -c user.email=build@openthoughts.ai -c user.name=gpu-rl-build commit -q -m "baked gpu-rl image content @ ${GITSHA}" && \
+    git -c user.email=gpu-rl-build@localhost -c user.name=gpu-rl-build add -A && \
+    git -c user.email=gpu-rl-build@localhost -c user.name=gpu-rl-build commit -q -m "baked gpu-rl image content @ ${GITSHA}" && \
     echo "/opt/skyrl git tree baked @ $(git -C ${SKYRL_HOME} rev-parse HEAD) (origin=marin-community/MarinSkyRL, source @ ${GITSHA})"
+
+# Machine-readable capability marker: the baked skyrl-train above carries the
+# controller-ingress serving wiring (terminal_bench_generator.CONTROLLER_INGRESS_WIRED),
+# so an `--ingress-mode controller` opencode-RL launch produces real rollouts. The iris
+# launcher auto-detects the wiring from the generator SOURCE it ships; this LABEL is the
+# optional registry-side counterpart for verifying a bespoke `--image`
+# (`docker inspect`/crane -> skyrl.controller_ingress_wired=true).
+LABEL skyrl.controller_ingress_wired=true
 
 # =============================================================================
 # RL environment — installed DIRECTLY from skyrl-train's uv.lock (single source of
@@ -235,12 +243,14 @@ RUN cd ${SKYRL_HOME} && \
 # all linux/x86_64-gated with the erictang cu128 wheels honored via [tool.uv.sources]).
 # No UV_CONSTRAINT / rl_env_constraints: the lock IS the constraint.
 # =============================================================================
-# RL venv path MUST match the OT-Agent iris launcher's hardcoded
-# RL_PYTHON=/opt/openthoughts/envs/rl/bin/python (rl/cloud/launch_rl_iris.py) —
-# the same path the standard FSDP2 gpu-rl image uses. Building it under
-# /opt/skyrl/envs/rl made every task die with
-# "/opt/openthoughts/envs/rl/bin/python: No such file or directory".
-ENV RL_ENV_DIR=/opt/openthoughts/envs/rl
+# RL venv path MUST match the iris launcher's hardcoded
+# RL_PYTHON=/opt/marin/envs/rl/bin/python (cloud/iris/launch_rl_iris.py) — the two
+# are COUPLED: the launcher references this exact path in the pod command, so a
+# change here requires the same change there (and vice versa) or every task dies with
+# "/opt/marin/envs/rl/bin/python: No such file or directory". Keep it OUTSIDE
+# ${SKYRL_HOME}=/opt/skyrl so the baked git working tree / --skyrl-ref checkout never
+# sees the venv as untracked content.
+ENV RL_ENV_DIR=/opt/marin/envs/rl
 ENV UV_PROJECT_ENVIRONMENT=${RL_ENV_DIR}
 # =============================================================================
 # RE-LAYERED uv sync (packaging only — SAME lock, SAME closure, SAME versions).

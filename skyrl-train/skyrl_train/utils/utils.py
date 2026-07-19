@@ -1102,7 +1102,7 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     # overhead; the model/training config is unchanged so the trace localizes
     # the SAME deadlock. (NCCL_DEBUG / NCCL_DEBUG_SUBSYS are forced to INFO AFTER
     # the launcher-env forwarding loop below -- see the override there -- because
-    # the OT-Agent launcher exports NCCL_DEBUG=WARN, which the forwarding loop
+    # the iris launcher exports NCCL_DEBUG=WARN, which the forwarding loop
     # would otherwise copy in and clobber an INFO set here.)
     #
     # Flight-recorder buffer size: torch 2.9 renamed TORCH_NCCL_TRACE_BUFFER_SIZE

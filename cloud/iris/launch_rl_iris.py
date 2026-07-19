@@ -10,7 +10,7 @@ launcher). It combines:
     job-name, max-retries, workspace source-sync to /app).
 
 The target is GPU (not TPU), and the gpu-rl image is a conda-venv image
-(/opt/openthoughts/envs/rl), so this launcher drives the iris SDK's GPU helpers
+(/opt/marin/envs/rl), so this launcher drives the iris SDK's GPU helpers
 (build_resources(gpu=...), gpu_device, the leafgroup-coscheduling
 ``resolve_multinode_defaults``) directly rather than going through a TPU-shaped
 base launcher.
@@ -385,13 +385,13 @@ def _resolve_default_disk(fraction: float = DISK_FRACTION) -> str:
 
 
 # The gpu-rl image's RL venv (deps-only: torch 2.11 + vLLM fork + skyrl editable).
-RL_PYTHON = "/opt/openthoughts/envs/rl/bin/python"
+RL_PYTHON = "/opt/marin/envs/rl/bin/python"
 SKYRL_HOME = "/opt/skyrl"
 # In-container source sync target. iris syncs the launcher's `workspace`
 # (this MarinSkyRL repo, PROJECT_ROOT — see IrisClient.remote(..., workspace=PROJECT_ROOT))
 # to /app and sets IRIS_WORKDIR=/app; putting /app first on PYTHONPATH makes the live
 # synced cloud.iris + skyrl-train code win over the image's baked copies. The runtime is
-# self-contained here (cloud.iris.*) — no OpenThoughts-Agent workspace is required in-pod.
+# self-contained here (cloud.iris.*) — no external launcher workspace is required in-pod.
 APP_DIR = "/app"
 
 # marin-iris wheel installed into the RL venv at pod bootstrap for the controller-ingress
@@ -456,6 +456,37 @@ def _cluster_dashboard_host(cluster_config_path: Optional[str]) -> Optional[str]
         return None
 
 
+_GENERATOR_SOURCE = PROJECT_ROOT / "skyrl-train" / "examples" / "terminal_bench" / "terminal_bench_generator.py"
+_CONTROLLER_INGRESS_SENTINEL = "CONTROLLER_INGRESS_WIRED = True"
+
+
+def _generator_controller_ingress_wired() -> bool:
+    """Auto-detect (network-free) whether the terminal_bench generator carries the
+    controller-ingress serving wiring — the ``agent_api_base <- HARBOR_MODEL_ENDPOINT``
+    plumbing plus the literal-bridge correlation that make ``--ingress-mode controller``
+    produce real rollouts instead of a silent 0-reward run.
+
+    The generator exports a ``CONTROLLER_INGRESS_WIRED = True`` capability sentinel; we
+    grep the source file that ships in THIS checkout (the code that is baked into the
+    gpu-rl image's ``/opt/skyrl`` at build time, and the same tree a ``--skyrl-ref``
+    checkout resolves against). Reading the source is deliberately dependency-free — the
+    generator module itself pulls in harbor/vLLM and is not importable on the submit host.
+
+    This replaces the retired ``SKYRL_IRIS_ALLOW_UNBAKED_GENERATOR`` manual assertion: the
+    wiring has been unconditionally on ``main`` since the cross-cluster opencode-RL ingress
+    landed (PR #14), so every gpu-rl image built from current ``main`` bakes it, and the
+    sentinel makes the invariant machine-checkable rather than a "trust me" env var. NOTE:
+    this checks the repo lineage, not the bytes of an arbitrary ``--image``; a custom image
+    built BEFORE the wiring merged is the one case the source check cannot see — the
+    Dockerfile also stamps ``LABEL skyrl.controller_ingress_wired=true`` for a manual
+    ``docker inspect`` / registry verification of a bespoke image.
+    """
+    try:
+        return _CONTROLLER_INGRESS_SENTINEL in _GENERATOR_SOURCE.read_text()
+    except OSError:
+        return False
+
+
 def validate_controller_ingress_reachability(args: argparse.Namespace) -> None:
     """Fail loud BEFORE submit when ``--ingress-mode controller`` would produce a
     capability URL a Daytona sandbox CANNOT reach — the Exp2 opencode-RL blocker
@@ -482,33 +513,36 @@ def validate_controller_ingress_reachability(args: argparse.Namespace) -> None:
         CoreWeave is ALLOWED iff ``--target-cluster`` is set and ``--ingress-host`` is
         the marin host.
 
-    Escape hatch (once a further remediation is wired): ``OTAGENT_ALLOW_INGRESS_HOST_MISMATCH=1``.
+    Escape hatch (once a further remediation is wired): ``SKYRL_IRIS_ALLOW_INGRESS_HOST_MISMATCH=1``.
     """
     if getattr(args, "ingress_mode", "direct") != "controller":
         return
     # The opencode-RL generator ingress wiring — terminal_bench_generator.py setting the
-    # agent api_base from HARBOR_MODEL_ENDPOINT, and the literal-bridge S5 correlation — is
-    # NOT baked into the gpu-rl image's /opt/skyrl clone (only cloud.iris.* rides the /app
-    # sync; examples.terminal_bench.* loads from baked /opt/skyrl). Without --skyrl-ref, the
-    # baked generator runs: opencode's base URL resolves to `undefined` (every call fails,
-    # 0 reward) AND rollout_details are never correlated (all-None logprobs) — a SILENT
-    # 4-hour-run-wasting failure (fullgate1, 2026-07-16). Block it before GPU allocation.
-    if not getattr(args, "skyrl_ref", None) and os.environ.get("OTAGENT_ALLOW_UNBAKED_GENERATOR") != "1":
+    # agent api_base from HARBOR_MODEL_ENDPOINT, and the literal-bridge correlation — is what
+    # keeps a controller-ingress launch from becoming a SILENT 0-reward run: without it
+    # opencode's base URL resolves to `undefined` (every call fails, 0 reward) AND
+    # rollout_details are never correlated (all-None logprobs) — a 4-hour-run-wasting failure
+    # (fullgate1, 2026-07-16). That wiring is now unconditionally on main (PR #14) and baked
+    # into every current gpu-rl image, so instead of the retired SKYRL_IRIS_ALLOW_UNBAKED_GENERATOR
+    # manual "trust me" assertion we AUTO-DETECT the CONTROLLER_INGRESS_WIRED sentinel in the
+    # generator source that ships in this checkout (== what gets baked / hot-loaded via
+    # --skyrl-ref). Block only when the wiring is genuinely absent from the code that will run.
+    if not _generator_controller_ingress_wired():
         raise SystemExit(
-            "[rl-iris] BLOCKED: --ingress-mode controller needs --skyrl-ref <branch with the "
-            "controller-ingress generator wiring> (e.g. feuer/opencode-literal-bridge-s8). The "
-            "HARBOR_MODEL_ENDPOINT->agent api_base + literal-bridge correlation live in "
-            "skyrl-train/examples/terminal_bench/terminal_bench_generator.py, which the pod "
-            "loads from the BAKED /opt/skyrl (NOT the /app sync). Without it opencode's base "
-            "URL is `undefined` (0 reward) and rollout_details are never correlated (all-None "
-            "logprobs).\n"
-            "  Fix: add --skyrl-ref <that branch> (pair it with --harbor-ref for the harbor "
-            "bridge). Override (only once the wiring is baked into the image): "
-            "OTAGENT_ALLOW_UNBAKED_GENERATOR=1."
+            "[rl-iris] BLOCKED: --ingress-mode controller requires the controller-ingress "
+            "generator wiring, but the CONTROLLER_INGRESS_WIRED sentinel was NOT found in "
+            "skyrl-train/examples/terminal_bench/terminal_bench_generator.py in this checkout. "
+            "Without it opencode's agent api_base is `undefined` (0 reward) and rollout_details "
+            "are never correlated (all-None logprobs) — a silent run-wasting failure.\n"
+            "  Fix: update MarinSkyRL to a commit that carries the wiring (it has been on main "
+            "since PR #14, the cross-cluster opencode-RL serving ingress), or pass --skyrl-ref "
+            "<such a branch>. The wiring is baked into every current gpu-rl image; a custom "
+            "pre-wiring --image is the only case this source check cannot see (verify it via "
+            "`docker inspect`/crane for LABEL skyrl.controller_ingress_wired=true)."
         )
-    if os.environ.get("OTAGENT_ALLOW_INGRESS_HOST_MISMATCH") == "1":
+    if os.environ.get("SKYRL_IRIS_ALLOW_INGRESS_HOST_MISMATCH") == "1":
         print(
-            "[rl-iris] WARNING: OTAGENT_ALLOW_INGRESS_HOST_MISMATCH=1 — skipping the "
+            "[rl-iris] WARNING: SKYRL_IRIS_ALLOW_INGRESS_HOST_MISMATCH=1 — skipping the "
             "controller-ingress reachability guard.",
             flush=True,
         )
@@ -535,7 +569,7 @@ def validate_controller_ingress_reachability(args: argparse.Namespace) -> None:
                 "the job through the marin meta-scheduler (keep --ingress-host iris.oa.dev), "
                 "so marin delegates it to the peer and federation-proxies /proxy.\n"
                 "  Override (only once another remediation is wired): "
-                "OTAGENT_ALLOW_INGRESS_HOST_MISMATCH=1."
+                "SKYRL_IRIS_ALLOW_INGRESS_HOST_MISMATCH=1."
             )
         if ingress_host and ingress_host != "iris.oa.dev":
             raise SystemExit(
@@ -552,12 +586,12 @@ def validate_controller_ingress_reachability(args: argparse.Namespace) -> None:
         raise SystemExit(
             f"[rl-iris] BLOCKED: --ingress-host {ingress_host} does not match this "
             f"cluster's controller host {dash_host} (--cluster={cluster}). Override with "
-            "OTAGENT_ALLOW_INGRESS_HOST_MISMATCH=1."
+            "SKYRL_IRIS_ALLOW_INGRESS_HOST_MISMATCH=1."
         )
 
 
 def _default_secrets_env() -> Optional[str]:
-    cand = os.environ.get("OT_AGENT_SECRETS_ENV") or os.path.expanduser("~/Documents/secrets.env")
+    cand = os.environ.get("SKYRL_IRIS_SECRETS_ENV") or os.path.expanduser("~/Documents/secrets.env")
     return cand if os.path.isfile(cand) else None
 
 
@@ -866,7 +900,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="In-pod path to the parent (marin) cluster YAML the in-pod worker mints "
         "against, if it differs from the launch-host --parent-cluster-config path. "
         "Defaults to the launch-host resolved marin.yaml path (must be materialized "
-        "in-pod — see the OTAGENT_PARENT_CONTROLLER_CONFIG forwarding NOTE).",
+        "in-pod — see the SKYRL_IRIS_PARENT_CONTROLLER_CONFIG forwarding NOTE).",
     )
     parser.add_argument(
         "--forward-marin-login",
@@ -886,7 +920,7 @@ def create_parser() -> argparse.ArgumentParser:
         dest="secrets_env",
         default=_default_secrets_env(),
         help="KEY=VALUE env file injected into the task (HF_TOKEN, WANDB_API_KEY, etc.). "
-        "Defaults to $OT_AGENT_SECRETS_ENV, else ~/Documents/secrets.env.",
+        "Defaults to $SKYRL_IRIS_SECRETS_ENV, else ~/Documents/secrets.env.",
     )
     parser.add_argument(
         "--daytona-api-key-env",
@@ -1314,7 +1348,7 @@ def build_task_command(args: argparse.Namespace) -> List[str]:
             train_cmd.extend(["--target_cluster", args.target_cluster])
             # Parent (marin) config the in-pod worker mints against. Prefer an explicit
             # in-pod path; else pass the resolved marin.yaml path (must be materialized
-            # in-pod — see the OTAGENT_PARENT_CONTROLLER_CONFIG env forwarding + NOTE).
+            # in-pod — see the SKYRL_IRIS_PARENT_CONTROLLER_CONFIG env forwarding + NOTE).
             parent_cfg_in_pod = getattr(args, "parent_controller_config_in_pod", None) or (
                 args.parent_cluster_config or _resolve_parent_cluster_config(args.cluster_config)
             )
@@ -1369,7 +1403,7 @@ def build_task_command(args: argparse.Namespace) -> List[str]:
     if args.rendezvous_timeout is not None:
         controller_cmd.extend(["--rendezvous-timeout", str(args.rendezvous_timeout)])
     # Per-NODE task-dataset staging. run_rl.py's resolve_rl_train_data() extracts the
-    # HF task dataset to the node-local $DCFT=/opt/openthoughts/tasks/ (gpu-rl image),
+    # HF task dataset to the node-local $DCFT=/opt/marin/tasks/ (gpu-rl image),
     # but it runs ONLY on rank 0 (the head), so the Ray-scheduled rollout workers on
     # ranks 1..N-1 find an empty tasks dir and every rollout dies with
     # FileNotFoundError: .../task.toml -> reward always 0 (data-starved, doomed run).
@@ -1597,7 +1631,7 @@ def main() -> int:
 
     # Load --secrets-env into os.environ on the launch host (so launch-host
     # hooks see it) AND collect them for injection into the task. Reuse the
-    # (file overrides shell; same semantics as the OT-Agent iris launchers).
+    # (file overrides shell; same semantics as the prior iris launchers).
     load_secrets_env_into_os_environ(args.secrets_env)
 
     # Daytona org re-route (robust). load_secrets_env_into_os_environ() above does
@@ -1741,8 +1775,8 @@ def main() -> int:
                 env_vars[_fr_cvar] = _new
                 print(f"[rl-iris] FR-slug re-scope: {_fr_cvar} {_old} -> {_new}", flush=True)
     if args.rendezvous_dir:
-        env_vars["OT_AGENT_IRIS_RENDEZVOUS_DIR"] = args.rendezvous_dir
-    env_vars["OT_AGENT_IRIS_RAY_PORT"] = str(args.ray_port)
+        env_vars["SKYRL_IRIS_IRIS_RENDEZVOUS_DIR"] = args.rendezvous_dir
+    env_vars["SKYRL_IRIS_IRIS_RAY_PORT"] = str(args.ray_port)
     # Forward the launch host's secrets (mirrors launch_eval_iris.py passthrough).
     #
     # IMPORTANT — do NOT forward AWS_*/R2_* here. The cw-us-east-02a cluster

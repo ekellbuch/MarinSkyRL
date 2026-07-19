@@ -1,7 +1,7 @@
 """literal_proxy_utils.py — co-located RecordProxy wiring for literal-token capture.
 
 Drives harbor's LITERAL-TOKEN trace machinery (``harbor.literal.proxy.RecordProxy``)
-from the OT-Agent launch path. When ``--record_literal`` is set, the RL / datagen
+from the iris launch path. When ``--record_literal`` is set, the RL / datagen
 launchers co-locate a :class:`~harbor.literal.proxy.RecordProxy` alongside the
 on-cluster vLLM server and route the agent's inference endpoint THROUGH the proxy.
 The proxy transparently injects ``return_token_ids=True`` / ``logprobs=True`` into
@@ -162,7 +162,7 @@ def _local_staging_path(job_name: str, token: str) -> Path:
     CWD-relative) so it is robust regardless of the worker's working directory. Carries
     the same per-serve ``token`` as the remote URI so staging + upload stay in sync.
     """
-    return Path(tempfile.gettempdir()) / "ot-agent-literal" / _literal_log_name(job_name, token)
+    return Path(tempfile.gettempdir()) / "skyrl-iris-literal" / _literal_log_name(job_name, token)
 
 
 def literal_proxy_endpoint(host: str = DEFAULT_LITERAL_PROXY_HOST, port: int = DEFAULT_LITERAL_PROXY_PORT) -> str:
@@ -352,6 +352,6 @@ def maybe_serve_literal_proxy(
     # per-trial x-ot-trial-id. This is the worker-side file the proxy APPENDS to (the
     # staging path when experiments_dir is remote, else the direct log); the correlator
     # reads it locally, never the gs:// upload. Single source of truth for the path.
-    os.environ["OTAGENT_LITERAL_LOG_PATH"] = str(log_path)
+    os.environ["SKYRL_IRIS_LITERAL_LOG_PATH"] = str(log_path)
     with serve_record_proxy(upstream_endpoint, log_path, host=host, port=port, remote_uri=remote_uri) as proxy_endpoint:
         yield proxy_endpoint

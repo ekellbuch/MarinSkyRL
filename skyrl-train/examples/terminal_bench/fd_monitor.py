@@ -1,9 +1,9 @@
 """Self-contained file-descriptor monitor for the SkyRL RL driver.
 
 This is a minimal, dependency-free port of the FileDescriptorMonitor used in
-the OT-Agent datagen path (`hpc/local_runner_utils.py`). It is duplicated here
-on purpose so it does NOT need to import anything from OT-Agent — the RL conda
-env may not have OT-Agent on its path.
+the upstream datagen path (`hpc/local_runner_utils.py`). It is duplicated here
+on purpose so it does NOT need to import anything from that external codebase —
+the RL conda env may not have it on its path.
 
 Goal: log file-descriptor usage of the *driver* process (the one that
 FD-aborts with `uv__epoll_ctl_prep` SIGABRT on long a3 RL chains) every

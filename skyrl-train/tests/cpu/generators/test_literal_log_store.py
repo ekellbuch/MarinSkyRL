@@ -202,6 +202,64 @@ def test_path_change_resets_state(tmp_path):
     assert [e["trial_id"] for e in store.all_entries(str(p2))] == ["B", "B"]
 
 
+def test_release_trial_frees_rows_from_both_index_and_flat_list(tmp_path):
+    """release_trial drops a consumed trial's rows from BOTH by_trial and the flat
+    entries list, so the row dicts are actually freed (bounding memory to in-flight)."""
+    entries = [_entry("A", 1.0, [10]), _entry("B", 1.1, [20]), _entry("A", 2.0, [11])]
+    p = tmp_path / "literal.jsonl"
+    _write(p, entries)
+    store = LiteralLogStore()
+    assert len(store.all_entries(str(p))) == 3
+    store.release_trial("A")
+    # A is gone from both views; B is untouched.
+    assert store.entries_for_trial(str(p), "A") == []
+    assert [e["literal"]["completion_token_ids"] for e in store.entries_for_trial(str(p), "B")] == [[20]]
+    assert [e["trial_id"] for e in store.all_entries(str(p))] == ["B"]
+    assert "A" not in store._state.by_trial
+
+
+def test_release_trial_fences_out_late_appends(tmp_path):
+    """A row appended for a trial AFTER it was released (orphaned opencode still hitting
+    the proxy post-timeout) is ignored — a released trial never regrows."""
+    p = tmp_path / "literal.jsonl"
+    _write(p, [_entry("A", 1.0, [10])])
+    store = LiteralLogStore()
+    assert len(store.entries_for_trial(str(p), "A")) == 1
+    store.release_trial("A")
+    with open(p, "a") as fh:
+        fh.write(json.dumps(_entry("A", 2.0, [11])) + "\n")
+    # The late A row is read past (offset still advances) but not retained.
+    assert store.entries_for_trial(str(p), "A") == []
+    assert store.all_entries(str(p)) == []
+    assert store._state.offset == os.path.getsize(p)
+
+
+def test_release_trial_idempotent_and_noop_when_unknown(tmp_path):
+    """Releasing an unknown trial, or the same trial twice, or before any read, is a
+    safe no-op that never raises."""
+    store = LiteralLogStore()
+    store.release_trial("never-read")  # no state yet
+    p = tmp_path / "literal.jsonl"
+    _write(p, [_entry("A", 1.0, [10])])
+    assert len(store.all_entries(str(p))) == 1
+    store.release_trial("Z")  # unknown trial
+    store.release_trial("A")
+    store.release_trial("A")  # twice
+    assert store.all_entries(str(p)) == []
+
+
+def test_release_of_one_trial_does_not_disturb_a_concurrent_trial(tmp_path):
+    """Interleaved A/B rows: releasing A leaves B's rows and file order intact."""
+    entries = [_entry("A", 1.0, [10]), _entry("B", 1.1, [20]), _entry("A", 2.0, [11]), _entry("B", 2.1, [21])]
+    p = tmp_path / "literal.jsonl"
+    _write(p, entries)
+    store = LiteralLogStore()
+    store.all_entries(str(p))
+    store.release_trial("A")
+    assert [e["literal"]["completion_token_ids"] for e in store.entries_for_trial(str(p), "B")] == [[20], [21]]
+    assert store.entries_for_trial(str(p), "A") == []
+
+
 def test_concurrent_access_is_thread_safe(tmp_path):
     """Concurrent readers + a concurrent appender never corrupt the index or raise. The
     log grows while N threads repeatedly read; every read returns a self-consistent list."""

@@ -48,6 +48,10 @@ class _LiteralLogState:
     identity: Optional[Tuple[int, int]] = None
     entries: List[Dict[str, Any]] = field(default_factory=list)
     by_trial: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    # Trials whose rows have been consumed + dropped (see LiteralLogStore.release_trial).
+    # A released trial's rows are pruned from ``entries`` / ``by_trial`` and any LATER
+    # appended row for it is ignored on refresh, so a released trial never regrows.
+    released: set = field(default_factory=set)
 
 
 class LiteralLogStore:
@@ -71,6 +75,35 @@ class LiteralLogStore:
         with self._lock:
             state = self._refresh(log_path)
             return list(state.by_trial.get(trial_id, ()))
+
+    def release_trial(self, trial_id: str) -> None:
+        """Drop a fully-consumed trial's rows so steady-state memory is O(in-flight
+        trials), not O(whole run).
+
+        The reader is append-only and, on its own, retains EVERY parsed row for the life
+        of the job (``entries`` + ``by_trial``). Over a long high-concurrency opencode RL
+        run the shared log reaches many GB, so that single retained copy grows without
+        bound and eventually pressures the RolloutCoordinator host. Once a trial's
+        rollout_details + chat_history have been rebuilt (both ``_maybe_*_opencode_*``
+        consumers have run in ``_process_trial_result``), its rows are dead weight —
+        release them here.
+
+        Idempotent. Late appends for a released trial (e.g. an orphaned opencode process
+        that keeps calling the proxy after harbor timed the trial out) are ignored on the
+        next :meth:`_refresh`, so a released trial never silently regrows. A no-op when the
+        trial is unknown / already released / no log has been read yet.
+        """
+        with self._lock:
+            state = self._state
+            if state is None:
+                return
+            state.released.add(trial_id)
+            dropped = state.by_trial.pop(trial_id, None)
+            if dropped:
+                # Prune the flat file-order list too — popping only the index would keep
+                # the row dicts alive (entries holds a strong ref), freeing nothing.
+                drop_ids = {id(e) for e in dropped}
+                state.entries = [e for e in state.entries if id(e) not in drop_ids]
 
     def all_entries(self, log_path: str) -> List[Dict[str, Any]]:
         """A membership snapshot of every parsed entry (incrementally maintained).
@@ -140,8 +173,13 @@ class LiteralLogStore:
             # entry list stays honestly ``List[Dict]`` and consumers can ``entry.get(...)``.
             if not isinstance(entry, dict):
                 continue
-            state.entries.append(entry)
             trial_id = entry.get("trial_id")
+            # A row appended AFTER its trial was released (e.g. an orphaned opencode still
+            # calling the proxy post-timeout) is dead weight — drop it so a released trial
+            # cannot regrow the index. Checked before retention so nothing is stored.
+            if isinstance(trial_id, str) and trial_id in state.released:
+                continue
+            state.entries.append(entry)
             # trial_id is the string correlation id; ignore a malformed non-string (a
             # list/dict would be unhashable and crash the index build).
             if isinstance(trial_id, str):

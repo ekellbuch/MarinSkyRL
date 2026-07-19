@@ -1344,25 +1344,34 @@ class TerminalBenchGenerator(GeneratorInterface):
         # Per-trial indexed lookup (O(this trial's entries)); build_rollout_details_for_trial
         # re-filters by trial_id, so the result is identical to scanning the whole log.
         entries = self._literal_log_store.entries_for_trial(log_path, trial_id)
-        if not entries:
-            return rollout_details
+        # This is the SECOND (last) opencode literal consumer for the trial —
+        # _maybe_build_opencode_chat_history already ran earlier in _process_trial_result.
+        # Once both have consumed this trial's rows, release them so the shared-log store
+        # stays O(in-flight trials) instead of retaining every row for the whole run (a
+        # long high-concurrency opencode RL run's shared log is many GB). release_trial is
+        # idempotent and also fences out any late orphaned-opencode appends for this trial.
         try:
-            from harbor.literal.rollout_build import build_rollout_details_for_trial
-        except Exception:  # harbor without the bridge → no-op
-            return rollout_details
-        built = build_rollout_details_for_trial(entries, trial_id)
-        if not built:
-            return rollout_details
-        # Persist onto the result so downstream consumers see a consistent view.
-        try:
-            result.agent_result.rollout_details = built
-        except Exception:
-            pass
-        n_turns = len(built[0].get("completion_token_ids", []))
-        logger.info(
-            f"[literal-bridge] correlated {n_turns} opencode turn(s) for trial {trial_id} from shared proxy log"
-        )
-        return built
+            if not entries:
+                return rollout_details
+            try:
+                from harbor.literal.rollout_build import build_rollout_details_for_trial
+            except Exception:  # harbor without the bridge → no-op
+                return rollout_details
+            built = build_rollout_details_for_trial(entries, trial_id)
+            if not built:
+                return rollout_details
+            # Persist onto the result so downstream consumers see a consistent view.
+            try:
+                result.agent_result.rollout_details = built
+            except Exception:
+                pass
+            n_turns = len(built[0].get("completion_token_ids", []))
+            logger.info(
+                f"[literal-bridge] correlated {n_turns} opencode turn(s) for trial {trial_id} from shared proxy log"
+            )
+            return built
+        finally:
+            self._literal_log_store.release_trial(trial_id)
 
     def _maybe_build_opencode_chat_history(
         self,

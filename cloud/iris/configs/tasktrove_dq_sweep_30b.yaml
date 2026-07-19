@@ -40,7 +40,7 @@ terminal_bench:
     # stay bounded by opencode's limit.context sliding window (harbor #11).
     opencode_config: {}
     override_setup_timeout_sec: 600  # opencode installs via nvm + npm at setup
-    override_timeout_sec: 1800
+    override_timeout_sec: 1800  # 30min: ABOVE the healthy-trial p90 (~19min) so real trials finish; the harbor kill-path fix (--harbor-ref, server-side `timeout`) now FORCIBLY reaps a runaway at this deadline (was a no-op before → 0 completions). A shorter ceiling would murder healthy trials mid-task.
 
     override_cpus: 1
     override_memory_mb: 2048
@@ -62,7 +62,12 @@ terminal_bench:
       - VerifierOutputParseError
       - VerifierRuntimeError
 
-    n_concurrent_trials: 48
+    # Prod concurrency (demand target). Paired IN LOCKSTEP with the decode-capacity
+    # supply lever below (max_num_seqs x num_inference_engines) per marinskyrl.md — never
+    # permute this alone. The old Daytona idle-reap that made 288 fail (keep1-v8) is fixed
+    # at the harbor layer (auto_stop_interval_mins 5->0, ride via --harbor-ref), so
+    # sandboxes now survive the queue depth; decode capacity (raised below) sets throughput.
+    n_concurrent_trials: 96
 
     log_level: INFO
 
@@ -192,7 +197,11 @@ trainer:
   ref:
     model:
       # POLICY §2 base model (also passed as the policy --model_path at launch).
-      path: Qwen/Qwen3-30B-A3B-Thinking-2507
+      # PIVOTED to Coder-Instruct (operator 2026-07-18): better agentic tool-use; the
+      # -Thinking-2507 model looped/never self-terminated opencode (v8-v11) → all trials
+      # AgentTimeout→reward 0. Coder-Instruct is the base config's NATIVE model (reverses
+      # the earlier Coder→Thinking swap); same Qwen3MoE arch → TP4/EP4 geometry unchanged.
+      path: Qwen/Qwen3-Coder-30B-A3B-Instruct
     megatron_config:
       tensor_model_parallel_size: 4
       pipeline_model_parallel_size: 2
@@ -237,12 +246,24 @@ generator:
 
   enforce_eager: false
 
-  inference_engine_tensor_parallel_size: 8
-  num_inference_engines: 2
+  # Inference GEOMETRY repartitioned 2xTP8/DCP2 -> 4xTP4/DCP1/EP4 (keep1-v10, KV-131k
+  # validated). TP8 was TP-comm waste for a 30B-A3B (~3B active) AND mis-aligned to the
+  # model's 4 KV heads (replicates 2x unless DCP2 rescues). TP4 = 4 KV heads split EXACTLY
+  # 1/GPU (no replication, DCP unnecessary=1), 4 independent schedulers over 16 GPUs (2x
+  # aggregate slots vs v9's 48, halved TP all-reduce group = the real win). KV-at-131k:
+  # a full 131k seq = 12 GiB across the model -> 3.0 GiB/GPU at TP4 = 6.4% of the ~47 GB
+  # pool (15.7x margin; ~15-17 full-131k seqs/engine). TP2 rejected (~5 seqs/engine @131k).
+  # Mirrors the proven sibling 64GPU_qwen3_6_35b_a3b.yaml (8xTP4/DCP1/EP4). 4xTP4=16 GPUs.
+  inference_engine_tensor_parallel_size: 4
+  num_inference_engines: 4
 
-  inference_engine_expert_parallel_size: 1
+  # EP-shard the 128 experts (32/GPU) — standard MoE-inference path at TP4 (was 1).
+  inference_engine_expert_parallel_size: 4
 
-  inference_engine_decode_context_parallel_size: 2
+  # DCP=1: at TP4 each GPU already holds exactly 1 KV head, so no decode-context split is
+  # needed (DCP existed to de-replicate KV at TP8). DCP1 + enable_return_routed_experts is
+  # the proven routed-experts path (35B sibling) — removes the routed-experts x DCP interaction.
+  inference_engine_decode_context_parallel_size: 1
 
   inference_engine_mp_backend: false
 
@@ -251,6 +272,12 @@ generator:
 
   gpu_memory_utilization: 0.80
 
+  # Per-engine decode slots. 24 x 4 engines = 96 aggregate (2x v9's 48). 24 is 1.5x the
+  # pure-131k KV capacity (~15-17/engine), backstopped by chunked-prefill + vLLM preemption
+  # (opencode contexts are bounded to ~113k and mostly short, KV was 1-8%). Push to 32
+  # (128 aggregate) after confirming KV-cache-usage stays off-ceiling in the sweep — the
+  # engines are slot-bound, not KV-bound. Drop gpu_memory_utilization 0.80->0.75 or this
+  # value first on any KV-bind OOM (never TP).
   max_num_seqs: 24
   max_num_batched_tokens: 16384
 
@@ -265,7 +292,11 @@ generator:
   enable_ray_prometheus_stats: false
   vllm_stats_interval: 1
   append_eos_token_after_stop_str_in_multi_turn: true
-  max_turns: 999999
+  # BOUNDED turn cap (fullgate proven-green value). 999999 (unbounded) let the
+  # -Thinking-/compaction-off opencode agent loop without self-terminating until the
+  # override_timeout_sec wall -> verifier never ran -> 0 result.json -> 0 completions.
+  # Reference healthy trial = ~8 sequential calls; 30 is a generous safety net.
+  max_turns: 30
 
   sampling_params:
     max_generate_length: 16384
@@ -275,18 +306,26 @@ generator:
 
   engine_init_kwargs:
     max_model_len: 131072
-    custom_chat_template_chat_completion_path: chat_templates/qwen3_thinking_acc.jinja2
+    # NO custom chat template: Qwen/Qwen3-Coder-30B-A3B-Instruct's NATIVE HF chat_template
+    # emits the Qwen3-Coder XML function-call format the qwen3_coder parser expects. Omitting
+    # custom_chat_template_chat_completion_path makes the vLLM chat endpoint pass chat_template=None
+    # (vllm_engine.py:1630), so it falls back to the model's tokenizer template. The old
+    # qwen3_thinking_acc.jinja2 was a -Thinking- artifact that FORCED the hermes <tool_call>{json}
+    # format onto Coder (which was not trained for it → tool_use=0). (The 32GPU coder throughput
+    # config keeps that jinja only because it drives TERMINUS-2, which parses tool calls itself
+    # and never hits the vLLM OpenAI tool parser — opencode does, so the format must match.)
     disable_custom_all_reduce: true
     enable_return_routed_experts: true
     async_scheduling: false
     # opencode sends tool_choice:"auto"; without tool-calling enabled the engine returns
     # '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser',
-    # opencode exits 1, every rollout = NonZeroAgentExit reward 0. The terminus-2 30B base
-    # omits these (added only to the 8B opencode smoke by #29). hermes = the Qwen3
-    # dense/THINKING <tool_call> format (our model is Qwen3-30B-A3B-Thinking-2507, NOT
-    # Qwen3-Coder → hermes, not qwen3_coder). Model/harness issue, backend-independent.
+    # opencode exits 1, every rollout = NonZeroAgentExit reward 0. qwen3_coder = the native
+    # Qwen3-Coder XML function-call parser (registered in the pinned vLLM 0.20.2:
+    # tool_parsers/__init__.py "qwen3_coder"), matching the model's native chat_template above.
+    # hermes was the -Thinking- <tool_call>{json} format — never matched Coder's output (v13
+    # tool_use=0). Model/harness setting, backend-independent.
     enable_auto_tool_choice: true
-    tool_call_parser: hermes
+    tool_call_parser: qwen3_coder
 
 data:
   train_data: []

@@ -62,7 +62,7 @@ terminal_bench:
       - VerifierOutputParseError
       - VerifierRuntimeError
 
-    n_concurrent_trials: 288
+    n_concurrent_trials: 48
 
     log_level: INFO
 

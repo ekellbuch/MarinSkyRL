@@ -472,7 +472,7 @@ def _generator_controller_ingress_wired() -> bool:
     checkout resolves against). Reading the source is deliberately dependency-free — the
     generator module itself pulls in harbor/vLLM and is not importable on the submit host.
 
-    This replaces the retired ``SKYRL_IRIS_ALLOW_UNBAKED_GENERATOR`` manual assertion: the
+    This replaces the retired manual env-var assertion that used to gate this: the
     wiring has been unconditionally on ``main`` since the cross-cluster opencode-RL ingress
     landed (PR #14), so every gpu-rl image built from current ``main`` bakes it, and the
     sentinel makes the invariant machine-checkable rather than a "trust me" env var. NOTE:
@@ -523,8 +523,8 @@ def validate_controller_ingress_reachability(args: argparse.Namespace) -> None:
     # opencode's base URL resolves to `undefined` (every call fails, 0 reward) AND
     # rollout_details are never correlated (all-None logprobs) — a 4-hour-run-wasting failure
     # (fullgate1, 2026-07-16). That wiring is now unconditionally on main (PR #14) and baked
-    # into every current gpu-rl image, so instead of the retired SKYRL_IRIS_ALLOW_UNBAKED_GENERATOR
-    # manual "trust me" assertion we AUTO-DETECT the CONTROLLER_INGRESS_WIRED sentinel in the
+    # into every current gpu-rl image, so instead of the retired manual "trust me" env-var
+    # assertion we AUTO-DETECT the CONTROLLER_INGRESS_WIRED sentinel in the
     # generator source that ships in this checkout (== what gets baked / hot-loaded via
     # --skyrl-ref). Block only when the wiring is genuinely absent from the code that will run.
     if not _generator_controller_ingress_wired():

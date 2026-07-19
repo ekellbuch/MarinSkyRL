@@ -67,7 +67,7 @@ terminal_bench:
     # permute this alone. The old Daytona idle-reap that made 288 fail (keep1-v8) is fixed
     # at the harbor layer (auto_stop_interval_mins 5->0, ride via --harbor-ref), so
     # sandboxes now survive the queue depth; decode capacity (raised below) sets throughput.
-    n_concurrent_trials: 288
+    n_concurrent_trials: 48
 
     log_level: INFO
 

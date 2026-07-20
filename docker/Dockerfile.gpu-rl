@@ -12,7 +12,7 @@
 #
 # Consumed by the iris RL launcher (digest-pinned). Built in-cluster via kaniko
 # (docker/build_gpu_rl_kaniko.sh) — the Mac cannot build it (arm64 + linux/amd64
-# CUDA). See the build-gpu-rl-image-iris skill in the iris launcher repo.
+# CUDA). See .agents/skills/build-gpu-rl-image-iris/SKILL.md in this repository.
 #
 # =============================================================================
 # WHEEL-CACHE BUILD (fast rebuilds)
@@ -21,11 +21,9 @@
 # GEMM kernels) and flash-attn 2.8.3 (its flash_attn_2_cuda extension). They are
 # isolated in the `wheel-builder` stage, which emits RELOCATABLE WHEELS. The `rl`
 # stage installs those wheels instead of recompiling. Two sources (WHEEL_SOURCE):
-#   prebuilt-wheelhouse (default): COPY docker/wheelhouse/*.whl (populated on an
-#     x86 host by build_wheels.sh, or fetched into the build context by
-#     build_gpu_rl_kaniko.sh from a public mirror) -> ZERO nvcc.
-#   wheel-builder: compile both wheels inline (~3 h nvcc) -> use when no prebuilt
-#     wheels are available.
+#   wheel-builder (default): compile both wheels inline (~3 h nvcc).
+#   prebuilt-wheelhouse: COPY docker/wheelhouse/*.whl after the Kaniko launcher
+#     fetches and validates a matching wheel artifact.
 # CACHE KEY (what invalidates a wheel) = { VLLM_FORK_COMMIT, FLASH_ATTN_VERSION,
 #   torch 2.11.0, CUDA 12.8, cp312, x86_64, TORCH_CUDA_ARCH_LIST "8.0;9.0" }.
 #
@@ -35,7 +33,7 @@
 #       vLLM / flash-attn / TransformerEngine wheels are all cu128-built, so the
 #       base is ABI-consistent with them (nvidia-nccl-cu12==2.28.9 from the lock).
 #   - vLLM 0.20.2rc0     : built FROM SOURCE from OUR FORK (no public wheel).
-#       Fork = mlfoundations/vllm @ commit VLLM_FORK_COMMIT. The lock's `vllm`
+#       Fork = marin-community/vllm @ commit VLLM_FORK_COMMIT. The lock's `vllm`
 #       extra pins vllm==0.20.2 (PyPI) so a general `uv sync` gets stock vLLM; the
 #       image swaps the fork wheel over it via `--no-deps`.
 #   - flash-attn 2.8.3   : compiled from source vs torch 2.11.0+cu128 / cp312 so
@@ -48,17 +46,19 @@
 # =============================================================================
 
 ARG BASE_IMAGE=nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+ARG WHEEL_PYTHON_VERSION=3.12
+ARG TARGET_PLATFORM=linux_x86_64
 ARG TORCH_VERSION=2.11.0
 ARG TORCHVISION_VERSION=0.26.0
 ARG FLASH_ATTN_VERSION=2.8.3
-ARG VLLM_FORK_REPO=https://github.com/mlfoundations/vllm.git
-ARG VLLM_FORK_COMMIT=76259c63a45e57c0d1cbaca3480aae52ebbfccd1
+ARG VLLM_FORK_REPO=https://github.com/marin-community/vllm.git
+ARG VLLM_FORK_COMMIT=4b55591306c934cdc21461f091c9ea22ad008007
 # A100 (8.0) + Hopper (9.0): the GPUs that run this image.
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
 ARG MAX_JOBS=8
 ARG NVCC_THREADS=2
-# prebuilt-wheelhouse (default, docker/wheelhouse/ populated) | wheel-builder (compile inline).
-ARG WHEEL_SOURCE=prebuilt-wheelhouse
+# wheel-builder | prebuilt-wheelhouse (after staging a matching wheel artifact).
+ARG WHEEL_SOURCE=wheel-builder
 # Opt-in Megatron training backend (megatron-bridge/core + TransformerEngine +
 # mamba/causal-conv1d). Off by default so the default image is fsdp2-only; set
 # INSTALL_MEGATRON=1 to build the megatron variant (adds the `megatron` extra to
@@ -75,6 +75,9 @@ ARG HARBOR_COMMIT=1319eb29
 # =============================================================================
 FROM ${BASE_IMAGE} AS wheel-builder
 
+ARG BASE_IMAGE
+ARG WHEEL_PYTHON_VERSION
+ARG TARGET_PLATFORM
 ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG FLASH_ATTN_VERSION
@@ -101,16 +104,18 @@ ENV VLLM_TARGET_DEVICE=cuda
 # Build venv with EXACTLY the torch the wheels must be ABI-compatible with. Both
 # from-source builds use --no-build-isolation to reuse THIS torch.
 ENV WHEEL_VENV=/opt/wheelbuild/.venv
-RUN uv venv --python 3.12 $WHEEL_VENV
+RUN uv venv --python ${WHEEL_PYTHON_VERSION} $WHEEL_VENV
 RUN . $WHEEL_VENV/bin/activate && \
     uv pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
         --index-strategy unsafe-best-match \
         "torch==${TORCH_VERSION}" \
         "torchvision==${TORCHVISION_VERSION}" \
-        "setuptools_scm" "setuptools>=77.0.3,<81.0.0" "wheel" "packaging" \
+        "setuptools_scm" "setuptools-rust>=1.9.0" \
+        "setuptools>=77.0.3,<81.0.0" "wheel" "packaging" \
         "ninja" "cmake" "psutil" "pip"
 
 WORKDIR /wheels
+COPY docker/write_gpu_rl_wheel_manifest.sh /usr/local/bin/write_gpu_rl_wheel_manifest.sh
 
 # (W1) flash-attn -> wheel. FLASH_ATTENTION_FORCE_BUILD=TRUE so it never silently
 # falls back to a (nonexistent) prebuilt torch-2.11 wheel.
@@ -135,15 +140,13 @@ RUN . $WHEEL_VENV/bin/activate && \
         VLLM_TARGET_DEVICE=cuda \
         python -m pip wheel . --no-build-isolation --no-deps -w /wheels -v
 
-RUN echo "VLLM_FORK_COMMIT=${VLLM_FORK_COMMIT}" >  /wheels/MANIFEST && \
-    echo "FLASH_ATTN_VERSION=${FLASH_ATTN_VERSION}" >> /wheels/MANIFEST && \
-    echo "TORCH_VERSION=${TORCH_VERSION}" >> /wheels/MANIFEST && \
-    echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}" >> /wheels/MANIFEST && \
-    echo "CUDA=12.8 PY=cp312 PLATFORM=linux_x86_64" >> /wheels/MANIFEST && \
+RUN bash /usr/local/bin/write_gpu_rl_wheel_manifest.sh /wheels/MANIFEST \
+      "${VLLM_FORK_COMMIT}" "${FLASH_ATTN_VERSION}" "${TORCH_VERSION}" \
+      "${BASE_IMAGE}" "${WHEEL_PYTHON_VERSION}" "${TARGET_PLATFORM}" "${TORCH_CUDA_ARCH_LIST}" && \
     ls -la /wheels
 
 # =============================================================================
-# STAGE 2: wheel source alias — prebuilt-wheelhouse (default) | wheel-builder
+# STAGE 2: wheel source alias — wheel-builder (default) | prebuilt-wheelhouse
 # =============================================================================
 FROM scratch AS prebuilt-wheelhouse
 # docker/wheelhouse/ always exists (committed .keep); when populated it also holds
@@ -158,11 +161,17 @@ FROM ${WHEEL_SOURCE} AS wheels
 # =============================================================================
 FROM ${BASE_IMAGE} AS rl
 
+ARG BASE_IMAGE
+ARG WHEEL_PYTHON_VERSION
+ARG TARGET_PLATFORM
 ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
+ARG FLASH_ATTN_VERSION
+ARG VLLM_FORK_COMMIT
 ARG TORCH_CUDA_ARCH_LIST
 ARG INSTALL_MEGATRON
 ARG HARBOR_COMMIT
+COPY docker/write_gpu_rl_wheel_manifest.sh /usr/local/bin/write_gpu_rl_wheel_manifest.sh
 # MarinSkyRL commit this image is built from — recorded in the baked /opt/skyrl
 # git tree (see the git-init step below) for provenance.
 ARG GITSHA=unknown
@@ -358,12 +367,20 @@ RUN cd ${SKYRL_HOME}/skyrl-train && \
 # Bring in the compiled wheels and SWAP them over the stock PyPI vllm/flash-attn
 # from the sync (--no-deps: keep the synced dep closure, replace only the package).
 COPY --from=wheels /wheels /wheels
+RUN bash /usr/local/bin/write_gpu_rl_wheel_manifest.sh /tmp/expected-wheel-manifest \
+      "${VLLM_FORK_COMMIT}" "${FLASH_ATTN_VERSION}" "${TORCH_VERSION}" \
+      "${BASE_IMAGE}" "${WHEEL_PYTHON_VERSION}" "${TARGET_PLATFORM}" "${TORCH_CUDA_ARCH_LIST}" && \
+    cmp /tmp/expected-wheel-manifest /wheels/MANIFEST
 RUN uv pip install --python ${RL_ENV_DIR}/bin/python --no-deps /wheels/flash_attn-*.whl && \
     ${RL_ENV_DIR}/bin/python -c "import flash_attn, flash_attn_2_cuda; print('flash_attn', flash_attn.__version__, '+ flash_attn_2_cuda OK')"
 RUN uv pip install --python ${RL_ENV_DIR}/bin/python --no-deps /wheels/vllm-*.whl
 
 # Primary assert: vLLM (fork) + skyrl_train import under transformers 5.8.1.
 RUN ${RL_ENV_DIR}/bin/python -c "import torch, transformers, vllm, skyrl_train, flash_attn, flash_attn_2_cuda; print('torch', torch.__version__, '| transformers', transformers.__version__, '| vllm', vllm.__version__, '| flash_attn', flash_attn.__version__)"
+
+# Grug contract assert: both sides of weight sync must be discoverable without
+# checkpoint-supplied remote code.
+RUN ${RL_ENV_DIR}/bin/python -c "from transformers import AutoConfig; import skyrl_train; from vllm.model_executor.models.registry import ModelRegistry; assert AutoConfig.for_model('grug_moe').model_type == 'grug_moe'; assert 'GrugMoeForCausalLM' in ModelRegistry.get_supported_archs(); print('Grug trainer config + vLLM model registry OK')"
 
 # Megatron backend asserts (only when built with INSTALL_MEGATRON=1).
 RUN if [ "${INSTALL_MEGATRON}" = "1" ]; then \

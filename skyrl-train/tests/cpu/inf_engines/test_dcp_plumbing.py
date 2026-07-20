@@ -113,6 +113,7 @@ def _run_create(monkeypatch, dcp: int):
     import skyrl_train.inference_engines.ray_wrapped_inference_engine as rwie
 
     capture = _RemoteCapture()
+    monkeypatch.setattr(rwie, "_validate_installed_vllm_for_model", lambda _pretrain: None)
 
     # Stub the vllm import + actor classes (the module imports them lazily in the vllm branch).
     fake_vllm = types.ModuleType("vllm")

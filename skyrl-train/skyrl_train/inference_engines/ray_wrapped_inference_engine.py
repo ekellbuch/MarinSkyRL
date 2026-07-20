@@ -1,9 +1,12 @@
+from collections.abc import Collection
+from typing import Any, Dict, List
+
 import ray
 from loguru import logger
 from packaging import version
 from ray.actor import ActorHandle
-from typing import Any, List, Dict
 from ray.util.placement_group import PlacementGroupSchedulingStrategy, placement_group
+from transformers import AutoConfig, PretrainedConfig
 
 from skyrl_train.inference_engines.base import (
     InferenceEngineInterface,
@@ -12,6 +15,7 @@ from skyrl_train.inference_engines.base import (
     NamedWeightsUpdateRequest,
 )
 from skyrl_train.inference_engines.utils import get_rendezvous_addr_port
+from skyrl_train.models.grug_moe import GRUG_MOE_ARCHITECTURE, GRUG_MOE_MODEL_TYPE
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +60,25 @@ _NCCL_FR_ENV_PASSTHROUGH = (
 )
 
 
+def validate_grug_vllm_support(hf_config: PretrainedConfig, supported_architectures: Collection[str]) -> None:
+    """Fail before actor creation when the running vLLM cannot serve Grug."""
+
+    if getattr(hf_config, "model_type", None) != GRUG_MOE_MODEL_TYPE:
+        return
+    if GRUG_MOE_ARCHITECTURE not in supported_architectures:
+        raise RuntimeError(
+            "The running vLLM build does not support GrugMoeForCausalLM. "
+            "Launch Grug with a Grug-capable image via --docker_image."
+        )
+
+
+def _validate_installed_vllm_for_model(pretrain: str) -> None:
+    from vllm.model_executor.models import ModelRegistry  # noqa: PLC0415
+
+    hf_config = AutoConfig.from_pretrained(pretrain, trust_remote_code=True)
+    validate_grug_vllm_support(hf_config, ModelRegistry.get_supported_archs())
+
+
 def _qwen3_5_vlm_engine_kwargs(pretrain: str) -> Dict[str, Any]:
     """vLLM EngineArgs overrides for the Qwen3.5/3.6 VLM-shell rollout (tmax Stage 2).
 
@@ -80,7 +103,6 @@ def _qwen3_5_vlm_engine_kwargs(pretrain: str) -> Dict[str, Any]:
     it returns ``{}`` so non-VLM launches are unaffected.
     """
     try:
-        from transformers import AutoConfig
         from skyrl_train.models.qwen3_5_vlm import is_qwen3_5_vlm_shell
 
         cfg = AutoConfig.from_pretrained(pretrain, trust_remote_code=True)
@@ -257,6 +279,7 @@ def create_ray_wrapped_inference_engines(
         # if a dev version is being used, skip the version check
         if "dev" not in vllm.__version__:
             assert version.parse(vllm.__version__) >= version.parse("0.8.3"), "SkyRL-Train only supports vLLM >= 0.8.3"
+        _validate_installed_vllm_for_model(pretrain)
     elif backend == "sglang":
         # We import SGLang later to avoid importing vllm. See `get_sglang_engine` for more.
         pass

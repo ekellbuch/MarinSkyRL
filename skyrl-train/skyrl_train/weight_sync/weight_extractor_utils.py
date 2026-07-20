@@ -2,9 +2,10 @@
 
 import os
 from collections import defaultdict
-from typing import Dict, List, Callable, Iterator, Any
+from typing import Any, Callable, Dict, Iterator, List, Optional
 import torch
 
+from skyrl_train.utils import torch_dtype_to_str
 from skyrl_train.weight_sync import WeightChunk
 
 import logging
@@ -99,6 +100,8 @@ def yield_module_grouped_chunks(
     gather_tensor_fn: Callable[[Any], torch.Tensor],
     get_shape_fn: Callable[[str, Any, torch.Tensor], List[int]],
     batch_size_threshold_gb: float = 0.0,
+    get_target_dtype_fn: Optional[Callable[[str, torch.dtype], torch.dtype]] = None,
+    prepare_tensor_fn: Optional[Callable[[str, torch.Tensor, torch.dtype], torch.Tensor]] = None,
 ) -> Iterator[WeightChunk]:
     """Yield WeightChunk objects grouped by module.
 
@@ -119,6 +122,8 @@ def yield_module_grouped_chunks(
         gather_tensor_fn: Backend-specific function to gather sharded tensors into full tensors
         get_shape_fn: Function to extract shape from param_name, param, and prepared tensor
         batch_size_threshold_gb: If > 0, batch complete modules together until threshold is reached
+        get_target_dtype_fn: Optional per-state-entry wire dtype selector.
+        prepare_tensor_fn: Optional per-state-entry cast/device staging hook.
 
     Yields:
         WeightChunk objects containing all parameters for each module (or batched modules if threshold set)
@@ -160,12 +165,16 @@ def yield_module_grouped_chunks(
         for param_name in param_names:
             param = params[param_name]
             tensor = gather_tensor_fn(param)
-            tensor = tensor.to(dtype).detach().contiguous()
+            target_dtype = get_target_dtype_fn(param_name, dtype) if get_target_dtype_fn else dtype
+            tensor = (
+                prepare_tensor_fn(param_name, tensor, target_dtype) if prepare_tensor_fn else tensor.to(target_dtype)
+            )
+            tensor = tensor.detach().contiguous()
             shape = get_shape_fn(param_name, param, tensor)
             module_tensors.append(tensor)
             module_names.append(param_name)
             module_shapes.append(shape)
-            module_dtypes.append(str(dtype))
+            module_dtypes.append(torch_dtype_to_str(target_dtype))
             module_size += tensor.nbytes
 
         # Fuse weights if enabled (gate+up → gate_up_proj, q+k+v → qkv_proj)

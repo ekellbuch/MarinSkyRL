@@ -12,6 +12,7 @@ sourced from PyTorch:
 
 from __future__ import annotations
 
+import os
 import socket
 from datetime import timedelta
 from typing import Any, Optional, Union, Tuple
@@ -30,9 +31,54 @@ from torch.distributed.distributed_c10d import (
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 import torch.nn as nn
 from torch.optim import Optimizer
+from loguru import logger
 
 ModelOptimPair = Tuple[nn.Module, Optimizer]
 ModelOrModelOptimPair = Union[nn.Module, ModelOptimPair]
+
+
+def init_worker_process_group_with_device(timeout_seconds: int, backend: str = "nccl") -> None:
+    """Pin this actor's CUDA device to its resolved ``LOCAL_RANK`` and create the default
+    torch.distributed process group with an explicit ``device_id`` — so ProcessGroupNCCL never
+    falls back to *"Guessing device ID based on global rank"*.
+
+    Single source of truth shared by every backend's ``init_worker_process_group`` (the base
+    FSDP/DeepSpeed worker and the Megatron policy/ref workers), so the device-pinned init is
+    not duplicated (and cannot drift) across backends.
+
+    ``LOCAL_RANK`` is resolved upstream by ``resolve_pinned_local_rank`` (workers/worker.py) for
+    all three CUDA_VISIBLE_DEVICES regimes, so it is the correct ``set_device`` index in each.
+
+    Why ``device_id`` matters: torch's fallback device guess (== global rank) is only correct
+    when Ray masks CVD to a single device (device 0 within the masked view). When Ray does NOT
+    mask CVD — every actor sees all GPUs, e.g. the megatron+vLLM image on cw-rno2a — the guess is
+    wrong and the FIRST collective (the weight-init barrier) DEADLOCKS: rank 0 races ahead into
+    weight-loading while the other ranks stall at a barrier on the wrong device (observed on
+    keep-6 / cw-rno2a, 2026-07-20). Pinning ``set_device`` AND passing ``device_id`` makes the
+    device explicit and correct in every regime.
+
+    Idempotent: always pins the device; only creates the process group if not already initialized.
+    """
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    # Surface the resolved rank/device + the CVD regime (masked=single-device vs unmasked=all)
+    # so the pinning can be validated per cluster from the logs.
+    logger.info(
+        "[pg-init] RANK={} LOCAL_RANK={} CUDA_VISIBLE_DEVICES={} visible_device_count={} -> set_device(cuda:{})",
+        os.environ.get("RANK", "?"),
+        local_rank,
+        os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+        torch.cuda.device_count(),
+        local_rank,
+    )
+    if not torch.distributed.is_initialized():
+        # Default torch dist pg init timeout is 10 minutes (600 s); callers pass
+        # SKYRL_WORKER_NCCL_TIMEOUT_IN_S.
+        torch.distributed.init_process_group(
+            backend=backend,
+            timeout=timedelta(seconds=timeout_seconds),
+            device_id=torch.device("cuda", local_rank),
+        )
 
 
 def get_free_port():

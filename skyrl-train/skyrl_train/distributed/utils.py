@@ -152,6 +152,27 @@ def init_custom_process_group(
             "_new_process_group_helper accepts neither 'backend_options' nor "
             f"'pg_options' (torch {torch.__version__}); signature: {_inspect.signature(_new_process_group_helper)}"
         )
+    _helper_kwargs = {pg_options_param_name: pg_options, "timeout": timeout}
+    # Pin an explicit device_id so ProcessGroupNCCL does NOT fall back to guessing this
+    # rank's device from its group-global rank. That guess is wrong once each engine is
+    # placed on its own node (per-engine STRICT_PACK, #232): the weight-sync group's
+    # ncclUniqueId store key then carries the wrong/empty device (".../cuda//0"), so the
+    # broadcast root and the receivers register under mismatched keys and never rendezvous
+    # -> mutual 1800s NCCL-init timeout at the FIRST weight broadcast (observed cw-rno2a,
+    # keep-6 val-rno 2026-07-20; the flat-PACK 80B run's guess happened to be correct).
+    # Mirrors init_worker_process_group_with_device (#64), which already pins device_id for
+    # the WORKER group; the custom (weight-sync) group needs the identical treatment.
+    if "device_id" in _helper_params and torch.cuda.is_available() and str(backend) == "nccl":
+        _device = torch.device("cuda", torch.cuda.current_device())
+        torch.cuda.set_device(_device)
+        _helper_kwargs["device_id"] = _device
+        logger.info(
+            "[weight-sync-pg] group_name={} rank={} world_size={} -> device_id={}",
+            group_name,
+            rank,
+            world_size,
+            _device,
+        )
     pg, _ = _new_process_group_helper(
         world_size,
         rank,
@@ -159,8 +180,7 @@ def init_custom_process_group(
         backend,
         store,
         group_name=group_name,
-        **{pg_options_param_name: pg_options},
-        timeout=timeout,
+        **_helper_kwargs,
     )
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}

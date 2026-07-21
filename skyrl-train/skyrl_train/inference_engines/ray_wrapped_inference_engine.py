@@ -137,8 +137,14 @@ class RayWrappedInferenceEngine(InferenceEngineInterface):
     This class implements the InferenceEngineInterface by delegating calls to the remote actor.
     """
 
-    def __init__(self, inference_engine_actor: ActorHandle):
+    def __init__(self, inference_engine_actor: ActorHandle, *, weight_sync_rank_offset: int | None = None):
         self.inference_engine_actor = inference_engine_actor
+        # Relative to the first inference rank. vLLM creates one top-level Ray
+        # actor per DP rank, but every actor in the same logical engine already
+        # reports a distinct global rank through torch.distributed. They must
+        # therefore receive the same logical-engine offset during weight-sync
+        # communicator initialization.
+        self.weight_sync_rank_offset = weight_sync_rank_offset
 
     def tp_size(self):
         # Diagnostic: unwrap un-pickleable Ray exceptions into a plain
@@ -287,6 +293,7 @@ def create_ray_wrapped_inference_engines(
         raise ValueError(f"Unsupported backend: {backend}")
 
     inference_engine_actors = []
+    weight_sync_rank_offsets = []
     # Qwen3.5/3.6 VLM-shell rollout (tmax Stage 2): materialize the text tower only
     # (language_model_only=True) so vLLM does not build/expect the vision tower.
     # Empty {} for every non-VLM-shell model -> byte-identical engine construction.
@@ -594,6 +601,7 @@ def create_ray_wrapped_inference_engines(
                     **rope_engine_kwargs,
                 )
                 inference_engine_actors.append(engine)
+                weight_sync_rank_offsets.append(i * per_engine_gpu_count)
         elif backend == "sglang":
             # NOTE: there is no async / sync engine distinction in SGLang
 
@@ -656,8 +664,12 @@ def create_ray_wrapped_inference_engines(
             engine = ray.get(get_sglang_engine.remote())
 
             inference_engine_actors.append(engine)
+            weight_sync_rank_offsets.append(i * per_engine_gpu_count)
 
-    engines = [RayWrappedInferenceEngine(actor_handle) for actor_handle in inference_engine_actors]
+    engines = [
+        RayWrappedInferenceEngine(actor_handle, weight_sync_rank_offset=rank_offset)
+        for actor_handle, rank_offset in zip(inference_engine_actors, weight_sync_rank_offsets, strict=True)
+    ]
 
     # Readiness gate (DISAGGREGATED-mode init-deadlock fix): block until every engine
     # actor has finished loading its model (weights + CUDA-graph capture) BEFORE the

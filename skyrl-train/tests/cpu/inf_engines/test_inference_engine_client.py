@@ -26,6 +26,70 @@ import pytest
 import random
 from copy import deepcopy
 
+
+class _CommunicatorEngine:
+    def __init__(self, relative_rank_offset=None, *, tp_size=1, pp_size=1):
+        if relative_rank_offset is not None:
+            self.weight_sync_rank_offset = relative_rank_offset
+        self._tp_size = tp_size
+        self._pp_size = pp_size
+        self.received_rank_offset = None
+
+    def tp_size(self):
+        return self._tp_size
+
+    def pp_size(self):
+        return self._pp_size
+
+    async def init_weight_update_communicator(self, **kwargs):
+        self.received_rank_offset = kwargs["rank_offset"]
+
+
+def test_weight_sync_communicator_reuses_logical_engine_offset_across_dp_actors():
+    # Two logical TP1/DP2 engines are flattened into four Ray actors. The DP
+    # rank is already part of each actor's torch.distributed rank, so actors in
+    # a logical engine must share one offset: [1, 1], then [3, 3].
+    engines = [_CommunicatorEngine(offset) for offset in (0, 0, 2, 2)]
+    client = object.__new__(InferenceEngineClient)
+    client.engines = engines
+    client._dead_engines = set()
+    client.enable_http_endpoint = False
+
+    asyncio.run(
+        client.init_weight_update_communicator(
+            master_addr="127.0.0.1",
+            master_port=1234,
+            rank_offset=1,
+            world_size=5,
+            group_name="test",
+            backend="nccl",
+        )
+    )
+
+    assert [engine.received_rank_offset for engine in engines] == [1, 1, 3, 3]
+
+
+def test_weight_sync_communicator_preserves_legacy_sequential_offsets():
+    engines = [_CommunicatorEngine(tp_size=2), _CommunicatorEngine(tp_size=2)]
+    client = object.__new__(InferenceEngineClient)
+    client.engines = engines
+    client._dead_engines = set()
+    client.enable_http_endpoint = False
+
+    asyncio.run(
+        client.init_weight_update_communicator(
+            master_addr="127.0.0.1",
+            master_port=1234,
+            rank_offset=1,
+            world_size=5,
+            group_name="test",
+            backend="nccl",
+        )
+    )
+
+    assert [engine.received_rank_offset for engine in engines] == [1, 3]
+
+
 # -------------------------------------------
 # tests for postprocess_completion_request
 # --------------------------------------------

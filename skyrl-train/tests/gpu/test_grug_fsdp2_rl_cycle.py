@@ -1,7 +1,9 @@
-"""Two-H100 Grug FSDP2 capstone.
+"""Grug FSDP2 capstones on Hopper.
 
-Proves vLLM TP1/DP2/EP2 rollout -> FSDP2 EP1 RL update + query bias ->
-weight sync -> a second rollout. This is an opt-in Iris/nightly test.
+The two-H100 test covers colocated CUDA-IPC weight sync. The four-H100 test
+puts the same vLLM TP1/DP2/EP2 and FSDP2 EP1 workers on disjoint GPUs and
+covers the production NCCL-broadcast path. Both run rollout -> RL update +
+query bias -> exact weight readback -> a second rollout.
 """
 
 from __future__ import annotations
@@ -36,7 +38,8 @@ from skyrl_train.utils import get_ray_pg_ready_with_timeout, initialize_ray
 from tests.gpu.utils import get_available_gpus, get_test_actor_config, init_worker_with_type
 
 
-NUM_GPUS = 2
+COLOCATED_NUM_GPUS = 2
+DISAGGREGATED_NUM_GPUS = 4
 TOKENIZER = "Qwen/Qwen2.5-0.5B-Instruct"
 REAL_EXPORT_SHA256 = "781bc3291c81ce282be6762520280ebd5ef5b85e88ba65129c2d0162d48ee632"
 REAL_EXPORT_SOURCE = "s3://marin-us-east-02a/marin/exports/grug/june-67b-a2b/step-42150/hf-bf16-vllm/781bc3291c81ce28/"
@@ -73,7 +76,7 @@ def _write_tiny_checkpoint(path) -> None:
     tokenizer.save_pretrained(path)
 
 
-def _config(model_path: str, *, real_checkpoint: bool = False):
+def _config(model_path: str, *, real_checkpoint: bool = False, colocate_all: bool = True):
     cfg = get_test_actor_config()
     cfg.trainer.policy.model.path = model_path
     cfg.trainer.critic.model.path = ""
@@ -89,7 +92,7 @@ def _config(model_path: str, *, real_checkpoint: bool = False):
     cfg.trainer.update_epochs_per_batch = 1
     cfg.trainer.algorithm.use_kl_loss = False
     cfg.trainer.algorithm.use_entropy_loss = False
-    cfg.trainer.placement.colocate_all = True
+    cfg.trainer.placement.colocate_all = colocate_all
     cfg.trainer.placement.policy_num_nodes = 1
     cfg.trainer.placement.policy_num_gpus_per_node = 2
     cfg.trainer.policy.fsdp_config.cpu_offload = True
@@ -163,7 +166,7 @@ def _engine_client(cfg, model_path: str, shared_pg) -> InferenceEngineClient:
         enforce_eager=True,
         shared_pg=shared_pg,
         gpu_memory_utilization=cfg.generator.gpu_memory_utilization,
-        inference_engine_enable_sleep=True,
+        inference_engine_enable_sleep=cfg.trainer.placement.colocate_all,
         async_engine=True,
         max_num_batched_tokens=128,
         max_num_seqs=2,
@@ -179,9 +182,9 @@ def _synthetic_training_batch(prompts: list[list[int]]) -> TrainingInputBatch:
     return _make_training_batch(sequences, torch.zeros((len(prompts), 4), dtype=torch.float32))
 
 
-def _require_two_hoppers() -> None:
-    if len(get_available_gpus()) < NUM_GPUS:
-        pytest.skip("Grug FSDP2 RL cycle requires two H100s")
+def _require_hoppers(count: int) -> None:
+    if len(get_available_gpus()) < count:
+        pytest.skip(f"Grug FSDP2 RL cycle requires {count} H100s")
     if not torch.cuda.is_available() or torch.cuda.get_device_properties(0).major < 9:
         pytest.skip("Grug FSDP2 RL cycle is locked to Hopper")
 
@@ -249,7 +252,7 @@ def _assert_checkpoint_restores_biases(
 def _run_trainer_gates(model_path: str, tmp_path: Path, gate: str, result: dict) -> None:
     cfg = _config(model_path, real_checkpoint=True)
     initialize_ray(cfg)
-    pg = placement_group([{"GPU": 1, "CPU": 1}] * NUM_GPUS, strategy="PACK")
+    pg = placement_group([{"GPU": 1, "CPU": 1}] * COLOCATED_NUM_GPUS, strategy="PACK")
     get_ray_pg_ready_with_timeout(pg, timeout=60)
     try:
         started = time.monotonic()
@@ -290,15 +293,25 @@ def _run_trainer_gates(model_path: str, tmp_path: Path, gate: str, result: dict)
         ray.shutdown()
 
 
-def _run_full_cycle(model_path: str, tmp_path: Path, result: dict, *, real_checkpoint: bool) -> None:
-    cfg = _config(model_path, real_checkpoint=real_checkpoint)
+def _run_full_cycle(
+    model_path: str,
+    tmp_path: Path,
+    result: dict,
+    *,
+    real_checkpoint: bool,
+    colocate_all: bool = True,
+) -> None:
+    cfg = _config(model_path, real_checkpoint=real_checkpoint, colocate_all=colocate_all)
     initialize_ray(cfg)
-    pg = placement_group([{"GPU": 1, "CPU": 1}] * NUM_GPUS, strategy="PACK")
-    get_ray_pg_ready_with_timeout(pg, timeout=60)
+    pg = None
+    if colocate_all:
+        pg = placement_group([{"GPU": 1, "CPU": 1}] * COLOCATED_NUM_GPUS, strategy="PACK")
+        get_ray_pg_ready_with_timeout(pg, timeout=60)
     client = _engine_client(cfg, model_path, pg)
     try:
         started = time.monotonic()
-        asyncio.run(client.wake_up())
+        if colocate_all:
+            asyncio.run(client.wake_up())
         prompts = [[1, 17, 29, 5, 11, 3], [1, 19, 31, 7, 13, 3]]
         sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
         sampling_params.update({"temperature": 0.0, "ignore_eos": True, "logprobs": 1})
@@ -317,12 +330,13 @@ def _run_full_cycle(model_path: str, tmp_path: Path, result: dict, *, real_check
             )
         )
         first_logprob = first_score["prompt_logprobs"][0][-1][first_token]
-        asyncio.run(client.sleep())
+        if colocate_all:
+            asyncio.run(client.sleep())
 
         policy = init_worker_with_type(
             "policy",
             shared_pg=pg,
-            colocate_all=True,
+            colocate_all=colocate_all,
             num_gpus_per_node=2,
             cfg=cfg,
         )
@@ -339,12 +353,14 @@ def _run_full_cycle(model_path: str, tmp_path: Path, result: dict, *, real_check
             training.weights,
         )
 
-        # The real checkpoint leaves roughly 67 GB/rank in the trainer's CUDA
-        # allocator after the update. Release it before vLLM restores weights;
-        # the FSDP extractor can gather from the CPU-offloaded shards.
-        policy.offload_to_cpu(offload_optimizer=False, offload_model=True)
+        if colocate_all:
+            # The real checkpoint leaves roughly 67 GB/rank in the trainer's CUDA
+            # allocator after the update. Release it before vLLM restores weights;
+            # the FSDP extractor can gather from the CPU-offloaded shards.
+            policy.offload_to_cpu(offload_optimizer=False, offload_model=True)
         ray.get(policy.async_run_ray_method("pass_through", "init_weight_sync_state", client))
-        asyncio.run(client.wake_up(tags=["weights"]))
+        if colocate_all:
+            asyncio.run(client.wake_up(tags=["weights"]))
         ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
 
         for engine in client.engines:
@@ -357,8 +373,9 @@ def _run_full_cycle(model_path: str, tmp_path: Path, result: dict, *, real_check
                     assert entry["found"], (name, entry)
                     torch.testing.assert_close(entry["tensor"], training.weights[name], rtol=0, atol=0)
 
-        policy.offload_to_cpu(offload_optimizer=False, offload_model=True)
-        asyncio.run(client.wake_up(tags=["kv_cache"]))
+        if colocate_all:
+            policy.offload_to_cpu(offload_optimizer=False, offload_model=True)
+            asyncio.run(client.wake_up(tags=["kv_cache"]))
         asyncio.run(client.reset_prefix_cache())
         second_score = asyncio.run(
             client.generate(
@@ -403,12 +420,25 @@ def _tree_sha256(export_dir: Path) -> str:
 
 @pytest.mark.vllm
 def test_grug_two_h100_rollout_train_sync_rollout(tmp_path):
-    _require_two_hoppers()
+    _require_hoppers(COLOCATED_NUM_GPUS)
 
     _write_tiny_checkpoint(tmp_path)
     result = {"checkpoint": "tiny", "stages": {}}
     _run_full_cycle(str(tmp_path), tmp_path, result, real_checkpoint=False)
     raw_result_path = os.environ.get("GRUG_TINY_RESULT_JSON")
+    _write_result(result, Path(raw_result_path) if raw_result_path else None)
+
+
+@pytest.mark.vllm
+def test_grug_four_h100_disaggregated_rollout_train_broadcast_rollout(tmp_path):
+    """Exercise mixed-dtype Grug sync with trainer and rollout on disjoint GPUs."""
+
+    _require_hoppers(DISAGGREGATED_NUM_GPUS)
+
+    _write_tiny_checkpoint(tmp_path)
+    result = {"checkpoint": "tiny", "topology": "disaggregated", "stages": {}}
+    _run_full_cycle(str(tmp_path), tmp_path, result, real_checkpoint=False, colocate_all=False)
+    raw_result_path = os.environ.get("GRUG_DISAGGREGATED_RESULT_JSON")
     _write_result(result, Path(raw_result_path) if raw_result_path else None)
 
 
@@ -420,7 +450,7 @@ def test_grug_step_42150_progressive_gate(tmp_path):
     raw_model_path = os.environ.get("GRUG_REAL_CHECKPOINT_DIR")
     if not raw_model_path:
         pytest.skip("set GRUG_REAL_CHECKPOINT_DIR to the staged step-42150 HF export")
-    _require_two_hoppers()
+    _require_hoppers(COLOCATED_NUM_GPUS)
     model_path = Path(raw_model_path)
     assert model_path.is_dir(), model_path
     source = os.environ.get("GRUG_REAL_CHECKPOINT_SOURCE")

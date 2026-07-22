@@ -2,6 +2,17 @@ import pytest
 import torch
 from skyrl_train.weight_sync.weight_extractor_utils import yield_module_grouped_chunks
 from skyrl_train.weight_sync import WeightChunk
+from skyrl_train.utils import str_to_torch_dtype
+
+
+@pytest.mark.parametrize("value", ["bfloat16", "torch.bfloat16"])
+def test_str_to_torch_dtype_accepts_weight_metadata(value):
+    assert str_to_torch_dtype(value) is torch.bfloat16
+
+
+def test_str_to_torch_dtype_rejects_unknown_name():
+    with pytest.raises(ValueError, match="unsupported torch dtype"):
+        str_to_torch_dtype("torch.not_a_dtype")
 
 
 class TestModuleGrouping:
@@ -161,6 +172,39 @@ class TestModuleGrouping:
         assert tensor.dtype == torch.bfloat16
         expected = (original + 1.0).to(torch.bfloat16)
         assert torch.allclose(tensor, expected)
+
+    def test_per_entry_dtype_and_prepare_callbacks(self):
+        params = {
+            "model.layers.0.mlp.router.weight": torch.randn(4, 8),
+            "model.layers.0.mlp.router.bias": torch.randn(4),
+        }
+        prepared = []
+
+        def target_dtype(name, default):
+            return torch.float32 if name.endswith(".router.bias") else default
+
+        def prepare(name, tensor, dtype):
+            prepared.append((name, dtype))
+            return tensor.to(dtype)
+
+        chunks = list(
+            yield_module_grouped_chunks(
+                params=params,
+                dtype=torch.bfloat16,
+                gather_tensor_fn=lambda param: param,
+                get_shape_fn=lambda name, param, tensor: list(tensor.shape),
+                get_target_dtype_fn=target_dtype,
+                prepare_tensor_fn=prepare,
+            )
+        )
+
+        assert len(chunks) == 1
+        assert chunks[0].dtypes == ["bfloat16", "float32"]
+        assert [tensor.dtype for tensor in chunks[0].tensors] == [torch.bfloat16, torch.float32]
+        assert prepared == [
+            ("model.layers.0.mlp.router.weight", torch.bfloat16),
+            ("model.layers.0.mlp.router.bias", torch.float32),
+        ]
 
     def test_get_shape_callback(self):
         """Test that get_shape_fn callback is called correctly."""

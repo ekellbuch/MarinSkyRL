@@ -124,7 +124,9 @@ def _config(
     cfg.generator.inference_engine_expert_parallel_size = rollout_dp_size
     cfg.generator.num_inference_engines = rollout_num_engines
     cfg.generator.n_samples_per_prompt = 1
-    cfg.generator.gpu_memory_utilization = 0.90 if real_checkpoint else 0.35
+    # The capstone only generates four tokens, so a large KV cache is wasteful.
+    # Keep enough free VRAM for vLLM's transient full-weight reload buffers.
+    cfg.generator.gpu_memory_utilization = 0.75 if real_checkpoint else 0.35
     cfg.generator.sampling_params.temperature = 1.0
     cfg.generator.sampling_params.top_p = 1.0
     cfg.generator.sampling_params.top_k = -1

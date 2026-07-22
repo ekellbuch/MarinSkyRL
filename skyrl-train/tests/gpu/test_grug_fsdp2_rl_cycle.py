@@ -40,6 +40,7 @@ from tests.gpu.utils import get_available_gpus, get_test_actor_config, init_work
 
 COLOCATED_NUM_GPUS = 2
 DISAGGREGATED_NUM_GPUS = 4
+PRODUCTION_NUM_GPUS = 32
 TOKENIZER = "Qwen/Qwen2.5-0.5B-Instruct"
 REAL_EXPORT_SHA256 = "781bc3291c81ce282be6762520280ebd5ef5b85e88ba65129c2d0162d48ee632"
 REAL_EXPORT_SOURCE = "s3://marin-us-east-02a/marin/exports/grug/june-67b-a2b/step-42150/hf-bf16-vllm/781bc3291c81ce28/"
@@ -76,7 +77,15 @@ def _write_tiny_checkpoint(path) -> None:
     tokenizer.save_pretrained(path)
 
 
-def _config(model_path: str, *, real_checkpoint: bool = False, colocate_all: bool = True):
+def _config(
+    model_path: str,
+    *,
+    real_checkpoint: bool = False,
+    colocate_all: bool = True,
+    policy_num_nodes: int = 1,
+    policy_num_gpus_per_node: int = 2,
+    rollout_dp_size: int = 2,
+):
     cfg = get_test_actor_config()
     cfg.trainer.policy.model.path = model_path
     cfg.trainer.critic.model.path = ""
@@ -86,17 +95,18 @@ def _config(model_path: str, *, real_checkpoint: bool = False, colocate_all: boo
     cfg.trainer.gradient_checkpointing = True
     cfg.trainer.gradient_checkpointing_use_reentrant = False
     cfg.trainer.use_sample_packing = False
-    cfg.trainer.train_batch_size = 2
-    cfg.trainer.policy_mini_batch_size = 2
+    policy_world_size = policy_num_nodes * policy_num_gpus_per_node
+    cfg.trainer.train_batch_size = policy_world_size
+    cfg.trainer.policy_mini_batch_size = policy_world_size
     cfg.trainer.micro_train_batch_size_per_gpu = 1
     cfg.trainer.update_epochs_per_batch = 1
     cfg.trainer.algorithm.use_kl_loss = False
     cfg.trainer.algorithm.use_entropy_loss = False
     cfg.trainer.placement.colocate_all = colocate_all
-    cfg.trainer.placement.policy_num_nodes = 1
-    cfg.trainer.placement.policy_num_gpus_per_node = 2
+    cfg.trainer.placement.policy_num_nodes = policy_num_nodes
+    cfg.trainer.placement.policy_num_gpus_per_node = policy_num_gpus_per_node
     cfg.trainer.policy.fsdp_config.cpu_offload = True
-    cfg.trainer.policy.fsdp_config.fsdp_size = 2
+    cfg.trainer.policy.fsdp_config.fsdp_size = policy_world_size
     cfg.trainer.policy.fsdp_config.expert_model_parallel_size = 1
     cfg.trainer.policy.fsdp_config.context_parallel_size = 1
     cfg.trainer.policy.fsdp_config.moe_router_replay = False
@@ -109,8 +119,8 @@ def _config(model_path: str, *, real_checkpoint: bool = False, colocate_all: boo
     cfg.generator.async_engine = True
     cfg.generator.weight_sync_backend = "nccl"
     cfg.generator.inference_engine_tensor_parallel_size = 1
-    cfg.generator.inference_engine_data_parallel_size = 2
-    cfg.generator.inference_engine_expert_parallel_size = 2
+    cfg.generator.inference_engine_data_parallel_size = rollout_dp_size
+    cfg.generator.inference_engine_expert_parallel_size = rollout_dp_size
     cfg.generator.n_samples_per_prompt = 1
     cfg.generator.gpu_memory_utilization = 0.90 if real_checkpoint else 0.35
     cfg.generator.sampling_params.temperature = 1.0
@@ -121,7 +131,8 @@ def _config(model_path: str, *, real_checkpoint: bool = False, colocate_all: boo
 
 
 def _make_training_batch(sequences: torch.Tensor, action_log_probs: torch.Tensor) -> TrainingInputBatch:
-    advantages = torch.tensor([[-1.0, -0.25, 0.5, 1.0], [1.0, 0.5, -0.25, -1.0]])
+    advantage_pattern = torch.tensor([[-1.0, -0.25, 0.5, 1.0], [1.0, 0.5, -0.25, -1.0]])
+    advantages = advantage_pattern.repeat(math.ceil(sequences.shape[0] / 2), 1)[: sequences.shape[0]]
     ones = torch.ones_like(action_log_probs)
     batch = TrainingInputBatch(
         {
@@ -156,8 +167,8 @@ def _engine_client(cfg, model_path: str, shared_pg) -> InferenceEngineClient:
     engines = create_ray_wrapped_inference_engines(
         num_inference_engines=1,
         tensor_parallel_size=1,
-        data_parallel_size=2,
-        expert_parallel_size=2,
+        data_parallel_size=cfg.generator.inference_engine_data_parallel_size,
+        expert_parallel_size=cfg.generator.inference_engine_expert_parallel_size,
         model_dtype="bfloat16",
         pretrain=model_path,
         seed=23,
@@ -168,8 +179,8 @@ def _engine_client(cfg, model_path: str, shared_pg) -> InferenceEngineClient:
         gpu_memory_utilization=cfg.generator.gpu_memory_utilization,
         inference_engine_enable_sleep=cfg.trainer.placement.colocate_all,
         async_engine=True,
-        max_num_batched_tokens=128,
-        max_num_seqs=2,
+        max_num_batched_tokens=128 * cfg.generator.inference_engine_data_parallel_size,
+        max_num_seqs=cfg.trainer.train_batch_size,
         tokenizer=tokenizer,
         backend="vllm",
         engine_init_kwargs={"max_model_len": 128},
@@ -300,19 +311,37 @@ def _run_full_cycle(
     *,
     real_checkpoint: bool,
     colocate_all: bool = True,
+    policy_num_nodes: int = 1,
+    policy_num_gpus_per_node: int = 2,
+    rollout_dp_size: int = 2,
 ) -> None:
-    cfg = _config(model_path, real_checkpoint=real_checkpoint, colocate_all=colocate_all)
+    cfg = _config(
+        model_path,
+        real_checkpoint=real_checkpoint,
+        colocate_all=colocate_all,
+        policy_num_nodes=policy_num_nodes,
+        policy_num_gpus_per_node=policy_num_gpus_per_node,
+        rollout_dp_size=rollout_dp_size,
+    )
     initialize_ray(cfg)
+    required_gpus = policy_num_nodes * policy_num_gpus_per_node + (0 if colocate_all else rollout_dp_size)
+    available_gpus = int(ray.cluster_resources().get("GPU", 0))
+    if available_gpus < required_gpus:
+        pytest.skip(f"topology requires {required_gpus} Ray GPUs, found {available_gpus}")
     pg = None
     if colocate_all:
-        pg = placement_group([{"GPU": 1, "CPU": 1}] * COLOCATED_NUM_GPUS, strategy="PACK")
+        pg = placement_group(
+            [{"GPU": 1, "CPU": 1}] * (policy_num_nodes * policy_num_gpus_per_node),
+            strategy="PACK",
+        )
         get_ray_pg_ready_with_timeout(pg, timeout=60)
     client = _engine_client(cfg, model_path, pg)
     try:
         started = time.monotonic()
         if colocate_all:
             asyncio.run(client.wake_up())
-        prompts = [[1, 17, 29, 5, 11, 3], [1, 19, 31, 7, 13, 3]]
+        prompt_pattern = [[1, 17, 29, 5, 11, 3], [1, 19, 31, 7, 13, 3]]
+        prompts = [prompt_pattern[idx % len(prompt_pattern)] for idx in range(cfg.trainer.train_batch_size)]
         sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
         sampling_params.update({"temperature": 0.0, "ignore_eos": True, "logprobs": 1})
         first_rollout = asyncio.run(
@@ -337,7 +366,8 @@ def _run_full_cycle(
             "policy",
             shared_pg=pg,
             colocate_all=colocate_all,
-            num_gpus_per_node=2,
+            num_gpus_per_node=policy_num_gpus_per_node,
+            num_nodes=policy_num_nodes,
             cfg=cfg,
         )
         training = _train_and_snapshot(policy, _training_batch(prompts, first_rollout), model_path)
@@ -450,7 +480,9 @@ def test_grug_step_42150_progressive_gate(tmp_path):
     raw_model_path = os.environ.get("GRUG_REAL_CHECKPOINT_DIR")
     if not raw_model_path:
         pytest.skip("set GRUG_REAL_CHECKPOINT_DIR to the staged step-42150 HF export")
-    _require_hoppers(COLOCATED_NUM_GPUS)
+    topology = os.environ.get("GRUG_REAL_TOPOLOGY", "colocated")
+    assert topology in {"colocated", "disaggregated-32"}
+    _require_hoppers(8 if topology == "disaggregated-32" else COLOCATED_NUM_GPUS)
     model_path = Path(raw_model_path)
     assert model_path.is_dir(), model_path
     source = os.environ.get("GRUG_REAL_CHECKPOINT_SOURCE")
@@ -468,9 +500,22 @@ def test_grug_step_42150_progressive_gate(tmp_path):
         "gate": gate,
         "stages": {},
     }
-    if gate == "full":
+    result["topology"] = topology
+    if gate == "full" and topology == "disaggregated-32":
+        _run_full_cycle(
+            str(model_path),
+            tmp_path,
+            result,
+            real_checkpoint=True,
+            colocate_all=False,
+            policy_num_nodes=2,
+            policy_num_gpus_per_node=8,
+            rollout_dp_size=16,
+        )
+    elif gate == "full":
         _run_full_cycle(str(model_path), tmp_path, result, real_checkpoint=True)
     else:
+        assert topology == "colocated", "progressive trainer-only gates use the two-H100 topology"
         _run_trainer_gates(str(model_path), tmp_path, gate, result)
     raw_result_path = os.environ.get("GRUG_REAL_RESULT_JSON")
     _write_result(result, Path(raw_result_path) if raw_result_path else None)

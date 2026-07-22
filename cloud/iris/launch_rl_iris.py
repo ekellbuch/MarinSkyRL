@@ -10,7 +10,7 @@ launcher). It combines:
     job-name, max-retries, workspace source-sync to /app).
 
 The target is GPU (not TPU), and the gpu-rl image is a conda-venv image
-(/opt/openthoughts/envs/rl), so this launcher drives the iris SDK's GPU helpers
+(/opt/marin/envs/rl), so this launcher drives the iris SDK's GPU helpers
 (build_resources(gpu=...), gpu_device, the leafgroup-coscheduling
 ``resolve_multinode_defaults``) directly rather than going through a TPU-shaped
 base launcher.
@@ -403,7 +403,7 @@ def _resolve_default_disk(fraction: float = DISK_FRACTION) -> str:
 
 
 # The gpu-rl image's RL venv (deps-only: torch 2.11 + vLLM fork + skyrl editable).
-RL_PYTHON = "/opt/openthoughts/envs/rl/bin/python"
+RL_PYTHON = "/opt/marin/envs/rl/bin/python"
 SKYRL_HOME = "/opt/skyrl"
 # In-container source sync target. iris syncs the launcher's `workspace`
 # (this MarinSkyRL repo, PROJECT_ROOT — see IrisClient.remote(..., workspace=PROJECT_ROOT))

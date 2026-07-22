@@ -542,14 +542,12 @@ def test_policy_loss_registry_specific():
     PolicyLossRegistry.unregister("test_policy_decorator")
 
 
+@pytest.mark.usefixtures("ray_module")
 def test_registry_cross_ray_process():
     """Test that registry works with Ray and that functions can be retrieved and called from different processes"""
     try:
         import ray
         from omegaconf import DictConfig
-
-        if not ray.is_initialized():
-            ray.init()
 
         # Create test functions
         def test_policy_loss(log_probs, old_log_probs, advantages, config, loss_mask=None):
@@ -608,13 +606,11 @@ def test_registry_cross_ray_process():
         AdvantageEstimatorRegistry.reset()
 
 
+@pytest.mark.usefixtures("ray_module")
 def test_registry_named_actor_creation():
     """Test that the registry creates named Ray actors and properly serializes functions."""
     try:
         import ray
-
-        if not ray.is_initialized():
-            ray.init()
 
         def test_func(**kwargs):
             rewards = kwargs["token_level_rewards"]
@@ -628,7 +624,7 @@ def test_registry_named_actor_creation():
         assert retrieved == test_func
 
         # Verify named actor exists and contains function
-        actor = ray.get_actor("advantage_estimator_registry")
+        actor = ray.get_actor(AdvantageEstimatorRegistry._actor_name)
         assert actor is not None
 
         available_in_actor = ray.get(actor.list_available.remote())
@@ -657,6 +653,7 @@ def test_registry_named_actor_creation():
         AdvantageEstimatorRegistry.reset()
 
 
+@pytest.mark.usefixtures("ray_module")
 def test_registry_reset_after_ray_shutdown():
     """
     Test that the registry resets properly after ray is shutdown.
@@ -674,18 +671,18 @@ def test_registry_reset_after_ray_shutdown():
         AdvantageEstimatorRegistry.register("named_actor_test", test_func)
         retrieved = AdvantageEstimatorRegistry.get("named_actor_test")
         assert retrieved == test_func
-        actor = ray.get_actor("advantage_estimator_registry")
+        actor = ray.get_actor(AdvantageEstimatorRegistry._actor_name)
         assert actor is not None
 
     try:
         import ray
 
-        # 1. Initialize ray and register function
-        if not ray.is_initialized():
-            ray.init()
+        # 1. Register a function in the fixture's Ray session
         _register_func_and_verify()
 
-        # 2. Shutdown ray
+        # 2. Force-kill the named actor before shutting down Ray. Waiting for
+        # owner-death cleanup can take Ray's full graceful actor timeout.
+        ray.kill(ray.get_actor(AdvantageEstimatorRegistry._actor_name))
         ray.shutdown()
 
         # 3. Initialize ray, reset registry, and register function
@@ -694,4 +691,5 @@ def test_registry_reset_after_ray_shutdown():
         _register_func_and_verify()
 
     finally:
+        AdvantageEstimatorRegistry.reset()
         ray.shutdown()

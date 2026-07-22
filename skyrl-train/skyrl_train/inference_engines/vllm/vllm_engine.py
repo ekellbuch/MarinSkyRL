@@ -689,8 +689,8 @@ class WorkerWrap:
         fused/sharded params; here we read those internal params back and rebuild
         the HF view so the trainer's post-step HF tensors can be compared
         tensor-by-tensor). Returns, per requested HF name, this worker's
-        contribution as a CPU fp32 tensor plus the rank coordinates so the caller
-        can assemble across TP/EP shards.
+        contribution as a CPU fp32 tensor plus the live engine dtype and rank
+        coordinates so the caller can assemble across TP/EP shards.
 
         Supported HF name forms (Qwen1.5-MoE / Qwen2MoE vLLM layout):
           * ``model.embed_tokens.weight``                       -> VocabParallelEmbedding (TP vocab-sharded)
@@ -741,7 +741,13 @@ class WorkerWrap:
             try:
                 # 1. Direct (replicated) match: router gate, norms, etc.
                 if name in all_params:
-                    entry = {"found": True, "mode": "direct", "tensor": _cpu(all_params[name])}
+                    tensor = all_params[name]
+                    entry = {
+                        "found": True,
+                        "mode": "direct",
+                        "dtype": str(tensor.dtype).removeprefix("torch."),
+                        "tensor": _cpu(tensor),
+                    }
                     out[name] = entry
                     continue
 

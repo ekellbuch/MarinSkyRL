@@ -51,6 +51,7 @@ class _TrainingSnapshot:
     status: dict[str, float]
     bias_names: list[str]
     representative_name: str
+    bf16_sentinel_name: str
     weights: dict[str, torch.Tensor]
 
 
@@ -222,15 +223,15 @@ def _record_stage(result: dict, stage: str, started: float, policy, status=None)
     result["stages"][stage] = payload
 
 
-def _representative_names(model_path: str) -> tuple[list[str], str]:
+def _representative_names(model_path: str) -> tuple[list[str], str, str]:
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=False, local_files_only=True)
     assert config.model_type == GRUG_MOE_MODEL_TYPE
     biases = [f"model.layers.{idx}{GRUG_ROUTER_BIAS_SUFFIX}" for idx in range(config.num_hidden_layers)]
-    return biases, "model.layers.0.mlp.router.weight"
+    return biases, "model.layers.0.mlp.router.weight", "model.layers.0.input_layernorm.weight"
 
 
 def _train_and_snapshot(policy, batch: TrainingInputBatch, model_path: str) -> _TrainingSnapshot:
-    bias_names, representative_name = _representative_names(model_path)
+    bias_names, representative_name, bf16_sentinel_name = _representative_names(model_path)
     before, _ = _snapshot(policy, [representative_name])
     train_output = ray.get(policy.async_run_ray_method("pass_through", "ppo_train", batch))[0]
     status = train_output.metadata["train_status"]
@@ -238,10 +239,10 @@ def _train_and_snapshot(policy, batch: TrainingInputBatch, model_path: str) -> _
     assert math.isfinite(status["raw_grad_norm"])
     assert status["raw_grad_norm"] > 0
     assert status["optimizer_step_succeeded"] == 1.0
-    weights, _ = _snapshot(policy, [representative_name, *bias_names])
+    weights, _ = _snapshot(policy, [representative_name, bf16_sentinel_name, *bias_names])
     assert not torch.equal(weights[representative_name], before[representative_name])
     assert all(torch.count_nonzero(weights[name]).item() > 0 for name in bias_names)
-    return _TrainingSnapshot(status, bias_names, representative_name, weights)
+    return _TrainingSnapshot(status, bias_names, representative_name, bf16_sentinel_name, weights)
 
 
 def _assert_checkpoint_restores_biases(
@@ -384,7 +385,7 @@ def _run_full_cycle(
             cfg=cfg,
         )
         training = _train_and_snapshot(policy, _training_batch(prompts, first_rollout), model_path)
-        sync_names = [*training.bias_names, training.representative_name]
+        sync_names = [*training.bias_names, training.representative_name, training.bf16_sentinel_name]
 
         checkpoint_path = str(tmp_path / "resume-checkpoint")
         _assert_checkpoint_restores_biases(
@@ -414,6 +415,8 @@ def _run_full_cycle(
                 for name in sync_names:
                     entry = rank_values[name]
                     assert entry["found"], (name, entry)
+                    expected_dtype = "bfloat16" if name == training.bf16_sentinel_name else "float32"
+                    assert entry["dtype"] == expected_dtype, (name, entry["dtype"])
                     torch.testing.assert_close(entry["tensor"], training.weights[name], rtol=0, atol=0)
 
         if colocate_all:

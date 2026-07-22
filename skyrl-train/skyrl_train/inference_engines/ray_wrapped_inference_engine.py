@@ -445,6 +445,7 @@ def create_ray_wrapped_inference_engines(
             shared_pg = placement_group(bundles, strategy="PACK")
             get_ray_pg_ready_with_timeout(shared_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
 
+    allocated_rendezvous_ports: set[int] = set()
     for i in range(num_inference_engines):
         # Per-engine STRICT_PACK PGs (ray/uni, multi-GPU engines) are engine-LOCAL: each
         # has its own bundle index space 0..per_engine_gpu_count-1, so base_pg_index
@@ -463,7 +464,10 @@ def create_ray_wrapped_inference_engines(
         # rendezvous bundle for engine i's DP-rank-0 is at i*data_parallel_size (not the
         # per-GPU base_pg_index, which would index past the smaller mp bundle list).
         rendezvous_pg_index = (i * data_parallel_size) if use_mp_backend else base_pg_index
-        data_parallel_address, data_parallel_rpc_port = get_rendezvous_addr_port(engine_pg, rendezvous_pg_index)
+        data_parallel_address, data_parallel_rpc_port = get_rendezvous_addr_port(
+            engine_pg, rendezvous_pg_index, allocated_rendezvous_ports
+        )
+        allocated_rendezvous_ports.add(data_parallel_rpc_port)
 
         if backend == "vllm":
             if async_engine:

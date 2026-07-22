@@ -146,7 +146,11 @@ def _run_create(monkeypatch, dcp: int):
     # ray.get(...) is called on get_all_env_variables.remote() — return a dummy env dict.
     monkeypatch.setattr(rwie.ray, "get", lambda *a, **k: {})
     # get_rendezvous_addr_port is only used for data_parallel_size>1; stub anyway.
-    monkeypatch.setattr(rwie, "get_rendezvous_addr_port", lambda pg, idx: ("127.0.0.1", 12345))
+    monkeypatch.setattr(
+        rwie,
+        "get_rendezvous_addr_port",
+        lambda pg, idx, excluded_ports=(): ("127.0.0.1", 12345),
+    )
     # The real RayWrappedInferenceEngine wrapper is trivial (it only stores the actor
     # handle as .inference_engine_actor), so use it unmocked — the readiness gate reads
     # engine.inference_engine_actor off it.

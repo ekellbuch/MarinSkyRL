@@ -7,10 +7,12 @@ uv run --isolated --extra dev pytest tests/cpu/inf_engines/test_inference_engine
 """
 
 from http import HTTPStatus
+import socket
 from unittest.mock import patch
 
 from transformers import AutoTokenizer
 from skyrl_train.inference_engines.utils import (
+    _find_available_rendezvous_port,
     postprocess_completion_request,
     route_prompts_to_engines,
     hash_with_sha256,
@@ -25,6 +27,23 @@ import asyncio
 import pytest
 import random
 from copy import deepcopy
+
+
+def test_rendezvous_port_avoids_ephemeral_range_and_existing_listener():
+    first = _find_available_rendezvous_port()
+    assert 20_000 <= first < 30_000
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("", first))
+        second = _find_available_rendezvous_port({first})
+
+    assert 20_000 <= second < 30_000
+    assert second != first
+
+
+def test_rendezvous_port_fails_when_range_is_excluded():
+    with pytest.raises(RuntimeError, match="No free rendezvous port"):
+        _find_available_rendezvous_port(range(20_000, 30_000))
 
 
 class _CommunicatorEngine:

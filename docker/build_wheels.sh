@@ -14,8 +14,8 @@
 #   1. Builds ONLY the `wheel-builder` Dockerfile stage (the nvcc compiles).
 #   2. Exports /wheels/*.whl + /wheels/MANIFEST from that stage to
 #      docker/wheelhouse/ (gitignored — large binaries).
-#   3. After this runs once, `docker/build_and_push.sh gpu-rl` (or the buildx
-#      command in docker/README.gpu-rl-wheelcache.md) installs THOSE wheels.
+#   3. After this runs once, the buildx command in
+#      docker/README.gpu-rl-wheelcache.md installs THOSE wheels.
 #
 # CACHE KEY (what invalidates the wheels) — recomputed from the Dockerfile ARGs:
 #   { VLLM_FORK_COMMIT, FLASH_ATTN_VERSION, torch 2.11.0, CUDA 12.8, cp312,
@@ -40,6 +40,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 DOCKERFILE="$SCRIPT_DIR/Dockerfile.gpu-rl"
 WHEELHOUSE="$SCRIPT_DIR/wheelhouse"
+EXPORT_DIR=$(mktemp -d "$SCRIPT_DIR/.wheelbuild-export.XXXXXX")
+trap 'rm -rf "$EXPORT_DIR"' EXIT
 
 # The production gpu-rl image is linux/amd64 ONLY (CoreWeave H100 / x86 CUDA).
 PLATFORM="${PLATFORM:-linux/amd64}"
@@ -76,18 +78,20 @@ docker buildx build \
     -f "$DOCKERFILE" \
     --target wheel-builder \
     --build-arg WHEEL_SOURCE=wheel-builder \
-    --output "type=local,dest=$SCRIPT_DIR/.wheelbuild-export" \
+    --output "type=local,dest=$EXPORT_DIR" \
     .
 
 # The wheel-builder stage holds the wheels at /wheels; the local export mirrors
 # the whole stage fs, so copy just the wheels + manifest into the wheelhouse.
 echo ""
 echo ">>> Collecting wheels from export ..."
-find "$SCRIPT_DIR/.wheelbuild-export/wheels" -maxdepth 1 -name '*.whl' -exec cp -v {} "$WHEELHOUSE/" \;
-if [[ -f "$SCRIPT_DIR/.wheelbuild-export/wheels/MANIFEST" ]]; then
-    cp -v "$SCRIPT_DIR/.wheelbuild-export/wheels/MANIFEST" "$WHEELHOUSE/MANIFEST"
-fi
-rm -rf "$SCRIPT_DIR/.wheelbuild-export"
+SOURCE_WHEELHOUSE="$EXPORT_DIR/wheels"
+test "$(find "$SOURCE_WHEELHOUSE" -maxdepth 1 -type f -name 'vllm-*.whl' | wc -l)" -eq 1
+test "$(find "$SOURCE_WHEELHOUSE" -maxdepth 1 -type f -name 'flash_attn-*.whl' | wc -l)" -eq 1
+test -s "$SOURCE_WHEELHOUSE/MANIFEST"
+find "$WHEELHOUSE" -maxdepth 1 -type f \( -name '*.whl' -o -name MANIFEST \) -delete
+find "$SOURCE_WHEELHOUSE" -maxdepth 1 -type f -name '*.whl' -exec cp -v {} "$WHEELHOUSE/" \;
+cp -v "$SOURCE_WHEELHOUSE/MANIFEST" "$WHEELHOUSE/MANIFEST"
 
 echo ""
 echo "============================================"
@@ -95,5 +99,5 @@ echo "Wheelhouse contents:"
 ls -la "$WHEELHOUSE"
 echo "============================================"
 echo "Done. Now build the image with the cached wheels:"
-echo "  ./docker/build_and_push.sh gpu-rl"
+echo "  See docker/README.gpu-rl-wheelcache.md for the buildx command."
 echo "(the rl stage COPYs docker/wheelhouse/*.whl and installs them — no nvcc)"

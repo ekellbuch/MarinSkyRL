@@ -28,7 +28,7 @@ targets `linux/amd64`.
 
 | | |
 |---|---|
-| **Cache location** | `docker/wheelhouse/` on the build host (gitignored; only `.keep` is committed). Holds `vllm-*.whl`, `flash_attn-*.whl`, `MANIFEST`. |
+| **Cache location** | `docker/wheelhouse/` on the build host (generated wheels and `MANIFEST` are gitignored; only `.keep` is committed). Holds `vllm-*.whl`, `flash_attn-*.whl`, `MANIFEST`. |
 | **Cache key (what invalidates a wheel)** | the tuple `{ VLLM_FORK_COMMIT, FLASH_ATTN_VERSION, torch 2.11.0, CUDA 12.8, cp312, x86_64, TORCH_CUDA_ARCH_LIST "8.0;9.0" }` — all declared as `ARG`s at the top of `Dockerfile.gpu-rl`. Change any → rebuild the wheels. `MANIFEST` records the key the wheels were built at. |
 | **Not cached** | torchtitan (pure-python, trivial — installed fresh each build) and all pip-resolved deps. |
 
@@ -45,6 +45,9 @@ Re-run this **only** when a pin/ABI in the cache key changes.
 
 ### Every rebuild — build + push from a populated wheelhouse (NO nvcc)
 
+Run `build_wheels.sh` first, or otherwise stage a matching manifest and exactly
+one wheel for each package in `docker/wheelhouse/`.
+
 ```bash
 source ~/secrets.env
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u <user> --password-stdin
@@ -56,25 +59,27 @@ docker buildx build -f docker/Dockerfile.gpu-rl \
 docker buildx imagetools inspect ghcr.io/<owner>/<package>:gpu-rl-<gitsha>
 ```
 
-The Kaniko launcher can fetch a wheelhouse tarball directly from Iris storage:
+### Iris rebuild from the validated wheel artifact
+
+`docker/build_gpu_rl_kaniko.sh` must run only inside its disposable Ubuntu Iris
+task. It installs system packages and overlays the Kaniko root filesystem onto
+`/`; never invoke it directly on a workstation or shared host. Follow the
+[Iris GPU-RL build guide](../.agents/skills/build-gpu-rl-image-iris/SKILL.md),
+which submits the script inside the task container.
+
+The validated Grug artifact is:
 
 ```bash
-export GITSHA=$(git rev-parse --short HEAD)
-export DOCKER_USER_ID="YOUR_GHCR_USER"
-export GHCR_TOKEN="YOUR_WRITE_PACKAGES_TOKEN"
-export GHCR_IMAGE_REPOSITORY="ghcr.io/YOUR_GHCR_USER/YOUR_PACKAGE"
-export WHEEL_SOURCE=prebuilt-wheelhouse
-export PREBUILT_WHEEL_ARTIFACT_URI=s3://marin-us-east-02a/iris/grug-vllm-wheels/4b55591306c9-torch211-cu128-cp312-fb6ff59.tar.gz
-export KANIKO_CACHE=0
-./docker/build_gpu_rl_kaniko.sh
+PREBUILT_WHEEL_ARTIFACT_URI=s3://marin-us-east-02a/iris/grug-vllm-wheels/4b55591306c9-torch211-cu128-cp312-fb6ff59.tar.gz
+PREBUILT_WHEEL_ARTIFACT_SHA256=d247a8865c56ea2756512fcb0b102f8127b2020bdfbfb92d76dbd1386d514417
 ```
 
 The archive must contain `wheels/MANIFEST`, one `vllm-*.whl`, and one
 `flash_attn-*.whl`. The launcher verifies the exact ABI/pin manifest and exits
-on any fetch or validation failure; it never falls back to a source compile.
-The URI above is the validated, content-keyed wheelhouse for the checked-in
-vLLM, Torch, CUDA, Python, and architecture manifest. Keep it until one of those
-inputs changes; a new manifest requires a new artifact rather than overwriting it.
+on any fetch, SHA-256, or validation failure; it never falls back to a source
+compile. Iris injects the `FSSPEC_S3` configuration and S3 credentials used to
+read this URI. A new manifest requires a new immutable artifact and checksum;
+do not overwrite the existing object.
 
 ### Explicit source rebuild (slow)
 
@@ -97,12 +102,24 @@ the default in `cloud/iris/launch_rl_iris.py` to the new digest (from the
 `:gpu-rl-<gitsha>` tag, never the floating `:gpu-rl`) and update the provenance
 comment.
 
+The validated image covers the Grug FSDP2 path. Before making it the shared
+default, reconcile the Marin vLLM fork's runtime dependency pins with
+`skyrl-train/uv.lock`, port or retire the old fork's
+`SKYRL_FUSE_WEIGHTS` FP8 synchronization patch, and run the retained non-Grug
+GPU-RL gates. The current shared default remains the pre-Grug image until that
+work is complete.
+
 ## What proves the build is good
 
 The `rl` stage asserts at build time:
 
+- the staged wheel manifest matches the Dockerfile's source and ABI pins;
 - `import flash_attn, flash_attn_2_cuda` — the CUDA extension EXISTS (from the wheel).
 - `import torch, vllm, skyrl_train, flash_attn, flash_attn_2_cuda`.
+- the MarinSkyRL Grug config and vLLM `GrugMoeForCausalLM` registry entry exist;
 - `from torchtitan.distributed.expert_parallel import ExpertParallel` — the
   **EP>1 MoE unblock**; if this line prints `... import OK`, `apply_ep` will
   resolve `ExpertParallel` and the CoreWeave EP=8 RL jobs can launch.
+- the locked S3 client imports and constructs a client;
+- optional Megatron imports resolve when `INSTALL_MEGATRON=1`;
+- the pinned Harbor commit installs and imports.

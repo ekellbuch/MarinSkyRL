@@ -45,6 +45,8 @@
 # Build is GPU-count-agnostic and needs no live GPU (only nvcc). Target = linux/amd64.
 # =============================================================================
 
+# The Kaniko launcher reads these literal defaults to validate prebuilt artifacts;
+# keep the cache-key ARGs as single-line values rather than derived expressions.
 ARG BASE_IMAGE=nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
 ARG WHEEL_PYTHON_VERSION=3.12
 ARG TARGET_PLATFORM=linux_x86_64
@@ -383,7 +385,7 @@ RUN ${RL_ENV_DIR}/bin/python -c "import torch, transformers, vllm, skyrl_train, 
 
 # Grug contract assert: both sides of weight sync must be discoverable without
 # checkpoint-supplied remote code.
-RUN ${RL_ENV_DIR}/bin/python -c "from transformers import AutoConfig; import skyrl_train; from vllm.model_executor.models.registry import ModelRegistry; assert AutoConfig.for_model('grug_moe').model_type == 'grug_moe'; assert 'GrugMoeForCausalLM' in ModelRegistry.get_supported_archs(); print('Grug trainer config + vLLM model registry OK')"
+RUN ${RL_ENV_DIR}/bin/python -c "from transformers import AutoConfig; import skyrl_train.models; from skyrl_train.models import GrugMoeConfig; from vllm.model_executor.models.registry import ModelRegistry; assert isinstance(AutoConfig.for_model('grug_moe'), GrugMoeConfig); assert 'GrugMoeForCausalLM' in ModelRegistry.get_supported_archs(); print('Grug trainer config + vLLM model registry OK')"
 
 # Megatron backend asserts (only when built with INSTALL_MEGATRON=1).
 RUN if [ "${INSTALL_MEGATRON}" = "1" ]; then \

@@ -15,10 +15,9 @@ PYTHON_VERSION=$6
 TARGET_PLATFORM=$7
 TORCH_CUDA_ARCH_LIST=$8
 
-CUDA_TAG=${BASE_IMAGE#*cuda:}
-CUDA_TAG=${CUDA_TAG%%-*}
-CUDA_VERSION=${CUDA_TAG%.*}
-if [ "$CUDA_VERSION" = "$CUDA_TAG" ] || [ -z "$CUDA_VERSION" ]; then
+if [[ "$BASE_IMAGE" =~ cuda:([0-9]+)\.([0-9]+)(\.[0-9]+)?- ]]; then
+  CUDA_VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+else
   echo "cannot derive CUDA major.minor from BASE_IMAGE=$BASE_IMAGE" >&2
   exit 2
 fi

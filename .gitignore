@@ -54,3 +54,4 @@ uv.lock
 /_build*
 # gpu-rl prebuilt wheels (fetched at build time, not committed)
 docker/wheelhouse/*.whl
+docker/wheelhouse/MANIFEST

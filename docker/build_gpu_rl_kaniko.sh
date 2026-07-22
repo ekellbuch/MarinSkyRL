@@ -22,6 +22,9 @@
 #   KANIKO_CACHE_REPOSITORY  required when KANIKO_CACHE=1
 #   PREBUILT_WHEEL_ARTIFACT_URI  s3://...tar.gz containing wheels/{MANIFEST,*.whl};
 #                      required when WHEEL_SOURCE=prebuilt-wheelhouse
+#   PREBUILT_WHEEL_ARTIFACT_SHA256  archive digest; required with the artifact URI
+# The s3:// fetch relies on the FSSPEC_S3 configuration and credentials injected
+# into Iris task pods. This script must run only inside a disposable Iris task.
 # SECURITY: NO `set -x` before the ghcr token is consumed (would echo GHCR_TOKEN
 # / the base64 AUTH into the R2-persisted finelog). Tracing is enabled AFTER the
 # config.json write, so build steps are traced but the secret never is.
@@ -36,6 +39,7 @@ TAG_PREFIX="${TAG_PREFIX:-gpu-rl}"
 # bake a new harbor commit. Default matches the Dockerfile ARG default.
 HARBOR_COMMIT="${HARBOR_COMMIT:-1319eb29}"
 PREBUILT_WHEEL_ARTIFACT_URI="${PREBUILT_WHEEL_ARTIFACT_URI:-}"
+PREBUILT_WHEEL_ARTIFACT_SHA256="${PREBUILT_WHEEL_ARTIFACT_SHA256:-}"
 GHCR_IMAGE_REPOSITORY="${GHCR_IMAGE_REPOSITORY:-}"
 GHCR_TOKEN="${GHCR_TOKEN:-}"
 DOCKERFILE="${DOCKERFILE:-docker/Dockerfile.gpu-rl}"
@@ -45,6 +49,15 @@ DOCKERFILE="${DOCKERFILE:-docker/Dockerfile.gpu-rl}"
 case "$WHEEL_SOURCE" in
   prebuilt-wheelhouse)
     : "${PREBUILT_WHEEL_ARTIFACT_URI:?Required when WHEEL_SOURCE=prebuilt-wheelhouse}"
+    : "${PREBUILT_WHEEL_ARTIFACT_SHA256:?Required when WHEEL_SOURCE=prebuilt-wheelhouse}"
+    if [[ "$PREBUILT_WHEEL_ARTIFACT_URI" != s3://* ]]; then
+      echo "PREBUILT_WHEEL_ARTIFACT_URI must use the Iris s3:// store" >&2
+      exit 2
+    fi
+    if [[ ! "$PREBUILT_WHEEL_ARTIFACT_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+      echo "PREBUILT_WHEEL_ARTIFACT_SHA256 must contain exactly 64 hexadecimal characters" >&2
+      exit 2
+    fi
     ;;
   wheel-builder) ;;
   *)
@@ -52,6 +65,15 @@ case "$WHEEL_SOURCE" in
     exit 2
     ;;
 esac
+
+DOCKERFILE_PATH="$DOCKERFILE"
+if [[ "$DOCKERFILE_PATH" != /* ]]; then DOCKERFILE_PATH="/app/$DOCKERFILE_PATH"; fi
+if [ -z "${IRIS_TASK_ID:-}" ] \
+  || [ ! -f "$DOCKERFILE_PATH" ] \
+  || [ ! -f /app/docker/write_gpu_rl_wheel_manifest.sh ]; then
+  echo "build_gpu_rl_kaniko.sh must run inside a disposable Iris task" >&2
+  exit 2
+fi
 
 # SINGLE_SNAPSHOT=0 (default) => per-instruction layers (each small enough to pull
 # + retry over the CoreWeave->ghcr egress). =1 collapses to ONE ~16 GB layer that
@@ -75,32 +97,8 @@ DEST_PINNED="${GHCR_IMAGE_REPOSITORY}:${TAG_PREFIX}-${GITSHA}"
 FLOATING_DEST_FLAGS=(--destination "$DEST_FLOATING")
 if [ "${PUSH_FLOATING:-0}" != "1" ]; then FLOATING_DEST_FLAGS=(); fi
 
-# --- 1. fetch crane (static binary) ---
-apt-get update -y && apt-get install -y --no-install-recommends ca-certificates curl tar
-cd /tmp
-CRANE_VER=v0.20.2
-curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VER}/go-containerregistry_Linux_x86_64.tar.gz" -o crane.tgz
-tar -xzf crane.tgz crane
-install -m 0755 crane /usr/local/bin/crane
-
-# --- 2. crane-export the kaniko executor rootfs over / ---
-crane export gcr.io/kaniko-project/executor:latest - | tar -xf - -C / || true
-
-# --- 3. write the ghcr auth config AFTER the overlay (kaniko clobbers /kaniko otherwise) ---
-export DOCKER_CONFIG=/kaniko/.docker
-mkdir -p "$DOCKER_CONFIG"
-AUTH=$(printf '%s:%s' "$DOCKER_USER_ID" "$GHCR_TOKEN" | base64 | tr -d '\n')
-cat > "$DOCKER_CONFIG/config.json" <<EOF
-{"auths":{"ghcr.io":{"auth":"${AUTH}"}}}
-EOF
-unset AUTH
-unset GHCR_TOKEN
-set -x  # ghcr PAT consumed — safe to trace the build steps (token never traced)
-
 prepare_wheel_artifact_io() {
-  apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-pip
-  python3 -m pip install --no-cache-dir fsspec s3fs
+  python3 -m pip install --no-cache-dir fsspec==2026.4.0 s3fs==2026.4.0
 }
 
 download_wheel_artifact() {
@@ -113,23 +111,31 @@ import fsspec
 uri, local_path = sys.argv[1:]
 with fsspec.open(uri, "rb") as source, open(local_path, "wb") as destination:
     shutil.copyfileobj(source, destination)
-print(f"downloaded wheel artifact: {uri}")
+print("downloaded wheel artifact")
 PY
 }
 
-# --- 3.5. fetch and validate the prebuilt wheelhouse, when selected ---
+# --- 1. install the bootstrap tools before any registry credential is written ---
+APT_PACKAGES=(ca-certificates curl tar)
+if [ "$WHEEL_SOURCE" = "prebuilt-wheelhouse" ]; then APT_PACKAGES+=(python3-pip); fi
+apt-get update -y && apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
+
+# --- 2. fetch and validate the prebuilt wheelhouse, when selected ---
 # This path is deliberately strict: a fetch or cache-key mismatch is fatal and
 # can never fall through to the multi-hour wheel-builder stage.
 if [ "$WHEEL_SOURCE" = "prebuilt-wheelhouse" ]; then
   prepare_wheel_artifact_io
   download_wheel_artifact "$PREBUILT_WHEEL_ARTIFACT_URI" /tmp/grug-vllm-wheels.tar.gz
+  ACTUAL_ARTIFACT_SHA256=$(sha256sum /tmp/grug-vllm-wheels.tar.gz | cut -d ' ' -f 1)
+  if [ "${ACTUAL_ARTIFACT_SHA256,,}" != "${PREBUILT_WHEEL_ARTIFACT_SHA256,,}" ]; then
+    echo "wheel artifact SHA-256 mismatch" >&2
+    exit 1
+  fi
 
   mkdir -p /tmp/grug-wheel-artifact /app/docker/wheelhouse
   tar -xzf /tmp/grug-vllm-wheels.tar.gz -C /tmp/grug-wheel-artifact
   WHEEL_DIR=/tmp/grug-wheel-artifact/wheels
   test -s "$WHEEL_DIR/MANIFEST"
-  DOCKERFILE_PATH="$DOCKERFILE"
-  if [[ "$DOCKERFILE_PATH" != /* ]]; then DOCKERFILE_PATH="/app/$DOCKERFILE_PATH"; fi
   dockerfile_arg() {
     sed -n "s/^ARG $1=//p" "$DOCKERFILE_PATH" | head -n 1 | tr -d '"'
   }
@@ -144,12 +150,36 @@ if [ "$WHEEL_SOURCE" = "prebuilt-wheelhouse" ]; then
   cmp /tmp/expected-grug-wheel-manifest "$WHEEL_DIR/MANIFEST"
   test "$(find "$WHEEL_DIR" -maxdepth 1 -type f -name 'vllm-*.whl' | wc -l)" -eq 1
   test "$(find "$WHEEL_DIR" -maxdepth 1 -type f -name 'flash_attn-*.whl' | wc -l)" -eq 1
+  VLLM_WHEEL=$(find "$WHEEL_DIR" -maxdepth 1 -type f -name 'vllm-*.whl')
+  FLASH_ATTN_WHEEL=$(find "$WHEEL_DIR" -maxdepth 1 -type f -name 'flash_attn-*.whl')
+  find /app/docker/wheelhouse -maxdepth 1 -type f \( -name '*.whl' -o -name MANIFEST \) -delete
   install -m 0644 "$WHEEL_DIR/MANIFEST" /app/docker/wheelhouse/MANIFEST
-  find "$WHEEL_DIR" -maxdepth 1 -type f -name '*.whl' -exec install -m 0644 '{}' /app/docker/wheelhouse/ \;
+  install -m 0644 "$VLLM_WHEEL" "$FLASH_ATTN_WHEEL" /app/docker/wheelhouse/
   echo "validated and staged prebuilt Grug wheelhouse"
 fi
+unset PREBUILT_WHEEL_ARTIFACT_URI PREBUILT_WHEEL_ARTIFACT_SHA256
 
-# --- 4. run kaniko ---
+# --- 3. fetch crane and overlay the kaniko executor rootfs ---
+cd /tmp
+CRANE_VER=v0.20.2
+curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VER}/go-containerregistry_Linux_x86_64.tar.gz" -o crane.tgz
+tar -xzf crane.tgz crane
+install -m 0755 crane /usr/local/bin/crane
+crane export gcr.io/kaniko-project/executor:latest - | tar -xf - -C / || true
+
+# --- 4. write the ghcr auth config AFTER the overlay (kaniko clobbers /kaniko otherwise) ---
+export DOCKER_CONFIG=/kaniko/.docker
+install -d -m 0700 "$DOCKER_CONFIG"
+AUTH=$(printf '%s:%s' "$DOCKER_USER_ID" "$GHCR_TOKEN" | base64 | tr -d '\n')
+cat > "$DOCKER_CONFIG/config.json" <<EOF
+{"auths":{"ghcr.io":{"auth":"${AUTH}"}}}
+EOF
+chmod 0600 "$DOCKER_CONFIG/config.json"
+unset AUTH
+unset GHCR_TOKEN
+set -x  # ghcr PAT consumed — safe to trace the build steps (token never traced)
+
+# --- 5. run kaniko ---
 # --skip-unused-stages prunes the wheel-builder (nvcc) stage on the prebuilt path.
 exec /kaniko/executor \
   --context dir:///app \

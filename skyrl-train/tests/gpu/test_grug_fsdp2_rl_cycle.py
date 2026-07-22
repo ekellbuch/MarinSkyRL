@@ -84,6 +84,7 @@ def _config(
     colocate_all: bool = True,
     policy_num_nodes: int = 1,
     policy_num_gpus_per_node: int = 2,
+    rollout_num_engines: int = 1,
     rollout_dp_size: int = 2,
 ):
     cfg = get_test_actor_config()
@@ -121,6 +122,7 @@ def _config(
     cfg.generator.inference_engine_tensor_parallel_size = 1
     cfg.generator.inference_engine_data_parallel_size = rollout_dp_size
     cfg.generator.inference_engine_expert_parallel_size = rollout_dp_size
+    cfg.generator.num_inference_engines = rollout_num_engines
     cfg.generator.n_samples_per_prompt = 1
     cfg.generator.gpu_memory_utilization = 0.90 if real_checkpoint else 0.35
     cfg.generator.sampling_params.temperature = 1.0
@@ -165,7 +167,7 @@ def _training_batch(prompts: list[list[int]], rollout) -> TrainingInputBatch:
 def _engine_client(cfg, model_path: str, shared_pg) -> InferenceEngineClient:
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     engines = create_ray_wrapped_inference_engines(
-        num_inference_engines=1,
+        num_inference_engines=cfg.generator.num_inference_engines,
         tensor_parallel_size=1,
         data_parallel_size=cfg.generator.inference_engine_data_parallel_size,
         expert_parallel_size=cfg.generator.inference_engine_expert_parallel_size,
@@ -313,6 +315,7 @@ def _run_full_cycle(
     colocate_all: bool = True,
     policy_num_nodes: int = 1,
     policy_num_gpus_per_node: int = 2,
+    rollout_num_engines: int = 1,
     rollout_dp_size: int = 2,
 ) -> None:
     cfg = _config(
@@ -321,10 +324,18 @@ def _run_full_cycle(
         colocate_all=colocate_all,
         policy_num_nodes=policy_num_nodes,
         policy_num_gpus_per_node=policy_num_gpus_per_node,
+        rollout_num_engines=rollout_num_engines,
         rollout_dp_size=rollout_dp_size,
     )
+    result["geometry"] = {
+        "policy_world_size": policy_num_nodes * policy_num_gpus_per_node,
+        "rollout_num_engines": rollout_num_engines,
+        "rollout_data_parallel_size_per_engine": rollout_dp_size,
+        "rollout_world_size": rollout_num_engines * rollout_dp_size,
+    }
     initialize_ray(cfg)
-    required_gpus = policy_num_nodes * policy_num_gpus_per_node + (0 if colocate_all else rollout_dp_size)
+    rollout_gpus = rollout_num_engines * rollout_dp_size
+    required_gpus = policy_num_nodes * policy_num_gpus_per_node + (0 if colocate_all else rollout_gpus)
     available_gpus = int(ray.cluster_resources().get("GPU", 0))
     if available_gpus < required_gpus:
         pytest.skip(f"topology requires {required_gpus} Ray GPUs, found {available_gpus}")
@@ -510,7 +521,11 @@ def test_grug_step_42150_progressive_gate(tmp_path):
             colocate_all=False,
             policy_num_nodes=2,
             policy_num_gpus_per_node=8,
-            rollout_dp_size=16,
+            # Match issue #72's node-atomic multi-engine shape while retaining
+            # Snowball's proven TP1/DP8/EP8 vLLM geometry. A single DP16 engine
+            # spans nodes and its Gloo group advertises loopback addresses.
+            rollout_num_engines=2,
+            rollout_dp_size=8,
         )
     elif gate == "full":
         _run_full_cycle(str(model_path), tmp_path, result, real_checkpoint=True)

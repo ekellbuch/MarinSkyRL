@@ -688,6 +688,7 @@ def get_rollout_metrics(
     rewards: Union[List[float], List[List[float]]],
     env_metrics: Optional[List[Dict[str, Any]]] = None,
     env_classes: Optional[List[str]] = None,
+    max_generate_length: Optional[int] = None,
 ):
     """
     Computes rollout metrics including token statistics and optional environment-specific metrics.
@@ -719,7 +720,25 @@ def get_rollout_metrics(
     # average tokens for zero rewards
     avg_tokens_zero_rewards = np.mean(num_tokens_arr[zero_rewards_arr]) if zero_rewards_arr.sum() > 0 else np.zeros(1)
 
+    # --- group composition and length tail ---
+    # Percentiles rather than the mean: for agent rollouts the tail carries the
+    # cost, and p99 is what collides with the generation cap.
+    p95 = float(np.percentile(num_tokens_arr, 95))
+    p99 = float(np.percentile(num_tokens_arr, 99))
+
+    # A rollout that stopped because it hit the cap did not finish its task, so
+    # its zero is not evidence about the model.
+    truncated_frac = (
+        float(np.mean(num_tokens_arr >= max_generate_length))
+        if max_generate_length
+        else float("nan")
+    )
+
+
     rollout_metrics = {
+        "generate/p95_num_tokens": p95,
+        "generate/p99_num_tokens": p99,
+        "generate/truncated_fraction": truncated_frac,
         "generate/min_num_tokens": np.min(num_tokens_arr).item(),
         "generate/max_num_tokens": np.max(num_tokens_arr).item(),
         "generate/avg_num_tokens": np.mean(num_tokens_arr).item(),

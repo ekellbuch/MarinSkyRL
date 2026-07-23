@@ -24,6 +24,97 @@ from skyrl_train.generators.utils import (
     SENTINEL_EXPERT_ID,
 )
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
+
+# --- reward-group composition (patch_skyrl_metrics.py) ---
+
+def _classify_reward_groups(outputs, expected_per_group):
+    """Reward-group composition, from the complete set of requested rollouts.
+
+    `outputs` must be `all_outputs` — every rollout that was asked for, before
+    the loops that filter `successful_outputs` and, in legacy mode, zero a whole
+    group because one member failed.
+
+    Grouping is by `trajectory_id.instance_id`, so it does not depend on the
+    order the rollouts came back in.
+
+    Each requested sample is one of:
+
+        infrastructure failure   the trial died for a reason that is not the
+                                 model's doing (`exclude_from_baseline`)
+        agent timeout            the agent spent its own budget: a real failed
+                                 attempt, graded zero, not lost data
+        truncated                hit the generation cap; still graded, because
+                                 the verifier ran, but counted separately
+        graded pass / fail       a verifier verdict
+
+    A group is only `all_zero` or `all_one` when *every* expected sample is a
+    valid graded outcome. A group missing samples, or holding an infrastructure
+    failure, is `incomplete` — never `all_zero`. Calling it all-zero would
+    invent unanimity out of a dead sandbox, and unanimity is exactly the
+    condition being counted.
+    """
+    groups = {}
+    for output in outputs:
+        groups.setdefault(output.trajectory_id.instance_id, []).append(output)
+
+    num_all_zero = num_all_one = num_nonconstant = num_incomplete = 0
+    num_graded = num_infra = num_timeout = num_truncated = 0
+
+    for members in groups.values():
+        rewards = []
+        complete = True
+        if expected_per_group and len(members) < expected_per_group:
+            complete = False
+        for output in members:
+            infra = getattr(output, "exclude_from_baseline", False)
+            if output.stop_reason == "error" and infra:
+                num_infra += 1
+                complete = False
+                continue
+            if getattr(output, "exception_type", None) == "AgentTimeoutError":
+                num_timeout += 1
+            if output.stop_reason == "length":
+                num_truncated += 1
+            rewards.append(float(output.reward))
+            num_graded += 1
+
+        if not complete or not rewards:
+            num_incomplete += 1
+        elif all(reward > 0 for reward in rewards):
+            num_all_one += 1
+        elif all(reward <= 0 for reward in rewards):
+            num_all_zero += 1
+        else:
+            num_nonconstant += 1
+
+    num_groups = len(groups)
+    expected_total = (
+        num_groups * expected_per_group if expected_per_group else len(outputs)
+    )
+
+    def fraction(count):
+        return (count / num_groups) if num_groups else float("nan")
+
+    return {
+        "generate/num_groups": num_groups,
+        "generate/num_expected_samples": expected_total,
+        "generate/num_graded_samples": num_graded,
+        "generate/num_infrastructure_failures": num_infra,
+        "generate/num_agent_timeouts": num_timeout,
+        "generate/num_truncated_samples": num_truncated,
+        "generate/num_all_zero_groups": num_all_zero,
+        "generate/num_all_one_groups": num_all_one,
+        "generate/num_nonconstant_groups": num_nonconstant,
+        "generate/num_incomplete_groups": num_incomplete,
+        "generate/frac_all_zero_groups": fraction(num_all_zero),
+        "generate/frac_all_one_groups": fraction(num_all_one),
+        "generate/frac_nonconstant_groups": fraction(num_nonconstant),
+        "generate/frac_incomplete_groups": fraction(num_incomplete),
+        "generate/infrastructure_failure_fraction": (
+            (num_infra / expected_total) if expected_total else float("nan")
+        ),
+    }
+
 from skyrl_train.utils.reward_shaping import shape_reward_from_output, shape_reward_with_components
 from skyrl_train.utils.span_tagger import tag_response_spans
 from skyrl_train.utils.pbs_shaping import compute_pbs_token_shaping
@@ -937,6 +1028,16 @@ class TerminalBenchGenerator(GeneratorInterface):
         #   - If ALL trajectories in a group fail, they all get excluded from baseline
         enable_error_classification = self._error_handling_config.get("enable_error_classification", False)
 
+        # --- reward-group composition, measured before anything is zeroed ---
+        # Eval and training draw different group sizes, and the eval session is
+        # the one whose composition the result is read from.
+        _expected_per_group = (
+            self.generator_cfg.get("eval_n_samples_per_prompt")
+            if self._eval_session_active
+            else None
+        ) or self.generator_cfg.get("n_samples_per_prompt")
+        _group_metrics = _classify_reward_groups(all_outputs, _expected_per_group)
+
         failed_instance_ids = set()
         num_failed_trajectories = 0  # per-trajectory, rather than per-instance
         num_masked_trajectories = 0  # trajectories excluded from baseline
@@ -989,6 +1090,9 @@ class TerminalBenchGenerator(GeneratorInterface):
             rollout_metrics = get_rollout_metrics(
                 [output.response_ids for output in successful_outputs],
                 [output.reward for output in successful_outputs],
+                max_generate_length=self.generator_cfg.sampling_params.get(
+                    "max_generate_length"
+                ),
             )
             rollout_metrics["generate/trajectories_summarized"] = sum(
                 1 for output in successful_outputs if output.summarization_count > 0
@@ -1001,6 +1105,7 @@ class TerminalBenchGenerator(GeneratorInterface):
         rollout_metrics["generate/num_failed_instances"] = len(failed_instance_ids)
         rollout_metrics["generate/num_failed_trajectories"] = num_failed_trajectories
         rollout_metrics["generate/num_masked_trajectories"] = num_masked_trajectories
+        rollout_metrics.update(_group_metrics)
 
         # TIS logprob-alignment metrics (aggregated across all trajectories with
         # logprobs). These make an LCS fallback or alignment failure ALWAYS visible

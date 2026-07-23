@@ -567,6 +567,14 @@ class HarborConfigBuilder:
         if "type" not in env_fields and "import_path" not in env_fields:
             env_fields["type"] = EnvironmentType.DAYTONA
 
+        # Generic environment_kwargs passthrough. The schema above maps only fields it
+        # names; backends such as GKE need constructor arguments it has never
+        # heard of, so pass this dict through untouched. Named fields win on
+        # collision, since they were asked for specifically.
+        extra_kwargs = self._harbor_cfg.get("environment_kwargs") or {}
+        for key, value in dict(extra_kwargs).items():
+            env_kwargs.setdefault(key, value)
+
         # Add kwargs if any were collected
         if env_kwargs:
             env_fields["kwargs"] = env_kwargs

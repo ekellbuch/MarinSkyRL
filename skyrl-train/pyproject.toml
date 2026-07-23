@@ -70,11 +70,12 @@ no-build-isolation-package = [
 
 # Megatron transitive pins that fight this tree's stack (scoped so the base/fsdp2 resolution is
 # untouched):
-#  - the transformer-engine meta package hardcodes the cu13 CUDA core; this image is CUDA 12.8, so
-#    drop cu13 (transformer-engine-cu12 is added to the megatron extra instead).
+#  - the transformer-engine meta package hardcodes the cu13 CUDA core, which MATCHES this image's
+#    CUDA 13.0 runtime, so it is kept as-is (no core override). The stray cu12 core is dropped so
+#    nothing pulls a mismatched cu12 runtime alongside torch+cu130.
 #  - nvidia-resiliency-ext is an unpinned megatron-bridge transitive we do not use (sdist, CUDA).
 override-dependencies = [
-    "transformer-engine-cu13 ; sys_platform == 'never'",
+    "transformer-engine-cu12 ; sys_platform == 'never'",
     "nvidia-resiliency-ext ; sys_platform == 'never'",
     # boto/s3 ecosystem (linux gpu-rl image only) — FORCE the runtime-validated combo. Overrides,
     # not a plain pin, because the combo is METADATA-IMPOSSIBLE but RUNTIME-PROVEN: aiobotocore 3.7.0
@@ -119,14 +120,14 @@ requires-dist = ["torch", "einops"]
 
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym" , editable = true }
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-flashinfer-jit-cache = { index = "flashinfer-cu128", marker = "extra == 'vllm'" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "extra == 'vllm'" }
 torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "a1fdd7e" }
 deep-ep = { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_x86_64.whl" }
 # Megatron backend (see the `megatron` extra). These are sdist-only on PyPI and build CUDA
 # extensions against torch at install time (uv can't resolve their metadata on a non-CUDA host), so
-# they resolve from prebuilt torch-2.11 / cu128 / cp312 / x86_64 wheels — the erictang000 forks
+# they resolve from prebuilt torch-2.11 / cu130 / cp312 / x86_64 wheels — the erictang000 forks
 # upstream SkyRL's megatron extra also uses, matching the gpu-rl image ABI. x86_64-only (H100).
 transformer-engine-torch = { url = "https://github.com/erictang000/TransformerEngine/releases/download/v2.11.0-torch2.11/transformer_engine_torch-2.11.0-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
 causal-conv1d = { url = "https://github.com/erictang000/causal-conv1d/releases/download/v1.6.1.post4-torch2.11/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
@@ -182,8 +183,8 @@ deepep = [
 # aarch64. This is the MODERN Megatron line: megatron-bridge 0.5.0 + megatron-core 0.18.0, which
 # requires transformers>=5.8.1 (why the base pin moved to 5.8.x) and torch>=2.6 (torch stays on the
 # base/vllm 2.11 line). transformer-engine-torch / mamba-ssm / causal-conv1d are sdist-only on PyPI
-# and resolve from prebuilt cu128 wheels (see [tool.uv.sources]); TE's CUDA core is overridden from
-# cu13 to cu12 to match the cu128 runtime (see [tool.uv] override-dependencies).
+# and resolve from prebuilt cu130 wheels (see [tool.uv.sources]); TE's CUDA core stays on its native
+# cu13 to match the cu130 runtime (see [tool.uv] override-dependencies).
 megatron = [
     "megatron-bridge==0.5.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     # 0.18.0 (not 0.18.1 — 0.18.1 is yanked on PyPI, "wrong version"); highest non-yanked with cp312 wheels.
@@ -192,8 +193,8 @@ megatron = [
     # Declared directly (not just via transformer-engine[pytorch]) so the [tool.uv.sources] URL is
     # honored — uv ignores sources for transitive-only packages.
     "transformer-engine-torch==2.11.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    # cu12 CUDA core to match the cu128 runtime (cu13 core overridden to `never`).
-    "transformer-engine-cu12==2.11.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # cu13 CUDA core to match the cu130 runtime (the TE meta package's native core; cu12 core -> `never`).
+    "transformer-engine-cu13==2.11.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     # GDN / Mamba-hybrid kernels (Qwen3-Next, Qwen3.6-35B-A3B) under megatron.
     "mamba-ssm>=2.2,<3 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "causal-conv1d>=1.5,<2 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -203,13 +204,13 @@ megatron = [
 
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [[tool.uv.index]]
-name = "flashinfer-cu128"
-url = "https://flashinfer.ai/whl/cu128"
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
 explicit = true
 
 [tool.setuptools]

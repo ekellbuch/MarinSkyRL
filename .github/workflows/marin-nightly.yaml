@@ -55,7 +55,7 @@ jobs:
           uv tool install --prerelease allow "marin-core>=0.2.46.dev202607131620"
           echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
 
-      - name: Train and gate on one H100
+      - name: Train, gate, and check Grug parity on one H100
         run: |
           set -o pipefail
           iris --cluster marin job run \

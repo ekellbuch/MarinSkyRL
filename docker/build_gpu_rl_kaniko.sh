@@ -121,7 +121,7 @@ PY
     "FLASH_ATTN_VERSION=$(dockerfile_arg FLASH_ATTN_VERSION)" \
     "TORCH_VERSION=$(dockerfile_arg TORCH_VERSION)" \
     "TORCH_CUDA_ARCH_LIST=$(dockerfile_arg TORCH_CUDA_ARCH_LIST)" \
-    "CUDA=12.8 PY=cp312 PLATFORM=linux_x86_64" \
+    "CUDA=12.9 PY=cp312 PLATFORM=linux_x86_64" \
     > /tmp/expected-wheel-manifest
   cmp /tmp/expected-wheel-manifest "$ARTIFACT_WHEELS/MANIFEST"
   test "$(find "$ARTIFACT_WHEELS" -maxdepth 1 -type f -name 'vllm-*.whl' | wc -l)" -eq 1

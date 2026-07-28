@@ -135,6 +135,47 @@ Also change for an arm64 build: the wheel MANIFEST hardcodes `PLATFORM=linux_x86
 `docker/Dockerfile.gpu-rl` and the expected copy in `build_gpu_rl_kaniko.sh`, and
 `TORCH_CUDA_ARCH_LIST` can drop to `10.0` since GB200 is the only arm64 target.
 
+## The image must be PUBLIC on ghcr, because two of three clusters cannot authenticate
+
+Image pull secrets in namespace `iris`, measured 2026-07-28:
+
+| cluster | ghcr pull secret |
+|---|---|
+| cw-us-east-02a | `ghcr-helw150` |
+| cw-rno2a | **none** |
+| cw-us-east-08a | **none** |
+
+Only east-02a can pull a private or internal package. rno2a and east-08a pull anonymously, so a
+non-public image fails there with `ImagePullBackOff` while working perfectly on east-02a — an
+asymmetry that reads as an image problem when it is a visibility problem. The digest is fine; the
+node simply cannot fetch it.
+
+This was invisible until the registry moved. `ghcr.io/open-thoughts/openthoughts-agent` was public,
+so rno2a never needed a secret and nothing recorded that it depended on that. The first build pushed
+to `ghcr.io/marin-community/marinskyrl` created the package as **internal** — GitHub's default for a
+new org package — and every RL arm on rno2a sat in `ImagePullBackOff` for two and a half hours.
+
+**After creating a new package, check its visibility and set it public.** The REST API cannot do
+this; `PATCH /orgs/.../packages/container/<name>` returns 404 whatever the payload. It is UI-only:
+
+```
+github.com/orgs/marin-community/packages/container/<name>/settings -> Change visibility -> Public
+```
+
+Verify with an ANONYMOUS pull, not an authenticated one — your own `gh` credentials will succeed
+against an internal package and tell you nothing about what a cluster node sees:
+
+```bash
+DOCKER_CONFIG=$(mktemp -d) crane manifest --platform linux/amd64 <repository>@sha256:<digest>
+```
+
+Recovery needs no intervention once visibility flips. Kubelet's backoff caps around five minutes;
+24 pods went from `ImagePullBackOff` to 23 running in five minutes with no relaunch. Do not kill and
+resubmit arms that are merely waiting on a backoff cycle.
+
+Copying `ghcr-helw150` into the other clusters would also work and is the wrong fix: it clones one
+person's credential across clusters and leaves the next new package broken in the same way.
+
 ## Pins
 
 - Deployed digests live in `cloud/iris/launch_rl_iris.py` (`DEFAULT_RL_DOCKER_IMAGE`,

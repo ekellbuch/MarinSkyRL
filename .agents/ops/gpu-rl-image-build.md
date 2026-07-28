@@ -63,12 +63,26 @@ tar -x wheels/`, then tar `wheels/` (containing both `.whl` files and `MANIFEST`
 the `TORCH_CUDA_ARCH_LIST` the wheels were built for, which is what the prebuilt path compares.
 
 `PREBUILT_WHEEL_ARTIFACT_URI` / `_SHA256` are the one pair with no home in the repo, so record them
-here. Current values, used by the `ac9c5f39`/`f2b44d4a`/`90072ada` builds:
+here. Current values, cut from `wheels-2b14abd3` on 2026-07-28 (951,075,128 bytes):
 
 ```
-PREBUILT_WHEEL_ARTIFACT_URI=s3://marin-us-east-02a/iris/grug-vllm-wheels/4b55591306c9-torch211-cu128-cp312-fb6ff59.tar.gz
-PREBUILT_WHEEL_ARTIFACT_SHA256=d247a8865c56ea2756512fcb0b102f8127b2020bdfbfb92d76dbd1386d514417
+PREBUILT_WHEEL_ARTIFACT_URI=s3://marin-us-east-02a/iris/grug-vllm-wheels/4b55591306c9-torch211-cu129-cp312-2b14abd3.tar.gz
+PREBUILT_WHEEL_ARTIFACT_SHA256=0147c62621c92d60d7407255bec9790fcddbb311edb99a209b0ee33fa037a6bb
 ```
+
+These wheels carry `sm_100`, so they are the first set that can build a Blackwell image without
+paying the nvcc compile. The superseded cu128 pair
+(`...cu128-cp312-fb6ff59.tar.gz`, sha `d247a886...d514417`) can no longer satisfy the Dockerfile:
+its MANIFEST reads `CUDA=12.8` and `TORCH_CUDA_ARCH_LIST=8.0;9.0`, both of which the expected-manifest
+comparison now rejects.
+
+Cut the artifact with an **iris job on cw-us-east-02a**, never from a laptop. The wheel-builder image
+is ~20 GB and the bucket is in that region, so a local `crane export` pulls tens of GB down and pushes
+back over the internet. Do NOT pass `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` to that job: the pod
+already receives correct CoreWeave credentials and `AWS_ENDPOINT_URL` from the `iris-task-env` Secret
+via `envFrom`, explicit container `env` overrides `envFrom`, and forwarding the launch host's pair
+retargets the upload at real AWS S3 — it fails with `The access key ID you provided does not exist in
+our records`. Let fsspec's default discovery find the injected pair.
 
 The digest is written out in full here on purpose. It was recorded truncated once, and the next
 rebuild had to recover the remaining characters from an earlier launch before it could start.

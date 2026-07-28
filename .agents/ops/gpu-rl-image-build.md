@@ -92,6 +92,50 @@ triple, so it changes only when one of those baked pins moves — at which point
 built before the image can be. A rebuild agent that cannot find this value has to recover it from a
 prior launch or an unmerged branch, which has already cost one build cycle.
 
+## arm64 / GB200
+
+`cw-us-east-08a` is **arm64**. All 808 GPUs sit behind Grace hosts; the only amd64 nodes there are
+4 CPU-only ones with no GPUs.
+
+```
+GPUs by host arch: {'amd64': 0, 'arm64': 808}
+arm64  gb200-4x           x202   144 cores, 955 GB RAM, GB200 compute_cap 10.0
+amd64  cd-gp-i64-erapids  x4     CPU only
+```
+
+The shipped gpu-rl image is a single-platform `linux/amd64` manifest with `linux_x86_64` wheels, so
+it cannot run there at all. `sm_100` kernels are necessary but not sufficient — the host CPU is the
+binding constraint, and there is no amd64 GPU capacity to fall back to.
+
+A build host is available: an iris job with `--gpu GB200x4` on `cw-us-east-08a` lands on aarch64 with
+144 cores, versus 48 on the amd64 builder. Use `KUBECONFIG=~/.kube/coreweave-iris`; the older
+`coreweave-iris-gpu` file has no east-08a context and fails with `context ... does not exist`.
+
+What an arm64 image still needs, surveyed against PyPI:
+
+| dependency | aarch64 status |
+|---|---|
+| torch, torchvision | published for aarch64 at cu129 |
+| megatron-core, nvidia-*-cu12 | published for aarch64 |
+| megatron-bridge, flashinfer-python, apex | pure Python or sdist |
+| vLLM fork, flash-attn | already source-built; recompile for aarch64 + sm_100 |
+| **TransformerEngine** | **no aarch64 wheel anywhere**, upstream included. Must build from source. |
+| deep-ep, mamba-ssm, causal-conv1d | pinned to x86_64 URLs and marker-gated, so absent on aarch64 |
+
+TransformerEngine is the one genuinely new compile. The megatron extra requires
+`transformer-engine-torch` only under `platform_machine == 'x86_64'`, so `uv sync --extra megatron`
+SUCCEEDS on aarch64 without it and the failure surfaces later at
+`import transformer_engine` in the build assert. Add an explicit source build rather than trusting
+the sync.
+
+The absent trio is probably tolerable for an export-only image: mamba-ssm and causal-conv1d serve
+Mamba models, and Qwen3-Coder is not one. deep-ep is MoE dispatch and Qwen3-Coder-30B-A3B is an MoE,
+so confirm whether `bridge.save_hf_weights` touches it before assuming.
+
+Also change for an arm64 build: the wheel MANIFEST hardcodes `PLATFORM=linux_x86_64` in both
+`docker/Dockerfile.gpu-rl` and the expected copy in `build_gpu_rl_kaniko.sh`, and
+`TORCH_CUDA_ARCH_LIST` can drop to `10.0` since GB200 is the only arm64 target.
+
 ## Pins
 
 - Deployed digests live in `cloud/iris/launch_rl_iris.py` (`DEFAULT_RL_DOCKER_IMAGE`,

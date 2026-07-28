@@ -129,7 +129,7 @@ DEFAULT_CLUSTER = "cw-us-east-02a"
 # tag resolves to the same digest. When the image is rebuilt, bump this digest
 # (use the immutable :gpu-rl-<gitsha> tag's digest, never the floating :gpu-rl).
 DEFAULT_RL_DOCKER_IMAGE = (
-    "ghcr.io/open-thoughts/openthoughts-agent"
+    "ghcr.io/marin-community/marinskyrl"
     # gpu-rl-efd77b98 (built 2026-07-03, kaniko job gpurl-kaniko-efd77b98): the PULLABLE re-layering of
     # gpu-rl-69634c0b (@sha256:d9c7e604…, harbor 0729a3e9 = poll fix + tmux-bake). Same baked contents
     # (harbor 0729a3e9, MarinSkyRL 39faff7d, vLLM-fork 76259c63, flash-attn 2.8.3, torch 2.11.0+cu128,
@@ -337,7 +337,21 @@ DEFAULT_RL_DOCKER_IMAGE = (
     # including cloudpickle 3.1.2, py-spy 0.4.2 and memray -- the launcher runs with
     # setup_scripts=[], so the image is the only source of the profiler.
     # Pull-verified: 38 layers, max 3.61 GB, 19.35 GB total.
-    "@sha256:433726335f6bd62373ce75c0178a12a9e36ec7c8cf364f443ca1a0b742b3ea5e"  # noqa: E501
+    # gpu-rl-7f97d057 (built 2026-07-28, kaniko job gpurl-kaniko-plain-7f97d057): the fsdp2 variant
+    # of the first Blackwell image, built from the same source and the same pins as
+    # gpu-rl-megatron-2b14abd3. TORCH_CUDA_ARCH_LIST is "8.0;9.0;10.0", so the vLLM fork and
+    # flash-attn carry sm_100 kernels for GB200 alongside the A100 and Hopper ones. Adding 10.0
+    # turns on the fork's Blackwell kernel set, one of which static-asserts CUDA >= 12.9, so the
+    # whole closure moved: base nvidia/cuda:12.9.2 and torch 2.11.0+cu129 from the pytorch-cu129
+    # index. torch and torchvision keep their versions; only the build tag moved. Harbor 772e20f7.
+    # Its wheels came from the cached wheel-builder layers the megatron build had already compiled,
+    # so this cost no nvcc time. The rl-stage assert that requires EXACTLY ONE pip-check conflict
+    # when INSTALL_MEGATRON != 1 passed, so the cu129 closure adds no new dependency conflict.
+    # ALSO the first plain image in the marin-community registry — the repository string above
+    # changed with this entry, so every (prev: ...) digest below lives under the old org.
+    # Pull-verified: 41 layers, max 4.07 GB, 21.63 GB total.
+    "@sha256:0f4f916a92de4d2ba2ffc6943f5ced75182e3c97cb433ea3c85426eacabb30fa"  # noqa: E501
+    # (prev: gpu-rl-90072ada @sha256:43372633, old org, CUDA 12.8, no Blackwell)
     # (prev: gpu-rl-f2b44d4a @sha256:c7e05af3, Harbor 772e20f7 + the baked profiler)
     # (prev: gpu-rl-ac5a9c65 @sha256:96848c50, Harbor 772e20f7 + the three reward signals)
     # (prev: gpu-rl-d7ba00ff @sha256:1879c801, Harbor 772e20f7 + verifier-teardown deadline)

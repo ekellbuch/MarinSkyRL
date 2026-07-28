@@ -356,7 +356,7 @@ DEFAULT_RL_DOCKER_IMAGE = (
 # config. Rebuild BOTH images together and bump BOTH digests, or a strategy switch silently
 # crosses a harbor-version boundary.
 DEFAULT_RL_MEGATRON_DOCKER_IMAGE = (
-    "ghcr.io/open-thoughts/openthoughts-agent"
+    "ghcr.io/marin-community/marinskyrl"
     # gpu-rl-megatron-d7ba00ff (built 2026-07-26): the megatron variant of gpu-rl-d7ba00ff, so it
     # carries the same harbor 772e20f7 (#39 verifier-teardown deadline, #40) and the same SKYRL
     # d7ba00ff (#137 coordinator-growth fix, #138 TIS diagnostics on both backends). Verified live
@@ -376,7 +376,19 @@ DEFAULT_RL_MEGATRON_DOCKER_IMAGE = (
     # asserts add megatron.core + megatron.bridge + transformer_engine. This is the image the
     # tasktrove-dq sweep uses, because its config sets trainer.strategy=megatron.
     # Pull-verified: 40 layers, max 3.61 GB, 22.05 GB total.
-    "@sha256:27a94ceb622828bdadaeabe1774b0f9adcaf6bbed2d8aff719d4685a230e2e2a"  # noqa: E501
+    # gpu-rl-megatron-2b14abd3 (built 2026-07-28, kaniko job gpurl-kaniko-mega-2b14abd3): the first
+    # image that runs on Blackwell. TORCH_CUDA_ARCH_LIST is "8.0;9.0;10.0", so the vLLM fork and
+    # flash-attn carry sm_100 kernels for the GB200 nodes on cw-us-east-08a, alongside the A100 and
+    # Hopper kernels the H100 clusters use. Adding 10.0 turns on the fork's Blackwell kernel set,
+    # one of which static-asserts CUDA >= 12.9, so the whole closure moved with it: base
+    # nvidia/cuda:12.9.2, and torch 2.11.0+cu129 from the pytorch-cu129 index rather than cu128.
+    # torch and torchvision keep their versions; only the build tag moved. Same harbor 772e20f7.
+    # ALSO the first image in the marin-community registry — the repository string above changed
+    # with this entry, so every earlier (prev: ...) digest below lives under the old org.
+    # Build asserts passed including megatron.core + megatron.bridge + transformer_engine import OK.
+    # Pull-verified: 43 layers, max 4.07 GB, 24.33 GB total.
+    "@sha256:283cf2af3fc1e29865f42f0a8102d5c2c7bc3ddaa9e72c36366ea36001bf75fd"  # noqa: E501
+    # (prev: gpu-rl-megatron-90072ada @sha256:27a94ceb, old org, CUDA 12.8, no Blackwell)
     # (prev: gpu-rl-megatron-f2b44d4a @sha256:a374dd04, Harbor 772e20f7)
     # (prev: gpu-rl-megatron-ac5a9c65 @sha256:0a6cea7d, Harbor 772e20f7)
     # (prev: gpu-rl-megatron-d7ba00ff @sha256:107e4933, Harbor 772e20f7)

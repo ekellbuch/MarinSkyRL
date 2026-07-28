@@ -46,6 +46,28 @@ $PY scripts/iris/iris_ops.py /benjaminfeuer/<job> --cluster cw-us-east-02a --int
 
 `--once` polls a single time and exits, which is what a monitor or cron wants.
 
+## Reading the CoreWeave object store from a laptop
+
+Do not launch an iris job to list or read `s3://marin-us-east-02a`. It is reachable directly:
+
+- Endpoint `https://cwobject.com` — the `external_object_storage_endpoint` in the cluster config.
+  `http://cwlota.com` is the in-cluster LOTA cache and does not resolve from outside.
+- Credentials come from the `iris-task-env` Secret in namespace `iris`, not from the laptop:
+
+  ```bash
+  kubectl --context marin-gpu_US-EAST-02A -n iris get secret iris-task-env \
+    -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d
+  ```
+
+  Neither `~/.aws/credentials` nor the `AWS_*` in `secrets.env` works: `secrets.env` sets
+  `AWS_ACCESS_KEY_ID=$LAION_ACCESS_KEY`, a different account, so sourcing it makes every call fail
+  with `The access key ID you provided does not exist in our records`.
+- Buckets use virtual-hosted addressing. With fsspec pass
+  `config_kwargs={'s3': {'addressing_style': 'virtual'}}` and `client_kwargs={'region_name': 'auto'}`.
+
+The same credential rule applies in reverse inside a job: a task pod already receives these through
+`envFrom`, and passing `AWS_*` explicitly overrides them and retargets the call at real AWS S3.
+
 ## Provenance
 
 Ported from the OpenThoughts-Agent checkout, where `iris_ops.py` had been renamed from

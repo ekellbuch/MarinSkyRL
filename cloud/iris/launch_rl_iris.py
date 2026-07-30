@@ -128,6 +128,7 @@ DEFAULT_DISK_PER_NODE = "auto"
 DISK_FRACTION = 0.80
 FALLBACK_DISK_GIB = 21800  # ~80% of the h100-8x ~27.2 TiB allocatable, used only if kubectl is unavailable
 DEFAULT_PRIORITY = "interactive"
+PRIORITY_NAMES = ("production", "interactive", "batch")
 
 
 def _parse_quantity_to_gib(q: str) -> float:
@@ -978,7 +979,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--priority",
         default=DEFAULT_PRIORITY,
-        choices=["production", "interactive", "batch"],
+        choices=PRIORITY_NAMES,
         help="Iris priority band.",
     )
     parser.add_argument(
@@ -1879,11 +1880,7 @@ def main() -> int:
         target_cluster=args.target_cluster,
     )
 
-    priority_band = {
-        "production": job_pb2.PRIORITY_BAND_PRODUCTION,
-        "interactive": job_pb2.PRIORITY_BAND_INTERACTIVE,
-        "batch": job_pb2.PRIORITY_BAND_BATCH,
-    }.get(args.priority, job_pb2.PRIORITY_BAND_UNSPECIFIED)
+    priority_band = job_pb2.PriorityBand.Value(f"PRIORITY_BAND_{args.priority.upper()}")
 
     # Env: secrets file values + the standard RL/iris-serve signals. iris injects
     # IRIS_TASK_ID / IRIS_NUM_TASKS / IRIS_ADVERTISE_HOST per task automatically.

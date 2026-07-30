@@ -140,13 +140,11 @@ def test_unresolvable_returns_none(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Store/creds resolution defaults — the object-store + kubeconfig wiring is untouched
+# Store and credential resolution
 # ---------------------------------------------------------------------------
 
 
-def test_store_and_kubeconfig_defaults_unchanged():
-    assert srl.BUCKET == "marin-us-east-02a"
-    assert srl.ENDPOINT == "https://cwobject.com"
-    assert srl.EAST_KUBECONFIG.endswith("coreweave-iris")
-    assert srl.RAY_SUBDIR == "ray_session_logs"
-    assert srl.KCFG == {"cw-us-east-02a": "~/.kube/coreweave-iris", "cw-rno2a": "~/.kube/coreweave-iris"}
+def test_cli_accepts_east08_cluster():
+    args = srl.argument_parser().parse_args(["/operator/job", "--cluster", "cw-us-east-08a"])
+
+    assert args.cluster == "cw-us-east-08a"

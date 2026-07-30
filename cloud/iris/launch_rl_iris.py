@@ -50,7 +50,9 @@ Usage
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -59,6 +61,7 @@ import shlex
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
 from urllib.parse import urlparse
@@ -67,6 +70,7 @@ import yaml
 
 from cloud.iris.paths import PROJECT_ROOT
 from cloud.iris.gpu_rl_images import image_for_cluster
+from cloud.iris.rl_config_translation import RL_CONFIG_PAYLOAD_ENV, RL_CONFIG_TASK_DIR, resolve_rl_config_path
 from cloud.iris.secrets_env import load_secrets_env_into_os_environ
 
 # Default cluster and GPU shape. Memory and disk requests are resolved from the
@@ -190,6 +194,21 @@ SKYRL_HOME = "/opt/skyrl"
 # See .agents/ops/gpu-rl-image-build.md. An earlier version of this comment claimed the bundle
 # also won for skyrl-train, and that cost a wasted 48-GPU launch.
 APP_DIR = "/app"
+
+
+@dataclass(frozen=True)
+class RlConfigLaunch:
+    """Task path and optional environment payload for one RL config."""
+
+    task_path: str
+    payload: str | None
+
+    def task_environment(self) -> dict[str, str]:
+        """Return the environment needed to materialize an external config."""
+        if self.payload is None:
+            return {}
+        return {RL_CONFIG_PAYLOAD_ENV: self.payload}
+
 
 # marin-iris wheel installed into the RL venv at pod bootstrap for the controller-ingress
 # registration path (GAP D). The gpu-rl image bakes ONLY MarinSkyRL + harbor, never iris (a
@@ -776,7 +795,10 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rl_config",
         required=True,
-        help="Path to SkyRL/MarinSkyRL config YAML (repo-relative or absolute).",
+        help=(
+            "Path to a SkyRL/MarinSkyRL config YAML. Repo-relative paths are synced under /app; "
+            "absolute host paths outside the repo are uploaded for the task."
+        ),
     )
     parser.add_argument("--rl-config", dest="rl_config", help=argparse.SUPPRESS)
 
@@ -1403,32 +1425,26 @@ def _job_scope_fr_dump_path(prefix: str, job_name: str) -> str:
 
 
 def normalize(args: argparse.Namespace) -> None:
-    """Validate + normalize. Keep rl_config repo-relative so it resolves on /app."""
-    # Resolve rl_config to a repo-relative path (it must exist on the synced
-    # /app workspace, NOT be an absolute host path).
-    rl_cfg = Path(args.rl_config)
-    if rl_cfg.is_absolute():
-        try:
-            args.rl_config = str(rl_cfg.resolve().relative_to(PROJECT_ROOT))
-        except ValueError:
-            raise SystemExit(
-                f"--rl_config {args.rl_config!r} is absolute and not under the repo "
-                f"({PROJECT_ROOT}); pass a repo-relative path so it resolves on /app."
-            )
-    # Verify it exists locally (so we fail fast before submitting).
-    if not (PROJECT_ROOT / args.rl_config).exists():
-        # Fall back to cloud/iris/configs/<name>[.yaml].
-        yaml_dir = Path("cloud/iris/configs")
-        for cand in (yaml_dir / args.rl_config, yaml_dir / f"{args.rl_config}.yaml"):
-            if (PROJECT_ROOT / cand).exists():
-                args.rl_config = str(cand)
-                break
-        else:
-            print(
-                f"[rl-iris] WARNING: --rl_config {args.rl_config!r} not found under "
-                f"{PROJECT_ROOT}; the worker will error if it isn't on /app.",
-                file=sys.stderr,
-            )
+    """Resolve the RL config and validate the requested worker topology."""
+    try:
+        source = resolve_rl_config_path(args.rl_config)
+    except FileNotFoundError as error:
+        raise SystemExit(str(error)) from error
+
+    try:
+        relative_path = source.relative_to(PROJECT_ROOT)
+    except ValueError:
+        contents = source.read_bytes()
+        digest = hashlib.sha256(contents).hexdigest()[:16]
+        suffix = source.suffix or ".yaml"
+        args.rl_config = str(source)
+        args.rl_config_launch = RlConfigLaunch(
+            task_path=f"{RL_CONFIG_TASK_DIR}/{digest}{suffix}",
+            payload=base64.b64encode(contents).decode("ascii"),
+        )
+    else:
+        args.rl_config = str(relative_path)
+        args.rl_config_launch = RlConfigLaunch(task_path=str(relative_path), payload=None)
 
     if args.num_nodes < 1:
         raise SystemExit("--num-nodes must be >= 1.")
@@ -1456,12 +1472,16 @@ def build_task_command(args: argparse.Namespace) -> List[str]:
 
     # The MarinSkyRL training command rank 0 runs (run_rl.py owns config parse,
     # hydra-arg build, HF data resolution, and the SkyRL entrypoint launch).
+    rl_config_launch = args.rl_config_launch
+    if not isinstance(rl_config_launch, RlConfigLaunch):
+        raise RuntimeError("normalize() must resolve --rl_config before building the task command")
+    task_rl_config = rl_config_launch.task_path
     train_cmd: List[str] = [
         RL_PYTHON,
         "-m",
         "cloud.iris.run_rl",
         "--rl_config",
-        args.rl_config,
+        task_rl_config,
         "--model_path",
         args.model_path,
         "--job_name",
@@ -1888,6 +1908,7 @@ def main() -> int:
     if config_extra_env:
         env_vars.update(config_extra_env)
         print(f"[rl-iris] Config extra_env: {', '.join(sorted(config_extra_env))}", flush=True)
+    env_vars.update(args.rl_config_launch.task_environment())
     # ── Per-cluster infra-env DEFAULTS (fill-gap belt for cluster-specific footguns) ──────────
     # Some clusters need a specific network/NCCL interface that a cluster-AGNOSTIC RL config
     # won't (and shouldn't) carry. Fill it in here, keyed on --target-cluster, ONLY if neither

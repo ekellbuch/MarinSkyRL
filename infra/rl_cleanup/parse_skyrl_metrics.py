@@ -40,6 +40,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from infra.rl_metrics import parse_training_metrics_result, strip_ansi, training_metrics_parse_error
+
 
 @dataclass(frozen=True)
 class CheckpointSelection:
@@ -56,12 +58,6 @@ class CheckpointSelection:
 class CheckpointInventory:
     available_exports: list[int]
     cap_step: int | None
-
-
-def strip_ansi(text: str) -> str:
-    """Remove ANSI escape codes from text."""
-    ansi_pattern = re.compile(r"\x1b\[[0-9;]*m")
-    return ansi_pattern.sub("", text)
 
 
 def extract_metrics_blocks(log_content: str) -> list[dict[str, Any]]:
@@ -160,48 +156,20 @@ def extract_standard_metrics(log_content: str) -> list[dict[str, Any]]:
     """
     Extract per-step training metrics from a STANDARD (non-agentic) GRPO log.
 
-    Standard SkyRL runs with logger=console emit one line per train step of the form:
+    Standard SkyRL runs with logger=console emit one JSON event per train step:
         (skyrl_entrypoint pid=...)<ANSI> ... WANDB_MIRROR kind=train step=N metrics={...}<ANSI>
-    where the metrics dict is DOUBLE-QUOTED JSON. We strip ANSI codes + the Ray
-    actor prefix, then json.loads the dict. ALL present keys are kept (no
-    hardcoded pass@k key — standard runs use reward/avg_pass_at_16, but the
-    suffix is n_samples_per_prompt-dependent).
+    All present keys are retained; the pass@k suffix remains dependent on
+    n_samples_per_prompt.
 
     Returns a list of dicts (one per train step), each carrying every key in the JSON dict
     (e.g. trainer/global_step, reward/avg_raw_reward, reward/avg_pass_at_*, policy/policy_entropy,
     policy/raw_grad_norm, policy/policy_loss, policy/ppo_clip_ratio, policy/log_ratio_abs_*,
     policy/n_tokens_dp_gt_*pct, loss/avg_raw_advantages, timing/*, ...).
     """
-    content = strip_ansi(log_content)
-
-    # Match the WANDB_MIRROR train line. The metrics dict runs to end-of-line; after ANSI
-    # stripping the trailing reset code is gone, so {.*} to line end is the JSON object.
-    pattern = re.compile(
-        r"WANDB_MIRROR\s+kind=train\s+step=(\d+)\s+metrics=(\{.*\})\s*$",
-        re.MULTILINE,
-    )
-
-    metrics_list: list[dict[str, Any]] = []
-    n_bad = 0
-    for match in pattern.finditer(content):
-        step_str, dict_str = match.group(1), match.group(2)
-        try:
-            metrics = json.loads(dict_str)
-        except json.JSONDecodeError:
-            n_bad += 1
-            continue
-        # Ensure trainer/global_step is present (fall back to the step= token).
-        if "trainer/global_step" not in metrics:
-            try:
-                metrics["trainer/global_step"] = int(step_str)
-            except ValueError:
-                pass
-        metrics_list.append(metrics)
-
-    if n_bad:
-        print(f"  Warning: {n_bad} WANDB_MIRROR train lines failed JSON parse")
-
-    return metrics_list
+    result = parse_training_metrics_result(log_content)
+    if parse_error := training_metrics_parse_error(result.malformed_lines):
+        print(f"  Warning: {parse_error}")
+    return [record.metrics for record in result.records]
 
 
 def _checkpoint_rewards(metrics: list[dict[str, Any]]) -> dict[int, float]:

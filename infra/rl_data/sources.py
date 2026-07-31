@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -69,6 +71,25 @@ def _strip_dapo_boilerplate(text: str) -> str:
     return body.strip()
 
 
+def _prepared_verifier_row(problem: str, normalized: str, source: Source, index: int) -> PreparedRow:
+    return {
+        "data_source": source.dataset_id,
+        "prompt": [{"role": "user", "content": problem}],
+        "env_class": source.env_id,
+        "reward_model": {"ground_truth": normalized},
+        "extra_info": {"split": "train", "index": index},
+    }
+
+
+def _schema_row(
+    problem: str, ground_truth: Any, source: Source, index: int, contract: VerifierDataContract
+) -> PreparedRow:
+    if not contract.prompt_instruction:
+        raise ValueError(f"{source.name} requires a verifier prompt instruction.")
+    normalized = contract.normalize_ground_truth(ground_truth)
+    return _prepared_verifier_row(problem + contract.prompt_instruction, normalized, source, index)
+
+
 def _math_row(
     problem: str, ground_truth: Any, source: Source, index: int, contract: VerifierDataContract
 ) -> PreparedRow:
@@ -80,13 +101,7 @@ def _math_row(
 
     normalized = contract.normalize_ground_truth(ground_truth)
     verified = contract.validate_example(normalized, f"Answer: \\boxed{{{normalized}}}", "")
-    return {
-        "data_source": source.dataset_id,
-        "prompt": [{"role": "user", "content": problem + instruction}],
-        "env_class": source.env_id,
-        "reward_model": {"ground_truth": verified},
-        "extra_info": {"split": "train", "index": index},
-    }
+    return _prepared_verifier_row(problem + instruction, verified, source, index)
 
 
 def _prepare_rlvr_math(example: Mapping[str, Any], index: int, contract: VerifierDataContract) -> PreparedRow:
@@ -181,17 +196,7 @@ def _prepare_gsm8k(example: Mapping[str, Any], index: int, contract: VerifierDat
     if not isinstance(answer_text, str):
         raise TypeError("GSM8K row answer must be a string.")
     ground_truth = _gsm8k_extract_answer(answer_text)
-    instruction = contract.prompt_instruction
-    if not instruction:
-        raise ValueError(f"{source.name} requires a verifier prompt instruction.")
-    normalized = contract.normalize_ground_truth(ground_truth)
-    return {
-        "data_source": source.dataset_id,
-        "prompt": [{"role": "user", "content": question + instruction}],
-        "env_class": source.env_id,
-        "reward_model": {"ground_truth": normalized},
-        "extra_info": {"split": "train", "index": index},
-    }
+    return _schema_row(question, ground_truth, source, index, contract)
 
 
 # ---------------------------------------------------------------------------
@@ -208,20 +213,11 @@ def _prepare_verifiable_code(example: Mapping[str, Any], index: int, contract: V
     if verification_info is None:
         raise ValueError("verifiable-coding-problems row is missing verification_info.")
     if isinstance(verification_info, str):
-        import ast
-
         try:
             verification_info = ast.literal_eval(verification_info)
         except (ValueError, SyntaxError) as exc:
             raise ValueError("verification_info string could not be parsed.") from exc
-    normalized = contract.normalize_ground_truth(verification_info)
-    return {
-        "data_source": source.dataset_id,
-        "prompt": [{"role": "user", "content": problem}],
-        "env_class": source.env_id,
-        "reward_model": {"ground_truth": normalized},
-        "extra_info": {"split": "train", "index": index},
-    }
+    return _schema_row(problem, verification_info, source, index, contract)
 
 
 def _prepare_apps(example: Mapping[str, Any], index: int, contract: VerifierDataContract) -> PreparedRow:
@@ -233,20 +229,11 @@ def _prepare_apps(example: Mapping[str, Any], index: int, contract: VerifierData
     if input_output is None:
         raise ValueError("APPS row is missing input_output.")
     if isinstance(input_output, str):
-        import json as _json
-
         try:
-            input_output = _json.loads(input_output)
-        except _json.JSONDecodeError as exc:
+            input_output = json.loads(input_output)
+        except json.JSONDecodeError as exc:
             raise ValueError("APPS input_output string is not valid JSON.") from exc
-    normalized = contract.normalize_ground_truth(input_output)
-    return {
-        "data_source": source.dataset_id,
-        "prompt": [{"role": "user", "content": problem}],
-        "env_class": source.env_id,
-        "reward_model": {"ground_truth": normalized},
-        "extra_info": {"split": "train", "index": index},
-    }
+    return _schema_row(problem, input_output, source, index, contract)
 
 
 # ---------------------------------------------------------------------------

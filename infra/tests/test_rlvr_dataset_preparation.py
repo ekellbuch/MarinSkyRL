@@ -36,6 +36,17 @@ class FakeContract:
         return normalized
 
 
+class SchemaOnlyCodeContract:
+    env_id = "lcb"
+    prompt_instruction = "\nReturn fenced Python."
+
+    def normalize_ground_truth(self, ground_truth):
+        return json.dumps(ground_truth, sort_keys=True)
+
+    def validate_example(self, ground_truth, positive_response, negative_response):
+        raise AssertionError("Code-source preparation must not execute downloaded solutions.")
+
+
 def test_dapo_preparation_strips_boilerplate_deduplicates_and_records_provenance():
     artifact = prepare_artifact(
         dapo_math_source(),
@@ -277,32 +288,46 @@ def test_gsm8k_rejects_missing_delimiter():
 
 
 def test_verifiable_code_preparation():
+    contract = SchemaOnlyCodeContract()
     artifact = prepare_artifact(
         verifiable_code_source(),
         [
             {
                 "problem_statement": "Write a function that adds two numbers.",
-                "verification_info": "{'language': 'python', 'test_cases': [{'fn_name': 'add', 'input': [1, 2], 'output': 3}]}",
+                "verification_info": (
+                    "{'language': 'python', 'test_cases': "
+                    "[{'fn_name': None, 'input': '1 2\\n', 'output': '3\\n', 'type': 'stdin_stdout'}]}"
+                ),
             }
         ],
-        FakeContract("lcb"),
+        contract,
         token_count=lambda text: len(text.split()),
         options=PreparationOptions(**_OPTS),
     )
     assert artifact.rows[0]["data_source"] == "open-r1/verifiable-coding-problems-python"
     assert "test_cases" in artifact.rows[0]["reward_model"]["ground_truth"]
+    assert artifact.rows[0]["prompt"][0]["content"].endswith(contract.prompt_instruction)
+    assert artifact.provenance["verification"] == "schema_only"
 
 
 def test_apps_preparation():
+    contract = SchemaOnlyCodeContract()
     artifact = prepare_artifact(
         apps_source(),
-        [{"question": "Reverse a string.", "input_output": '{"inputs": ["abc"], "outputs": ["cba"]}'}],
-        FakeContract("lcb"),
+        [
+            {
+                "question": "Reverse a string.",
+                "input_output": '{"inputs": ["abc\\n"], "outputs": ["cba\\n"]}',
+            }
+        ],
+        contract,
         token_count=lambda text: len(text.split()),
         options=PreparationOptions(**_OPTS),
     )
     assert artifact.rows[0]["data_source"] == "codeparrot/apps"
     assert "inputs" in artifact.rows[0]["reward_model"]["ground_truth"]
+    assert artifact.rows[0]["prompt"][0]["content"].endswith(contract.prompt_instruction)
+    assert artifact.provenance["verification"] == "schema_only"
 
 
 def test_gpqa_preparation_builds_mcq():

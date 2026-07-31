@@ -17,10 +17,15 @@ from skyrl_gym import error
 from skyrl_gym.envs.aime import utils as aime_utils
 from skyrl_gym.envs.gsm8k import utils as gsm8k_utils
 from skyrl_gym.envs.ifeval import utils as ifeval_utils
+from skyrl_gym.envs.lcb.livecodebench import (
+    compute_score,
+    normalize_lcb_ground_truth,
+)
 from skyrl_gym.envs.registration import spec
 
 NormalizeGroundTruth = Callable[[Any], str]
 IsCorrect = Callable[[str, str], bool]
+LCB_PROMPT_INSTRUCTION = "\nReturn the complete Python solution in this format:\n```python\n# solution\n```"
 
 
 @dataclass(frozen=True)
@@ -85,21 +90,13 @@ def _gsm8k_is_correct(response: str, ground_truth: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# LCB / code (schema-only — execution happens at runtime)
+# LCB / code
 # ---------------------------------------------------------------------------
 
 
-def _normalize_code(ground_truth: Any) -> str:
-    if isinstance(ground_truth, (list, dict)):
-        return json.dumps(ground_truth, sort_keys=True)
-    normalized = str(ground_truth)
-    if not normalized:
-        raise ValueError("code ground_truth must be non-empty.")
-    return normalized
-
-
 def _code_is_correct(response: str, ground_truth: str) -> bool:
-    return True
+    _, reward = compute_score(response, json.loads(ground_truth))
+    return reward == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +153,9 @@ CONTRACTS = {
     ),
     "lcb": VerifierDataContract(
         env_id="lcb",
-        normalize_ground_truth=_normalize_code,
+        normalize_ground_truth=normalize_lcb_ground_truth,
         is_correct=_code_is_correct,
+        prompt_instruction=LCB_PROMPT_INSTRUCTION,
     ),
     "mcq": VerifierDataContract(
         env_id="mcq",

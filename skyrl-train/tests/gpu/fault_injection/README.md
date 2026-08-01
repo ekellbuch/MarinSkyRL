@@ -47,3 +47,25 @@ communicator mode. The warmed phase-divergence case uses blocking production set
 deliberately do not enable communicator nonblocking: NCCL permits ordinary calls to return `ncclInProgress`,
 and PyTorch's EP `all_to_all_single` path does not handle that result. Keeping the healthy all-to-all and fault
 teardown checks together prevents a fault-only result from being mistaken for a training-safe runtime default.
+
+## Model collective schedule matrix
+
+Run the healthy model-level matrix separately:
+
+```bash
+cd skyrl-train
+python -m pytest -s tests/gpu/fault_injection/ep_fsdp_collective_matrix.py
+```
+
+Run that command inside the policy image so it uses the image's installed Torch, TorchTitan, and CUDA stack.
+An isolated `uv` environment both requires network access to direct-URL dependencies and can resolve a different
+CUDA build, so it is not an image-validation command.
+
+The six cases launch serially in fresh four-rank gangs. They compose the real TorchTitan EP hooks and FSDP2
+wrapping while varying live versus replayed routing, spread versus concentrated expert selection, and reentrant
+activation checkpointing. The final case adds a two-second delay on rank 0 before layer 1; it observes eventual
+completion and matching schedules without asserting a narrow runtime.
+
+Every case must emit one `MODEL_COLLECTIVE_SCHEDULE_OK` record and exit zero within four minutes. A timeout kills
+and reaps only that case's subprocess group and reports its complete captured output. This matrix is opt-in and
+its filename deliberately remains outside pytest's default `test_*.py` discovery.

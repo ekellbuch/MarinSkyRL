@@ -72,6 +72,7 @@ override-dependencies = [
     "flashinfer-python==0.6.12 ; sys_platform == 'linux'",
     "flashinfer-cubin==0.6.12 ; sys_platform == 'linux'",
     "flashinfer-jit-cache==0.6.12 ; sys_platform == 'linux'",
+    "opentelemetry-api>=1.39.1",
 ]
 
 [tool.uv.extra-build-dependencies]
@@ -117,6 +118,10 @@ docs = [
     "myst-parser>=2.0.0",
     "sphinx-copybutton>=0.5.0",
     "sphinx-autobuild>=2021.3.14"
+]
+telemetry = [
+    "marin-rigging[prometheus]==0.2.70.dev30755316227",
+    "ray[default]",
 ]
 sandboxes = [
     "litellm[proxy]>=1.67.5",

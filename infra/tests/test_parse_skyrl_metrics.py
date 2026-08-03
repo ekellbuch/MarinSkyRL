@@ -50,6 +50,37 @@ def test_default_parser_reads_agentic_wandb_json(tmp_path):
     assert result.serialization is parse_skyrl_metrics.MetricSerialization.WANDB_JSON
 
 
+def test_reward_plot_uses_the_structured_rollout_failure_fraction(tmp_path, monkeypatch):
+    captured = {}
+    real_subplots = parse_skyrl_metrics.plt.subplots
+
+    def capture_subplots(*args, **kwargs):
+        figure, axes = real_subplots(*args, **kwargs)
+        captured["axes"] = axes
+        return figure, axes
+
+    monkeypatch.setattr(parse_skyrl_metrics.plt, "subplots", capture_subplots)
+
+    parse_skyrl_metrics.generate_reward_plot(
+        {
+            "run": [
+                {
+                    "trainer/global_step": 7,
+                    "reward/avg_raw_reward": 0.75,
+                    "policy/policy_entropy": 0.4,
+                    "policy/raw_grad_norm": 1.2,
+                    "generate/failed_trajectory_fraction": 0.25,
+                }
+            ]
+        },
+        tmp_path / "reward.png",
+    )
+
+    assert len(captured["axes"]) == 3
+    failure_axis = captured["axes"][2]
+    assert list(failure_axis.lines[0].get_ydata()) == [0.25]
+
+
 def test_legacy_python_dict_log_is_auto_detected(tmp_path, monkeypatch):
     log_path = tmp_path / "trainer.out"
     log_path.write_text(

@@ -4,16 +4,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import importlib.metadata
 import json
 import posixpath
-import subprocess
 import sys
 import tempfile
 from dataclasses import asdict
-from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import unquote, urlparse
 
 from iris.client import JobFailedError
 
@@ -46,11 +42,6 @@ class JobBackend(Protocol):
 
 
 def _registered_image(runtime: RuntimeIdentity, cluster: str) -> GpuRlImage:
-    launcher_commit = _installed_launcher_commit()
-    if launcher_commit != runtime.launcher_commit:
-        raise ValueError(
-            f"Installed launcher commit {launcher_commit} does not match requested {runtime.launcher_commit}"
-        )
     matches = [image for image in GPU_RL_IMAGES.values() if image.reference == runtime.task_image]
     if len(matches) != 1:
         raise ValueError(f"Task image is not registered by this launcher: {runtime.task_image}")
@@ -67,39 +58,6 @@ def _registered_image(runtime: RuntimeIdentity, cluster: str) -> GpuRlImage:
             f"Task image architecture {image.architecture} is incompatible with cluster {cluster} ({architecture})"
         )
     return image
-
-
-def _installed_launcher_commit() -> str:
-    try:
-        direct_url = importlib.metadata.distribution("marinskyrl").read_text("direct_url.json")
-    except importlib.metadata.PackageNotFoundError:
-        direct_url = None
-    if direct_url:
-        direct_url_value = json.loads(direct_url)
-        commit = direct_url_value.get("vcs_info", {}).get("commit_id")
-        if commit:
-            return str(commit)
-        parsed_url = urlparse(direct_url_value.get("url", ""))
-        if parsed_url.scheme == "file":
-            checkout = Path(unquote(parsed_url.path))
-            if (checkout / ".git").exists() and (checkout / "pyproject.toml").exists():
-                return subprocess.run(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=checkout,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                ).stdout.strip()
-    repository_root = Path(__file__).resolve().parents[2]
-    if not (repository_root / ".git").exists() or not (repository_root / "pyproject.toml").exists():
-        raise RuntimeError("Installed marinskyrl wheel has no VCS commit identity in direct_url.json")
-    return subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repository_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
 
 def _write_json(uri: str, value: dict[str, Any]) -> None:

@@ -81,7 +81,12 @@ from iris.cluster.types import CoschedulingConfig, ResourceSpec, gpu_device
 from iris.rpc import job_pb2
 
 from cloud.iris.paths import PROJECT_ROOT
-from cloud.iris.ray_storage import DEFAULT_RAY_SPILL_DIR, RaySpillBackend, validate_ray_spill_dir
+from cloud.iris.ray_storage import (
+    DEFAULT_RAY_SPILL_DIR,
+    RaySpillBackend,
+    resolve_ray_spill_target,
+    validate_ray_spill_dir,
+)
 from cloud.iris.gpu_rl_images import GPU_RL_ENV_DIR, GPU_RL_PYTHON, image_for_cluster
 from cloud.iris.model_paths import is_object_store_model_path, unsupported_model_path_message
 from cloud.iris.rl_config_translation import RL_CONFIG_PAYLOAD_ENV, RL_CONFIG_TASK_DIR, resolve_rl_config_path
@@ -1835,11 +1840,79 @@ def normalize(args: argparse.Namespace) -> None:
         raise SystemExit("--gpus-per-node must be >= 1.")
 
 
+def _build_task_shell(
+    args: argparse.Namespace,
+    controller_cmd: list[str],
+    pythonpath: str,
+    iris_refresh: str,
+) -> list[str]:
+    """Wrap the node controller with per-pod storage and cache setup."""
+    ctrl = shlex.join(controller_cmd)
+    # Run outside task_runtime so every pod establishes Ray's filesystem contract
+    # before importing or starting any MarinSkyRL controller code. The controller
+    # repeats this check immediately before `ray start` as defense in depth.
+    spill_preflight = resolve_ray_spill_target(
+        args.rendezvous_dir, args.ray_spill_backend, args.ray_spill_dir
+    ).shell_preflight()
+    # TileLang JIT-cache warm-start shim for GDN/FlashQLA runs only.
+    # SKYRL_GDN_FLASHQLA=1 lazily JIT-compiles the FlashQLA GatedDeltaNet TileLang
+    # kernels on the first GPU forward into the node-local, ephemeral TileLang cache.
+    # Kaniko is CPU-only, so these kernels cannot be baked into the image. This brackets the train command
+    # with a per-pod, per-NODE cache sync (the bash runs once per task pod / node, and
+    # TileLang's cache is node-local, so one --down warms all 8 local GPU workers):
+    #   --down BEFORE the controller -> pulls the keyed warm cache (seed cache.tgz +
+    #          incremental per-hash-dir objects) into TILELANG_CACHE_DIR so TileLang
+    #          hash-matches and skips the cold compile. A miss is a warn+continue no-op.
+    #   --up   at EXIT (bash EXIT trap; fires on normal completion AND a `set -e`/crash
+    #          exit) -> uploads NEWLY-compiled hash-dirs as per-hash objects (race-free
+    #          across the ~16 writers — content-addressed, no cache.tgz overwrite).
+    # The shim self-gates on SKYRL_GDN_FLASHQLA and NEVER fails the job (best-effort;
+    # exits 0 even on S3 error). We ALSO branch here on SKYRL_GDN_FLASHQLA so non-GDN
+    # runs keep the BYTE-IDENTICAL `exec <controller>` fast path.
+    # TILELANG_CACHE_DIR is exported (defaulting to TileLang's own default) so the shim
+    # and the trainer's TileLang agree on the location; a config-set value wins.
+    # TILELANG_CACHE_MODEL_PATH lets the shim derive the model component of the key.
+    sync_py = "cloud/iris/tilelang_cache_sync.py"
+    tl_down = f"{GPU_RL_PYTHON} {sync_py} --down || true"
+    tl_up = f"{GPU_RL_PYTHON} {sync_py} --up || true"
+    # The controller is run as a BACKGROUND child + `wait` (not `exec`) so we can
+    # (a) run --up at exit via the bash EXIT trap and (b) FORWARD SIGTERM/SIGINT to
+    # the controller — preserving the old `exec` graceful-shutdown path (rank-0's Ray
+    # teardown + done-marker on preemption) that a plain child would lose. `wait` is
+    # interrupted by the trapped signal (rc>128); we re-`wait` to reap the child's
+    # real exit code after its forwarded-TERM shutdown.
+    gdn_branch = (
+        f'if [ "${{SKYRL_GDN_FLASHQLA:-0}}" = "1" ] || '
+        f'[ "${{SKYRL_GDN_FLASHQLA:-}}" = "true" ] || '
+        f'[ "${{SKYRL_GDN_FLASHQLA:-}}" = "on" ]; then '
+        f'export TILELANG_CACHE_DIR="${{TILELANG_CACHE_DIR:-/root/.tilelang/cache}}"; '
+        f"export TILELANG_CACHE_MODEL_PATH={shlex.quote(args.model_path)}; "
+        f"{tl_down}; "
+        f"trap {shlex.quote(tl_up)} EXIT; "
+        f'trap \'[ -n "$_child" ] && kill -TERM "$_child" 2>/dev/null\' TERM INT; '
+        f"set +e; {ctrl} & _child=$!; "
+        f'wait "$_child"; _rc=$?; '
+        f'if [ $_rc -gt 128 ]; then wait "$_child" 2>/dev/null; _rc=$?; fi; '
+        f"exit $_rc; "
+        f"else exec {ctrl}; fi"
+    )
+    bash = (
+        f"set -e; {spill_preflight}cd {APP_DIR}; "
+        f"{iris_refresh}"
+        f"export SKYRL_HOME={shlex.quote(SKYRL_HOME)}; "
+        f"export PYTHONPATH={shlex.quote(pythonpath)}:${{PYTHONPATH:-}}; "
+        f"export VLLM_USE_V1=1; "
+        f"{gdn_branch}"
+    )
+    return ["bash", "-c", bash]
+
+
 def build_task_command(args: argparse.Namespace) -> List[str]:
     """Build the in-container command, multi-node-aware.
 
     The full pipeline that runs inside each task container:
-      cd /app
+      prepare the node-local Ray spill directory
+      && cd /app
       && export SKYRL_HOME + PYTHONPATH (live cloud.iris, baked skyrl_train)
       && <GPU_RL_PYTHON> cloud/iris/task_runtime.py
             --ray-port ... --rendezvous-dir ...
@@ -2089,59 +2162,7 @@ def build_task_command(args: argparse.Namespace) -> List[str]:
             f"print('[rl-iris] post-iris pins intact: torch', torch.__version__, "
             f"'vllm', vllm.__version__)\"; "
         )
-    ctrl = shlex.join(controller_cmd)
-    # TileLang JIT-cache warm-start shim (Fix A) — GDN/FlashQLA runs only.
-    # SKYRL_GDN_FLASHQLA=1 lazily JIT-compiles the FlashQLA GatedDeltaNet TileLang
-    # kernels on the first GPU forward into the node-local, ephemeral TileLang cache
-    # (~71 min cold on the first r4f run, x every one of the N gang pods — kaniko is
-    # CPU-only so they can't be baked into the image). This brackets the train command
-    # with a per-pod, per-NODE cache sync (the bash runs once per task pod / node, and
-    # TileLang's cache is node-local, so one --down warms all 8 local GPU workers):
-    #   --down BEFORE the controller -> pulls the keyed warm cache (seed cache.tgz +
-    #          incremental per-hash-dir objects) into TILELANG_CACHE_DIR so TileLang
-    #          hash-matches and skips the cold compile. A miss is a warn+continue no-op.
-    #   --up   at EXIT (bash EXIT trap; fires on normal completion AND a `set -e`/crash
-    #          exit) -> uploads NEWLY-compiled hash-dirs as per-hash objects (race-free
-    #          across the ~16 writers — content-addressed, no cache.tgz overwrite).
-    # The shim self-gates on SKYRL_GDN_FLASHQLA and NEVER fails the job (best-effort;
-    # exits 0 even on S3 error). We ALSO branch here on SKYRL_GDN_FLASHQLA so a non-GDN
-    # run (e.g. 30B-coder) keeps the BYTE-IDENTICAL `exec <controller>` fast path.
-    # TILELANG_CACHE_DIR is exported (defaulting to TileLang's own default) so the shim
-    # and the trainer's TileLang agree on the location; a config-set value wins.
-    # TILELANG_CACHE_MODEL_PATH lets the shim derive the model component of the key.
-    sync_py = "cloud/iris/tilelang_cache_sync.py"
-    tl_down = f"{GPU_RL_PYTHON} {sync_py} --down || true"
-    tl_up = f"{GPU_RL_PYTHON} {sync_py} --up || true"
-    # The controller is run as a BACKGROUND child + `wait` (not `exec`) so we can
-    # (a) run --up at exit via the bash EXIT trap and (b) FORWARD SIGTERM/SIGINT to
-    # the controller — preserving the old `exec` graceful-shutdown path (rank-0's Ray
-    # teardown + done-marker on preemption) that a plain child would lose. `wait` is
-    # interrupted by the trapped signal (rc>128); we re-`wait` to reap the child's
-    # real exit code after its forwarded-TERM shutdown.
-    gdn_branch = (
-        f'if [ "${{SKYRL_GDN_FLASHQLA:-0}}" = "1" ] || '
-        f'[ "${{SKYRL_GDN_FLASHQLA:-}}" = "true" ] || '
-        f'[ "${{SKYRL_GDN_FLASHQLA:-}}" = "on" ]; then '
-        f'export TILELANG_CACHE_DIR="${{TILELANG_CACHE_DIR:-/root/.tilelang/cache}}"; '
-        f"export TILELANG_CACHE_MODEL_PATH={shlex.quote(args.model_path)}; "
-        f"{tl_down}; "
-        f"trap {shlex.quote(tl_up)} EXIT; "
-        f'trap \'[ -n "$_child" ] && kill -TERM "$_child" 2>/dev/null\' TERM INT; '
-        f"set +e; {ctrl} & _child=$!; "
-        f'wait "$_child"; _rc=$?; '
-        f'if [ $_rc -gt 128 ]; then wait "$_child" 2>/dev/null; _rc=$?; fi; '
-        f"exit $_rc; "
-        f"else exec {ctrl}; fi"
-    )
-    bash = (
-        f"set -e; cd {APP_DIR}; "
-        f"{iris_refresh}"
-        f"export SKYRL_HOME={shlex.quote(SKYRL_HOME)}; "
-        f"export PYTHONPATH={shlex.quote(pythonpath)}:${{PYTHONPATH:-}}; "
-        f"export VLLM_USE_V1=1; "
-        f"{gdn_branch}"
-    )
-    return ["bash", "-c", bash]
+    return _build_task_shell(args, controller_cmd, pythonpath, iris_refresh)
 
 
 def resolved_launch_args(argv: list[str] | None = None) -> argparse.Namespace:

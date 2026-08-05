@@ -19,18 +19,22 @@ from tests.gpu.fault_injection.collective_payloads import (
     warm_ep_and_fsdp_communicators,
 )
 from tests.gpu.fault_injection.multi_node_mesh import MeshRuntime, multi_node_mesh_runtime
+from tests.gpu.fault_injection.multi_node_phase_divergence_protocol import (
+    ACTIVE_MARKER,
+    BLOCKING_WAIT_DISABLED_MARKER,
+    BLOCKING_WAIT_FIELD,
+    PROCESS_GROUP_TIMEOUT_SECONDS,
+    READY_MARKER,
+    UNAFFECTED_EP_COMPLETION_MARKER,
+    UNEXPECTED_COMPLETION_MARKER,
+    WARMUP_MARKER,
+)
 from tests.process_gang import signal_rank_ready_and_wait_for_start
 from tests.nccl_environment import disable_nccl_communicator_nonblocking
 
 
-PROCESS_GROUP_TIMEOUT_SECONDS = 60
 WARMUP_ROUNDS = 3
 PAYLOAD_MIB = 1
-WARMUP_MARKER = "MULTI_NODE_COMMUNICATOR_WARMUP_COMPLETED"
-READY_MARKER = "MULTI_NODE_FAULT_READY"
-ACTIVE_MARKER = "MULTI_NODE_FAULT_ACTIVE"
-UNAFFECTED_EP_COMPLETION_MARKER = "MULTI_NODE_UNAFFECTED_EP_COMPLETED"
-UNEXPECTED_COMPLETION_MARKER = "MULTI_NODE_FAULT_UNEXPECTED_COMPLETION"
 
 
 def _build_and_warm_communicators(runtime: MeshRuntime, values_per_rank: int) -> MeshCollectives:
@@ -50,10 +54,15 @@ def _run(runtime: MeshRuntime, control_directory: Path) -> None:
     values_per_rank = numel_for_mib(PAYLOAD_MIB, VERIFICATION_DTYPE)
     collectives = _build_and_warm_communicators(runtime, values_per_rank)
     rank = runtime.placement.rank
+    blocking_wait = os.environ.get("NCCL_BLOCKING_WAIT")
+    blocking_wait_record = (
+        BLOCKING_WAIT_DISABLED_MARKER if blocking_wait is None else f"{BLOCKING_WAIT_FIELD}={blocking_wait}"
+    )
     print(
         f"{READY_MARKER} rank={rank} backend={dist.get_backend()} timeout={PROCESS_GROUP_TIMEOUT_SECONDS} "
         f"ep_ranks={collectives.ep.ranks} fsdp_ranks={collectives.fsdp.ranks} "
-        f"async_error_handling={os.environ.get('TORCH_NCCL_ASYNC_ERROR_HANDLING')}",
+        f"async_error_handling={os.environ.get('TORCH_NCCL_ASYNC_ERROR_HANDLING')} "
+        f"{blocking_wait_record}",
         flush=True,
     )
     signal_rank_ready_and_wait_for_start(control_directory, rank)
@@ -76,7 +85,7 @@ def _run(runtime: MeshRuntime, control_directory: Path) -> None:
     signal.pause()
 
 
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--control-directory", type=Path, required=True)
     arguments = parser.parse_args()

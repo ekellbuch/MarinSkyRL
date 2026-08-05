@@ -15,6 +15,7 @@ import argparse
 import os
 import signal
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -24,10 +25,11 @@ from pathlib import Path
 
 import pytest
 
-from skyrl_train.utils.nccl_environment import nccl_diagnostics_environment
-from tests.gpu.fault_injection.multi_node_mesh import EXPECTED_NODES, GPUS_PER_NODE, WORLD_SIZE
-from tests.gpu.fault_injection.multi_node_phase_divergence_worker import (
+from skyrl_train.nccl_diagnostics import nccl_diagnostics_environment
+from tests.gpu.fault_injection.multi_node_geometry import EXPECTED_NODES, GPUS_PER_NODE, WORLD_SIZE
+from tests.gpu.fault_injection.multi_node_phase_divergence_protocol import (
     ACTIVE_MARKER,
+    BLOCKING_WAIT_DISABLED_MARKER,
     PROCESS_GROUP_TIMEOUT_SECONDS,
     UNAFFECTED_EP_COMPLETION_MARKER,
     UNEXPECTED_COMPLETION_MARKER,
@@ -40,7 +42,7 @@ from tests.process_gang import (
 )
 
 
-WORKER_MODULE = "tests.gpu.fault_injection.multi_node_phase_divergence_worker"
+WORKER_MODULE = "tests.gpu.fault_injection.multi_node_worker_bootstrap"
 SETUP_TIMEOUT_SECONDS = 300
 FAULT_TIMEOUT_SECONDS = 120
 REAP_TIMEOUT_SECONDS = 30
@@ -48,6 +50,7 @@ SRUN_KILL_WAIT_SECONDS = 20
 WATCHDOG_HEARTBEAT_TIMEOUT_SECONDS = PROCESS_GROUP_TIMEOUT_SECONDS // 2
 MASTER_PORT_BASE = 20_000
 MASTER_PORT_SPAN = 20_000
+LEGACY_BLOCKING_WAIT_TIMEOUT_MS = "1800000"
 
 
 def _allocated_hostnames() -> tuple[str, ...]:
@@ -75,6 +78,7 @@ def _slurm_step_command(
     control_directory: Path,
     hostnames: tuple[str, ...],
     node_agent_command_prefix: tuple[str, ...],
+    master_address: str,
     master_port: int,
 ) -> tuple[str, ...]:
     """Build the host-side Slurm step that enters the policy runtime on each node."""
@@ -94,7 +98,7 @@ def _slurm_step_command(
         "--control-directory",
         str(control_directory),
         "--master-address",
-        hostnames[0],
+        master_address,
         "--master-port",
         str(master_port),
     )
@@ -127,14 +131,28 @@ def _launch_slurm_step(
     node_agent_command_prefix: tuple[str, ...],
 ) -> Iterator[ProcessGang]:
     environment = os.environ.copy()
-    environment.pop("NCCL_BLOCKING_WAIT", None)
+    # Keep the modern alias absent so this contract isolates the legacy setting
+    # captured in the TaskTrove worker environment, independent of the shell
+    # used to submit the test.
     environment.pop("TORCH_NCCL_BLOCKING_WAIT", None)
+    # The production Ray worker bootstrap must remove this alias before
+    # importing torch; otherwise it disables the watchdog path exercised here.
+    environment["NCCL_BLOCKING_WAIT"] = "1"
+    environment["TORCH_NCCL_BLOCKING_WAIT_TIMEOUT_MS"] = LEGACY_BLOCKING_WAIT_TIMEOUT_MS
     environment.update(
         nccl_diagnostics_environment(
             heartbeat_timeout_seconds=WATCHDOG_HEARTBEAT_TIMEOUT_SECONDS,
         )
     )
-    command = _slurm_step_command(control_directory, hostnames, node_agent_command_prefix, _master_port())
+    # Resolve the batch host before entering Jupiter's IPv4-only runtime.
+    master_address = socket.gethostbyname(hostnames[0])
+    command = _slurm_step_command(
+        control_directory,
+        hostnames,
+        node_agent_command_prefix,
+        master_address,
+        _master_port(),
+    )
     with launch_process_gang(
         command=command,
         working_directory=SKYRL_TRAIN_ROOT,
@@ -175,6 +193,7 @@ def test_warmed_multinode_phase_divergence_terminates_gang(pytestconfig: pytest.
             run_timeout_seconds=FAULT_TIMEOUT_SECONDS,
         )
 
+        assert result.output.count(BLOCKING_WAIT_DISABLED_MARKER) == WORLD_SIZE, result.output
         assert result.output.count(ACTIVE_MARKER) == WORLD_SIZE, result.output
         assert result.output.count(UNAFFECTED_EP_COMPLETION_MARKER) == WORLD_SIZE - GPUS_PER_NODE, result.output
         assert UNEXPECTED_COMPLETION_MARKER not in result.output

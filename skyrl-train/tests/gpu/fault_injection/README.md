@@ -99,9 +99,10 @@ process-group timeout is three minutes, so the enclosing cluster job needs a lon
 
 ## Four-node permanent phase divergence
 
-`multi_node_nccl_contract.py` controls the dedicated `multi_node_phase_divergence_worker.py`; together they are
-the destructive counterpart to the healthy traffic test. They use the same 16-rank EP4/FSDP4 placement and
-blocking communicator mode. After every rank completes three EP all-to-all and
+`multi_node_nccl_contract.py` starts `multi_node_worker_bootstrap.py`, which applies the production Ray worker
+setup before loading `multi_node_phase_divergence_worker.py`. Together they are the destructive counterpart to
+the healthy traffic test. They use the same 16-rank EP4/FSDP4 placement and asynchronous watchdog mode. After
+every rank completes three EP all-to-all and
 inter-node FSDP all-gather warmup rounds, rank 0 enters an FSDP all-gather while the other 15 ranks enter EP
 all-to-all. Twelve ranks complete unaffected EP groups and remain alive; rank 0 and its three EP peers wait for
 participants that never arrive. The test passes only if the configured ProcessGroupNCCL deadline converts that
@@ -125,6 +126,13 @@ two-minute fault deadline only after all 16 ranks report ready. Either deadline 
 Slurm step under a separate bounded reap deadline and includes its captured output in the failure. A passing run emits
 16 warmup records, 16 readiness records with effective timeout and group membership, 16 fault-entry records,
 and 12 unaffected-EP completion records; no blocked collective may return normally.
+
+The controller injects the legacy `NCCL_BLOCKING_WAIT=1` setting seen in the TaskTrove launch environment before
+starting the node agents. The production worker bootstrap must remove it before importing torch; every readiness
+record therefore reports `blocking_wait=None`. This keeps the regression at the actual worker boundary and proves
+that inherited launcher settings cannot switch ProcessGroupNCCL away from MarinSkyRL's asynchronous watchdog.
+The controller also resolves the Slurm batch hostname to IPv4 before torchrun because Jupiter compute nodes do not
+support the IPv6 addresses returned first by the cluster aliases.
 
 Pass the policy-image command through `--node-agent-command-prefix`. The controller prepends it to every remote
 node-agent command and invokes the image's `python`, so all four nodes use the same explicit policy runtime.

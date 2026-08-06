@@ -19,9 +19,14 @@ from skyrl_train.trainer import RayPPOTrainer
 from skyrl_train.utils.trainer_utils import ResumeMode
 from skyrl_train.training_batch import TrainingInputBatch
 from skyrl_train.models.grug_moe import GrugMoeForCausalLM
-from skyrl_train.models.grug_query_bias import next_query_bias
+from skyrl_train.models.grug_query_bias import (
+    GrugQueryBiasCapturePlan,
+    GrugQueryBiasShardLayout,
+    GrugQueryBiasWindow,
+    next_query_bias,
+)
 import numpy as np
-from skyrl_train.workers.worker import PolicyWorkerBase, CriticWorkerBase
+from skyrl_train.workers.worker import CriticWorkerBase, PolicyWorkerBase
 from skyrl_train.workers.worker_utils import BatchIterator
 from skyrl_train.utils.utils import validate_batch_sizes
 from skyrl_train.config.utils import get_default_config
@@ -92,21 +97,22 @@ class _FixedQueryBiasAccumulator:
         return self.betas
 
 
-def _worker_with_grug_query_bias_accumulator(accumulator):
-    worker = object.__new__(PolicyWorkerBase)
+def _window_with_grug_query_bias_accumulator(accumulator):
     causal_lm = _ObservableGrugCausalLM()
-    worker.model = SimpleNamespace(model=causal_lm)
-    worker._grug_query_bias_accumulator = accumulator
-    return worker, causal_lm
+    shard_layout = GrugQueryBiasShardLayout(micro_batch_size=1, accumulation_steps=1, ep_size=1, ep_rank=0)
+    capture_plan = GrugQueryBiasCapturePlan.build(torch.ones((1, 1)), shard_layout)
+    window = GrugQueryBiasWindow(causal_lm, valid_tokens=1, capture_plan=capture_plan)
+    window.accumulator = accumulator
+    return window, causal_lm
 
 
 def test_failed_optimizer_step_discards_grug_query_bias_window():
     accumulator = _FixedQueryBiasAccumulator(torch.tensor([[1.0, -2.0]]))
-    worker, causal_lm = _worker_with_grug_query_bias_accumulator(accumulator)
+    window, causal_lm = _window_with_grug_query_bias_accumulator(accumulator)
     previous_bias = causal_lm.query_bias.clone()
 
-    worker._finish_grug_query_bias_window(optimizer_step_succeeded=False)
-    worker._finish_grug_query_bias_window(optimizer_step_succeeded=True)
+    window.finish(optimizer_step_succeeded=False)
+    window.finish(optimizer_step_succeeded=True)
 
     torch.testing.assert_close(causal_lm.query_bias, previous_bias)
 
@@ -114,14 +120,55 @@ def test_failed_optimizer_step_discards_grug_query_bias_window():
 def test_successful_optimizer_step_applies_grug_query_bias_once():
     betas = torch.tensor([[1.0, -2.0]])
     accumulator = _FixedQueryBiasAccumulator(betas)
-    worker, causal_lm = _worker_with_grug_query_bias_accumulator(accumulator)
+    window, causal_lm = _window_with_grug_query_bias_accumulator(accumulator)
 
-    worker._finish_grug_query_bias_window(optimizer_step_succeeded=True)
+    window.finish(optimizer_step_succeeded=True)
 
     torch.testing.assert_close(causal_lm.query_bias, next_query_bias(betas))
     causal_lm.query_bias.fill_(17)
-    worker._finish_grug_query_bias_window(optimizer_step_succeeded=True)
+    window.finish(optimizer_step_succeeded=True)
     torch.testing.assert_close(causal_lm.query_bias, torch.full_like(causal_lm.query_bias, 17))
+
+
+def test_grug_query_bias_virtual_shards_partition_optimizer_window():
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 0],
+            [1, 0, 0],
+            [1, 1, 1],
+            [0, 1, 1],
+        ]
+    )
+    microbatches = attention_mask.split(2)
+
+    rank_masks = []
+    for ep_rank in range(2):
+        shard_layout = GrugQueryBiasShardLayout(
+            micro_batch_size=2,
+            accumulation_steps=2,
+            ep_size=2,
+            ep_rank=ep_rank,
+        )
+        capture_plan = GrugQueryBiasCapturePlan.build(attention_mask, shard_layout)
+        assert capture_plan.valid_token_counts == ((3, 0), (0, 5))[ep_rank]
+        rank_masks.append(
+            torch.cat([shard_layout.mask_for(mask, local_step) for local_step, mask in enumerate(microbatches)])
+        )
+
+    torch.testing.assert_close(rank_masks[0].logical_xor(rank_masks[1]), attention_mask.bool())
+    assert not torch.logical_and(rank_masks[0], rank_masks[1]).any()
+    assert rank_masks[0].sum().item() == 3
+    assert rank_masks[1].sum().item() == 5
+    single_rank_layout = GrugQueryBiasShardLayout(
+        micro_batch_size=4,
+        accumulation_steps=1,
+        ep_size=1,
+        ep_rank=0,
+    )
+    torch.testing.assert_close(
+        single_rank_layout.mask_for(attention_mask, local_step=0),
+        attention_mask.bool(),
+    )
 
 
 def _get_test_data(trainer: RayPPOTrainer):
@@ -804,6 +851,7 @@ def test_grug_ppo_train_releases_consumed_microbatches():
     )
     worker.policy_mini_batch_size_per_gpu = 2
     worker.strategy = MagicMock(fsdp_strategy="fsdp2")
+    worker.strategy.ep_size = 1
     worker.strategy.is_rank_0.return_value = False
     worker.strategy.all_reduce.side_effect = lambda status: status
     worker.model = SimpleNamespace(model=_ObservableGrugCausalLM())

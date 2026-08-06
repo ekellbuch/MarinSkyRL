@@ -97,7 +97,7 @@ Then configure the paths and API keys at the top of the script, and run:
 
 ```bash
 cd SkyRL/skyrl-train
-bash run_otagent.sh
+bash run_marinskyrl.sh
 ```
 
 The script is designed to run on 8 GPUs single-node. If that is not your setup, modify these configs correspondingly:

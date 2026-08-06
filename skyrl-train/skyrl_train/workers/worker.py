@@ -21,6 +21,7 @@ from ray.util.placement_group import (
     placement_group_table,
 )
 
+from skyrl_train.config.query_bias import GrugQueryBiasUpdateMode, resolve_grug_query_bias_update_mode
 from skyrl_train.utils import ray_noset_visible_devices, get_ray_pg_ready_with_timeout, get_reordered_bundle_indices
 from skyrl_train.utils.constants import SKYRL_RAY_PG_TIMEOUT_IN_S, SKYRL_WORKER_NCCL_TIMEOUT_IN_S
 from skyrl_train.utils.io import io
@@ -1078,8 +1079,12 @@ class PolicyWorkerBase(Worker):
         all_metrics = defaultdict(list)
         policy_update_steps = 0
         grug_causal_lm = self._grug_causal_lm()
+        grug_query_bias_updates_enabled = (
+            grug_causal_lm is not None
+            and resolve_grug_query_bias_update_mode(self.cfg.trainer.policy) is GrugQueryBiasUpdateMode.REPLACE
+        )
         grug_capture_plan = None
-        if grug_causal_lm is not None:
+        if grug_query_bias_updates_enabled:
             micro_batch_size = self.cfg.trainer.micro_train_batch_size_per_gpu
             ep_size = self.strategy.ep_size
             ep_rank = int(self.strategy.device_mesh.get_local_rank(mesh_dim="ep")) if ep_size > 1 else 0
@@ -1101,7 +1106,7 @@ class PolicyWorkerBase(Worker):
                 disable=not self.strategy.is_rank_0(),
             )
             for local_step, experience in enumerate(pbar):
-                if grug_causal_lm is not None and local_step % accumulation_steps == 0:
+                if grug_query_bias_updates_enabled and local_step % accumulation_steps == 0:
                     assert grug_capture_plan is not None
                     window_end = local_step + accumulation_steps
                     valid_tokens = sum(grug_capture_plan.valid_token_counts[local_step:window_end])

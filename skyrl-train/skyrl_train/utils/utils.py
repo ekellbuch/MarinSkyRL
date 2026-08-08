@@ -17,7 +17,13 @@ from ray.util.placement_group import (
     placement_group_table,
 )
 
+from skyrl_train.config.callbacks import has_explicit_callbacks
 from skyrl_train.config.query_bias import resolve_grug_query_bias_update_mode
+from skyrl_train.callbacks.types import (
+    CHECKPOINT_CALLBACK_TYPE,
+    HF_HUB_UPLOAD_CALLBACK_TYPE,
+    HF_MODEL_SAVE_CALLBACK_TYPE,
+)
 from skyrl_train.distributed_debug import apply_distributed_debug_mode
 from skyrl_train.numa_policy import NUMA_AFFINITY_ENV
 from skyrl_train.env_vars import EnvVarManager, EnvVarScope, write_process_manifest
@@ -496,9 +502,48 @@ def _validate_cp_cfg(cfg: DictConfig):
         )
 
 
+def validate_hf_export_config(cfg: DictConfig) -> None:
+    """Validate checkpoint alignment and deferred publication for HF exports."""
+    if cfg.trainer.get("hf_export_execution", False):
+        return
+
+    callbacks = cfg.trainer.get("callbacks")
+    if has_explicit_callbacks(cfg):
+        if any(callback.get("type") == HF_HUB_UPLOAD_CALLBACK_TYPE for callback in callbacks):
+            raise ValueError(
+                "hf_hub_upload cannot run in normal training because HF exports are produced out of band; "
+                "publish only after the export request is complete"
+            )
+
+        def callback_intervals(callback_type: str) -> list[int]:
+            return [
+                int(callback.get("save_steps", -1))
+                for callback in callbacks
+                if callback.get("type") == callback_type and int(callback.get("save_steps", -1)) > 0
+            ]
+
+        checkpoint_intervals = callback_intervals(CHECKPOINT_CALLBACK_TYPE)
+        export_intervals = callback_intervals(HF_MODEL_SAVE_CALLBACK_TYPE)
+    else:
+        checkpoint_interval = int(cfg.trainer.get("ckpt_interval", -1))
+        export_interval = int(cfg.trainer.get("hf_save_interval", -1))
+        checkpoint_intervals = [checkpoint_interval] if checkpoint_interval > 0 else []
+        export_intervals = [export_interval] if export_interval > 0 else []
+
+    for export_interval in export_intervals:
+        if not checkpoint_intervals or not any(
+            export_interval % checkpoint_interval == 0 for checkpoint_interval in checkpoint_intervals
+        ):
+            raise ValueError(
+                f"HF export interval {export_interval} must be a multiple of trainer.ckpt_interval "
+                f"or an explicit checkpoint callback interval; found {checkpoint_intervals or 'none'}"
+            )
+
+
 def validate_cfg(cfg: DictConfig):
     # Validate generation config separately
     validate_generator_cfg(cfg)
+    validate_hf_export_config(cfg)
     # Validate context-parallel config (no-op when context_parallel_size == 1 for all roles)
     _validate_cp_cfg(cfg)
     from .ppo_utils import AdvantageEstimatorRegistry, PolicyLossRegistry, repopulate_all_registries

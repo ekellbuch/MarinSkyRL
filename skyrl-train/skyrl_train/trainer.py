@@ -81,8 +81,21 @@ from skyrl_train.callbacks import (
     RefModelUpdateCallback,
 )
 from skyrl_train.telemetry import critical_phase, record_generated_work, record_policy_step
+from skyrl_train.hf_export import (
+    protected_hf_export_steps,
+    read_hf_export_request,
+    write_hf_export_request,
+)
+from skyrl_train.hf_export_schema import (
+    DEFAULT_HF_HUB_REVISION,
+    DEFAULT_HF_UPLOAD_MODE,
+    HFExportRequest,
+    HFExportStatus,
+    HFUploadMode,
+)
 
 _MODEL_INITIALIZATION_TIMEOUT = 60 * 60
+_TRAINER_STATE_FILENAME = "trainer_state.pt"
 
 
 class RayPPOTrainer:
@@ -393,8 +406,8 @@ class RayPPOTrainer:
                 logger.info("Saved final checkpoint.")
             await self.callback_handler.call_event_async("on_save", final_state, self._control, trainer=self)
         if self._control.should_save_hf_model:
-            with Timer("save_hf_model", self.all_timings):
-                await asyncio.to_thread(self.save_models)
+            await asyncio.to_thread(self.handle_hf_export)
+            if self.cfg.trainer.hf_export_execution:
                 logger.info("Saved final model.")
                 await asyncio.to_thread(self._flush_hf_uploads)
 
@@ -611,8 +624,7 @@ class RayPPOTrainer:
 
                 # Handle HF model saving
                 if self._control.should_save_hf_model:
-                    with Timer("save_hf_model", self.all_timings):
-                        self.save_models()
+                    self.handle_hf_export()
                     self._control.should_save_hf_model = False
 
                 # Handle evaluation
@@ -1893,7 +1905,7 @@ class RayPPOTrainer:
             "global_step": self.global_step,
             "config": self.cfg,
         }
-        trainer_state_path = os.path.join(global_step_folder, "trainer_state.pt")
+        trainer_state_path = os.path.join(global_step_folder, _TRAINER_STATE_FILENAME)
         with io.open_file(trainer_state_path, "wb") as f:
             torch.save(trainer_state, f)
         logger.info(f"Saved trainer state to {trainer_state_path}")
@@ -1918,6 +1930,8 @@ class RayPPOTrainer:
         if max_ckpts < 0:
             return
 
+        protected_steps = protected_hf_export_steps(self.cfg.trainer.ckpt_path)
+
         if not self._node_ids:
             self._node_ids = get_node_ids(self.policy_model, self.critic_model, self.ref_model)
         try:
@@ -1926,6 +1940,7 @@ class RayPPOTrainer:
                 cleanup_old_checkpoints,
                 self.cfg.trainer.ckpt_path,
                 max_ckpts,
+                protected_steps,
             )
         except ray.exceptions.RayError as e:
             # Best-effort: cleanup runs only after a successful checkpoint save,
@@ -1937,7 +1952,7 @@ class RayPPOTrainer:
 
         # Driver-side cleanup. For a shared ckpt_path (GPFS, S3) this alone
         # suffices; the per-node fan-out above only matters for node-local dirs.
-        cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, max_ckpts)
+        cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, max_ckpts, protected_steps)
 
     def load_checkpoints(self) -> Tuple[int, str]:
         """
@@ -2000,7 +2015,7 @@ class RayPPOTrainer:
         # Define paths for different checkpoint components
         policy_ckpt_dir = os.path.join(checkpoint_path, "policy")
         critic_ckpt_dir = os.path.join(checkpoint_path, "critic")
-        trainer_state_path = os.path.join(checkpoint_path, "trainer_state.pt")
+        trainer_state_path = os.path.join(checkpoint_path, _TRAINER_STATE_FILENAME)
         dataloader_state_path = os.path.join(checkpoint_path, "data.pt")
 
         # Validate that required checkpoint files exist
@@ -2075,6 +2090,52 @@ class RayPPOTrainer:
                 )
             )
         logger.info("Successfully saved model weights.")
+
+    def handle_hf_export(self) -> None:
+        """Execute an export-only run or persist its out-of-band request state."""
+        timer_label = "save_hf_model" if self.cfg.trainer.hf_export_execution else "queue_hf_export"
+        with Timer(timer_label, self.all_timings):
+            self._handle_hf_export()
+
+    def _handle_hf_export(self) -> None:
+        if self.cfg.trainer.hf_export_execution:
+            self.save_models()
+            return
+
+        checkpoint_path = os.path.join(self.cfg.trainer.ckpt_path, f"{GLOBAL_STEP_PREFIX}{self.global_step}")
+        trainer_state_path = os.path.join(checkpoint_path, _TRAINER_STATE_FILENAME)
+        if not io.exists(trainer_state_path):
+            raise RuntimeError(
+                f"Cannot request HF export for global_step_{self.global_step}: "
+                f"completed checkpoint marker is missing at {trainer_state_path}"
+            )
+
+        existing = read_hf_export_request(checkpoint_path)
+        if existing is not None:
+            if existing.status is HFExportStatus.COMPLETE:
+                logger.info(f"HF export for global_step_{self.global_step} is already complete")
+            else:
+                logger.info(
+                    f"HF export for global_step_{self.global_step} is already recorded with status={existing.status.value}"
+                )
+            return
+
+        placement = self.cfg.trainer.placement
+        request = HFExportRequest(
+            step=self.global_step,
+            checkpoint_base_path=self.cfg.trainer.ckpt_path,
+            checkpoint_path=checkpoint_path,
+            export_path=self.cfg.trainer.export_path,
+            model_path=self.cfg.trainer.policy.model.path,
+            num_nodes=placement.policy_num_nodes,
+            gpus_per_node=placement.policy_num_gpus_per_node,
+            hf_hub_repo_id=self.cfg.trainer.get("hf_hub_repo_id"),
+            hf_hub_private=self.cfg.trainer.get("hf_hub_private", False),
+            hf_hub_revision=self.cfg.trainer.get("hf_hub_revision", DEFAULT_HF_HUB_REVISION),
+            hf_upload_mode=HFUploadMode(self.cfg.trainer.get("hf_upload_mode", DEFAULT_HF_UPLOAD_MODE)),
+        )
+        request_path = write_hf_export_request(request)
+        logger.info(f"Queued out-of-band HF export for global_step_{self.global_step}: {request_path}")
 
     def _flush_hf_uploads(self) -> None:
         """Re-process HF Hub uploads after the final model export is on disk.

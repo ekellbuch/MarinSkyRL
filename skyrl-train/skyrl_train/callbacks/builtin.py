@@ -24,10 +24,17 @@ from typing import Any, Dict, List, Optional, Type
 from loguru import logger
 from omegaconf import DictConfig
 
+from skyrl_train.config.callbacks import has_explicit_callbacks
+from skyrl_train.hf_export_schema import DEFAULT_HF_HUB_REVISION, DEFAULT_HF_UPLOAD_MODE, HFUploadMode
 from skyrl_train.utils.data_tracker import DataConsumptionTracker
 from skyrl_train.utils.io import io
 
 from .base import TrainerCallback, TrainerState, TrainerControl, CallbackHandler
+from .types import (
+    CHECKPOINT_CALLBACK_TYPE,
+    HF_HUB_UPLOAD_CALLBACK_TYPE,
+    HF_MODEL_SAVE_CALLBACK_TYPE,
+)
 
 
 def _hf_hub_online():
@@ -83,7 +90,7 @@ def register_callback(name: str):
     return decorator
 
 
-@register_callback("checkpoint")
+@register_callback(CHECKPOINT_CALLBACK_TYPE)
 class CheckpointCallback(TrainerCallback):
     """
     Callback for saving training checkpoints at regular intervals.
@@ -167,18 +174,18 @@ class EvaluationCallback(TrainerCallback):
         return control
 
 
-@register_callback("hf_model_save")
+@register_callback(HF_MODEL_SAVE_CALLBACK_TYPE)
 class HFModelSaveCallback(TrainerCallback):
     """
-    Callback for saving models in HuggingFace format at regular intervals.
+    Callback for requesting Hugging Face exports at regular intervals.
 
-    This replaces the inline `hf_save_interval` logic in the training loop.
-    HF format models can be loaded directly with transformers and pushed to
-    the HuggingFace Hub.
+    Normal training records a request beside the immutable sharded checkpoint;
+    an export-only job later converts that checkpoint. Export-only runs execute
+    the conversion directly.
 
     Args:
-        save_steps: Save HF model every N steps. Set to -1 or 0 to disable.
-        save_on_train_end: Whether to save final HF model when training ends.
+        save_steps: Request an HF export every N steps. Set to -1 or 0 to disable.
+        save_on_train_end: Whether to request a final HF export when training ends.
     """
 
     def __init__(self, save_steps: int = -1, save_on_train_end: bool = True):
@@ -206,7 +213,7 @@ class HFModelSaveCallback(TrainerCallback):
         return control
 
 
-@register_callback("hf_hub_upload")
+@register_callback(HF_HUB_UPLOAD_CALLBACK_TYPE)
 class HFHubUploadCallback(TrainerCallback):
     """
     Callback for uploading HuggingFace format models to HuggingFace Hub.
@@ -242,8 +249,8 @@ class HFHubUploadCallback(TrainerCallback):
         upload_steps: int = -1,
         upload_on_train_end: bool = True,
         private: bool = False,
-        revision: str = "main",
-        upload_mode: str = "latest",
+        revision: str = DEFAULT_HF_HUB_REVISION,
+        upload_mode: str = DEFAULT_HF_UPLOAD_MODE,
         path_in_repo_prefix: str = "checkpoints",
     ):
         import os
@@ -253,7 +260,7 @@ class HFHubUploadCallback(TrainerCallback):
         self.upload_on_train_end = upload_on_train_end
         self.private = private
         self.revision = revision
-        self.upload_mode = upload_mode
+        self.upload_mode = HFUploadMode(upload_mode)
         self.path_in_repo_prefix = path_in_repo_prefix
         self._pending_uploads: List[int] = []  # Steps that need uploading
         self._export_path: Optional[str] = None
@@ -366,7 +373,7 @@ class HFHubUploadCallback(TrainerCallback):
 
             with io.local_read_dir(model_path) as local_dir:
                 upload_targets = [("", f"Upload checkpoint at step {step} (root)")]
-                if self.upload_mode == "all":
+                if self.upload_mode is HFUploadMode.ALL:
                     archive_path = f"{self.path_in_repo_prefix}/step_{step}"
                     upload_targets.append((archive_path, f"Archive checkpoint at step {step}"))
 
@@ -1100,8 +1107,7 @@ def create_default_callbacks(cfg: DictConfig) -> List[TrainerCallback]:
         List of configured callbacks
     """
     # Check for new-style explicit callback configuration
-    callbacks_config = getattr(cfg.trainer, "callbacks", None)
-    if callbacks_config is not None and len(callbacks_config) > 0:
+    if has_explicit_callbacks(cfg):
         logger.info("Using explicit callback configuration from YAML")
         callbacks = create_callbacks_from_config(cfg)
         # Always add logging callback if not explicitly configured
@@ -1135,12 +1141,13 @@ def create_default_callbacks(cfg: DictConfig) -> List[TrainerCallback]:
     if hf_save_interval > 0:
         callbacks.append(HFModelSaveCallback(save_steps=hf_save_interval))
 
-    # HF Hub upload callback (uploads saved HF models to HuggingFace Hub)
+    # The export-only job publishes after conversion; normal training only records the destination in its request.
     hf_hub_repo_id = getattr(cfg.trainer, "hf_hub_repo_id", None)
-    if hf_hub_repo_id and hf_save_interval > 0:
+    hf_export_execution = getattr(cfg.trainer, "hf_export_execution", False)
+    if hf_export_execution and hf_hub_repo_id and hf_save_interval > 0:
         hf_hub_private = getattr(cfg.trainer, "hf_hub_private", False)
-        hf_hub_revision = getattr(cfg.trainer, "hf_hub_revision", "main")
-        hf_upload_mode = getattr(cfg.trainer, "hf_upload_mode", "latest")
+        hf_hub_revision = getattr(cfg.trainer, "hf_hub_revision", DEFAULT_HF_HUB_REVISION)
+        hf_upload_mode = getattr(cfg.trainer, "hf_upload_mode", DEFAULT_HF_UPLOAD_MODE)
         callbacks.append(
             HFHubUploadCallback(
                 repo_id=hf_hub_repo_id,

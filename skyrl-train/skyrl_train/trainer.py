@@ -128,7 +128,7 @@ class RayPPOTrainer:
         self.generator = generator
         self.train_dataloader = None
         self.total_training_steps = None
-        self._build_train_dataloader_and_compute_training_steps()
+        self._configure_training_schedule()
 
         self.eval_dataloader = (
             build_dataloader(self.cfg, eval_dataset, is_train=False) if eval_dataset is not None else None
@@ -163,13 +163,8 @@ class RayPPOTrainer:
         # Trainer control object for callback coordination
         self._control = TrainerControl()
 
-    def _build_train_dataloader_and_compute_training_steps(self):
-        """
-        Hook for constructing the training dataloader. Subclasses can override
-        this to customize dataloader behavior. For instance, fully async training
-        needs a batch size of 1, among other features.
-        Defaults to `trainer_utils.build_dataloader` with `is_train=True`.
-        """
+    def _configure_training_schedule(self):
+        """Set ``total_training_steps`` and any inputs required to execute that schedule."""
         self.train_dataloader = build_dataloader(self.cfg, self.train_dataset, is_train=True)
         self.total_training_steps = len(self.train_dataloader) * self.cfg.trainer.epochs
         max_steps = getattr(self.cfg.trainer, "max_steps", None)
@@ -188,7 +183,7 @@ class RayPPOTrainer:
         Returns:
             TrainerState object with current training state
         """
-        num_steps_per_epoch = len(self.train_dataloader)
+        num_steps_per_epoch = self._num_steps_per_epoch()
         return TrainerState(
             global_step=self.global_step,
             epoch=epoch,
@@ -199,6 +194,9 @@ class RayPPOTrainer:
             metrics=dict(self.all_metrics),
             timings=dict(self.all_timings),
         )
+
+    def _num_steps_per_epoch(self) -> int:
+        return len(self.train_dataloader)
 
     def _get_ref_update_callback(self) -> Optional[RefModelUpdateCallback]:
         """Get the RefModelUpdateCallback if one exists in the callback handler."""
@@ -356,19 +354,21 @@ class RayPPOTrainer:
         """
         Main training loop for PPO
         """
-        # Initialize generator resources (e.g., shared QueueOrchestrator for Harbor)
-        # This must happen before any generate() calls
+        await self._startup_generator()
+
+        try:
+            await self._train_loop()
+        finally:
+            await self._teardown()
+
+    async def _startup_generator(self) -> None:
+        """Initialize generator resources before any rollout can begin."""
         try:
             await self.generator.startup()
             logger.info("Generator startup complete")
         except Exception as e:
             logger.opt(depth=0).error("Generator startup failed: " + str(e))
             raise
-
-        try:
-            await self._train_loop()
-        finally:
-            await self._teardown()
 
     async def _handle_resume_at_max_steps(self) -> None:
         """Handle a run that resumed AT or PAST max_steps (already complete).
@@ -2202,3 +2202,35 @@ class RayPPOTrainer:
             logger.warning(f"Failed to clean up temporary policy export directory {policy_export_dir}: {e}")
 
         logger.info("Successfully update ref model with policy model, training continue.")
+
+
+class CheckpointExportTrainer(RayPPOTrainer):
+    """Load one exact checkpoint, export it, and exit without a training lifecycle."""
+
+    def _configure_training_schedule(self) -> None:
+        configured_max_steps = self.cfg.trainer.max_steps
+        if configured_max_steps is None or configured_max_steps <= 0:
+            raise ValueError("HF export execution requires trainer.max_steps to select the checkpoint step")
+        max_steps = int(configured_max_steps)
+        if ResumeMode(self.cfg.trainer.resume_mode) is not ResumeMode.FROM_PATH or not self.cfg.trainer.get(
+            "resume_path"
+        ):
+            raise ValueError("HF export execution requires trainer.resume_mode=from_path and trainer.resume_path")
+        self.train_dataloader = None
+        self.total_training_steps = max_steps
+
+    def _num_steps_per_epoch(self) -> int:
+        return self.total_training_steps
+
+    async def _startup_generator(self) -> None:
+        """Checkpoint export has no rollout lifecycle to start."""
+
+    async def _train_loop(self) -> None:
+        with Timer("load_checkpoints"):
+            self.global_step, _ = self.load_checkpoints()
+        if self.global_step != self.total_training_steps:
+            raise ValueError(
+                "HF export checkpoint step mismatch: "
+                f"requested global_step_{self.total_training_steps}, loaded global_step_{self.global_step}"
+            )
+        await self._handle_resume_at_max_steps()

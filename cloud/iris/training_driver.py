@@ -35,9 +35,11 @@ from cloud.iris.artifacts import fs_and_path
 from cloud.iris.paths import PROJECT_ROOT
 from cloud.iris.rl_config_translation import (
     apply_context_budget_overrides,
+    build_checkpoint_export_hydra_args,
     build_skyrl_hydra_args,
     get_skyrl_command_preview,
     materialize_rl_config,
+    parse_checkpoint_export_config,
     parse_rl_config,
     write_resolved_context_budget,
 )
@@ -48,6 +50,7 @@ from cloud.iris.rl_data import (
     resolve_rl_train_data,
 )
 from marinskyrl.resource_locator import model_source_for_path
+from cloud.iris.runtime_environment import CHECKPOINT_EXPORT_ENTRYPOINT
 
 
 @dataclass
@@ -57,6 +60,7 @@ class LocalRLConfig:
     rl_config_path: str
     job_name: str
     model_path: str
+    entrypoint: str | None = None
     model_source_uri: str | None = None
     model_source_identity: str | None = None
     train_data: List[str] = field(default_factory=list)
@@ -193,54 +197,73 @@ class LocalRLRunner:
         print(f"  artifact:       {artifact}")
         return artifact
 
+    def _write_resolved_config(self, entrypoint: str, hydra_args: List[str], source_config: Path) -> None:
+        if not self.config.resolved_config_uri:
+            return
+        filesystem, path = fs_and_path(self.config.resolved_config_uri)
+        with filesystem.open(path, "w") as destination:
+            json.dump(
+                {
+                    "entrypoint": entrypoint,
+                    "hydra_args": hydra_args,
+                    "source_config": str(source_config),
+                },
+                destination,
+                sort_keys=True,
+            )
+
+    def _run_checkpoint_export(self, rl_config_path: Path, exp_args: dict, hpc: "_LocalHPCStub") -> int:
+        """Run the policy-only conversion pipeline without training setup."""
+        parsed = parse_checkpoint_export_config(rl_config_path, model_override=self.config.model_path)
+        hydra_args = build_checkpoint_export_hydra_args(parsed, exp_args, hpc)
+        hydra_args.extend(self.config.skyrl_overrides)
+        print(f"Loaded RL config: {parsed.config_path}")
+        self._write_resolved_config(CHECKPOINT_EXPORT_ENTRYPOINT, hydra_args, parsed.config_path)
+        if self.config.dry_run:
+            print("\n[DRY RUN] Would execute SkyRL with:")
+            print(get_skyrl_command_preview(CHECKPOINT_EXPORT_ENTRYPOINT, hydra_args))
+            return 0
+        return self._run_skyrl(CHECKPOINT_EXPORT_ENTRYPOINT, hydra_args)
+
     def run(self) -> int:
         """Execute the RL training job. Returns an exit code (0 for success)."""
         self.print_banner()
 
         rl_config_path = materialize_rl_config(self.config.rl_config_path)
+        exp_args = self._build_exp_args()
+        hpc_stub = _LocalHPCStub(
+            gpus_per_node=self.config.gpus,
+            cpus_per_node=self.config.cpus,
+        )
+        if self.config.entrypoint == CHECKPOINT_EXPORT_ENTRYPOINT:
+            return self._run_checkpoint_export(rl_config_path, exp_args, hpc_stub)
+
         parsed = parse_rl_config(
             rl_config_path,
             model_override=self.config.model_path,
         )
         parsed, skyrl_overrides = apply_context_budget_overrides(parsed, self.config.skyrl_overrides)
-        print(f"Loaded RL config: {parsed.config_path}")
+        entrypoint = self.config.entrypoint or parsed.entrypoint
         self.config.tensor_parallel_size = parsed.tensor_parallel_size
-
         if self.config.train_data:
             print(f"\nResolving train_data (kind={parsed.data_kind}): {self.config.train_data}")
             resolved_train = resolve_rl_train_data(self.config.train_data, kind=parsed.data_kind)
             self.config.train_data = resolved_train
+            exp_args["train_data"] = resolved_train
             print(f"Resolved train_data: {resolved_train}")
-
-        exp_args = self._build_exp_args()
-
-        hpc_stub = _LocalHPCStub(
-            gpus_per_node=self.config.gpus,
-            cpus_per_node=self.config.cpus,
-        )
         hydra_args = build_skyrl_hydra_args(parsed, exp_args, hpc_stub)
-
         self._record_context_budget(parsed, skyrl_overrides)
+
+        print(f"Loaded RL config: {parsed.config_path}")
 
         if skyrl_overrides:
             hydra_args.extend(skyrl_overrides)
 
-        if self.config.resolved_config_uri:
-            filesystem, path = fs_and_path(self.config.resolved_config_uri)
-            with filesystem.open(path, "w") as destination:
-                json.dump(
-                    {
-                        "entrypoint": parsed.entrypoint,
-                        "hydra_args": hydra_args,
-                        "source_config": str(parsed.config_path),
-                    },
-                    destination,
-                    sort_keys=True,
-                )
+        self._write_resolved_config(entrypoint, hydra_args, parsed.config_path)
 
         if self.config.dry_run:
             print("\n[DRY RUN] Would execute SkyRL with:")
-            print(get_skyrl_command_preview(parsed.entrypoint, hydra_args))
+            print(get_skyrl_command_preview(entrypoint, hydra_args))
             return 0
 
         self._setup_environment(exp_args)
@@ -265,7 +288,7 @@ class LocalRLRunner:
             # this the worker's os.environ lacks the path and TIS skips 100% of the batch.
             if self._literal_log_path:
                 hydra_args = hydra_args + [f"++terminal_bench_config.literal_log_path={self._literal_log_path}"]
-            return self._run_skyrl(parsed.entrypoint, hydra_args)
+            return self._run_skyrl(entrypoint, hydra_args)
 
     @contextlib.contextmanager
     def _ingress_context(self) -> Iterator[None]:
@@ -522,6 +545,7 @@ def create_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--rl_config", required=True, help="Path to a SkyRL config YAML.")
     parser.add_argument("--rl-config", dest="rl_config", help=argparse.SUPPRESS)
+    parser.add_argument("--entrypoint", default=None, help="Override the RL config entrypoint.")
 
     parser.add_argument("--model_path", required=True, help="Model path or HuggingFace ID.")
     parser.add_argument("--model-path", dest="model_path", help=argparse.SUPPRESS)
@@ -641,6 +665,7 @@ def main() -> None:
         rl_config_path=args.rl_config,
         job_name=args.job_name,
         model_path=args.model_path,
+        entrypoint=args.entrypoint,
         model_source_uri=args.model_source_uri,
         model_source_identity=args.model_source_identity,
         train_data=train_data,

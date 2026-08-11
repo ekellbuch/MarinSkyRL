@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol
 import yaml
 
 from cloud.iris.paths import resolve_paths_in_dict
-from marinskyrl.resource_locator import model_source_for_path
+from marinskyrl.resource_locator import join_resource_path, model_source_for_path
 
 # Directory containing the bundled example RL config YAML files.
 SKYRL_CONFIG_DIR = Path(__file__).parent / "configs"
@@ -739,6 +739,15 @@ def build_checkpoint_export_hydra_args(
     return args
 
 
+def _apply_trajectory_retention_path(generator: Dict[str, Any], experiments_dir: str, job_name: str) -> None:
+    retention = dict(generator.get("trajectory_retention", {}))
+    configured_path = retention.get("output_path")
+    if not configured_path and experiments_dir and job_name:
+        retention["output_path"] = join_resource_path(experiments_dir, job_name, "trace_jobs", "training_trajectories")
+    if retention:
+        generator["trajectory_retention"] = retention
+
+
 def build_skyrl_hydra_args(
     parsed: ParsedRLConfig,
     exp_args: Dict[str, Any],
@@ -769,11 +778,12 @@ def build_skyrl_hydra_args(
     if not trainer.get("run_name") and job_name:
         trainer["run_name"] = job_name
     if not trainer.get("export_path") and experiments_dir and job_name:
-        trainer["export_path"] = f"{experiments_dir}/{job_name}/exports"
+        trainer["export_path"] = join_resource_path(experiments_dir, job_name, "exports")
         print(f"Auto-set trainer.export_path: {trainer['export_path']}")
     if not trainer.get("ckpt_path") and experiments_dir and job_name:
-        trainer["ckpt_path"] = f"{experiments_dir}/{job_name}/checkpoints"
+        trainer["ckpt_path"] = join_resource_path(experiments_dir, job_name, "checkpoints")
         print(f"Auto-set trainer.ckpt_path: {trainer['ckpt_path']}")
+    _apply_trajectory_retention_path(generator, experiments_dir, job_name)
 
     # Derive placement from num_nodes.
     num_nodes = int(exp_args.get("num_nodes", 1))

@@ -104,7 +104,7 @@ Checkpoint Configuration
     max_ckpts_to_keep: -1 # -1 to keep all checkpoints, N to keep the last N checkpoints
     ckpt_interval: 10  # Save full training checkpoint every `ckpt_interval` steps.
     hf_save_interval: -1  # Save HF format model(s)every `hf_save_interval` steps.
-    export_path: "${oc.env:HOME}/exports/" # Path for exported artifacts (HF models, debug dumps, etc.)
+    export_path: "${oc.env:HOME}/exports" # Path for exported artifacts (HF models, debug dumps, etc.)
     project_name: "skyrl"
     run_name: "test_run"
     logger: "wandb"
@@ -609,7 +609,36 @@ Generator Configuration
         penalty_per_token: 0.0
         max_penalty: 0.2
 
+    trajectory_retention:
+      enabled: true
+      output_path: ${trainer.export_path}/training_trajectories
+      run_id: ${trainer.run_name}
+      phases: [train]
+      sample_count_per_step: 1
+      sample_fraction: 0.0
+      always_retain_failures: true
+      always_retain_non_terminating: true
+      always_retain_loops: true
+      accepted_stop_reasons: ${generator.trajectory_reward_shaping.non_termination.accepted_stop_reasons}
+      reward_below: null
+      reward_above: null
+      max_bytes_per_step: 8388608
+      max_bytes_per_run: 268435456
+      required: false
+      redact_fields: []
+      model_path: ${trainer.policy.model.path}
+      model_source_identity: ${trainer.policy.model.source_identity}
+      resume_path: ${trainer.resume_path}
+      inference_backend: ${generator.backend}
+
     apply_overlong_filtering: false
+
+``trajectory_retention`` runs after every generator has produced the common normalized output. It writes gzip-compressed,
+content-addressed JSON records for selected training or evaluation trajectories. Count and fraction sampling are deterministic;
+failure, non-termination, loop, and reward-threshold selectors retain diagnostic cases independently. The persistent ledger makes
+resume idempotent and enforces compressed-byte limits before each write. Set ``required: true`` when a retention write failure must
+stop training; best-effort mode instead reports ``generate/trajectory_retention/write_errors``. Iris derives a durable path under
+the job's ``trace_jobs`` directory unless the launch configuration supplies an explicit path.
 
 
 Inference Engine Placement Configuration
@@ -674,5 +703,6 @@ Misc Configuration
 ~~~~~~~~~~~~~~~~~~
 
 - ``generator.trajectory_reward_shaping``: Generator-independent additive penalties applied after trajectory normalization. ``non_termination`` penalizes stop reasons outside its accepted set. ``loop`` detects repeated trainable token windows without crossing tool-observation boundaries. ``successful_length`` penalizes trainable response tokens beyond ``free_tokens`` only when the raw task outcome is positive. The raw outcome remains in ``unshaped_rewards`` for pass-rate and verifier-accuracy metrics. ``schema_version`` is stored with the run configuration and emitted on each shaped trajectory.
+- ``generator.trajectory_retention``: Generator-independent bounded capture of normalized training trajectories. It samples deterministically per step, always retains configured anomalies, and writes content-addressed compressed records plus a resume-safe ledger. ``required=false`` reports storage failures without stopping training; ``required=true`` fails the run.
 - ``generator.apply_overlong_filtering``: Whether to apply DAPO Overlong Filtering to the loss masks. For each trajectory that exceeds the max length (i.e., truncated and does not end with an EOS token), this masks out every token in the loss mask.
 - ``trainer.step_wise_training``: Whether to use step-wise training. If ``true``, then the generator will return multi-turn generations with each turn being a separate trajectory. Advantages are computed based on the last step of each trajectory and propagated to the previous steps.

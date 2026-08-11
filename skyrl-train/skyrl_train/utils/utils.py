@@ -38,6 +38,26 @@ from .logging_utils import format_exception_text
 from .loss_reduction import SUPPORTED_LOSS_REDUCTIONS
 from .nccl_environment import worker_nccl_environment
 
+MOE_ROUTER_REPLAY_STRATEGIES = frozenset({"fsdp", "fsdp2"})
+
+
+def moe_router_replay_requested(cfg: DictConfig) -> bool:
+    return bool(cfg.trainer.policy.fsdp_config.get("moe_router_replay", False))
+
+
+def moe_router_replay_enabled(cfg: DictConfig) -> bool:
+    return cfg.trainer.strategy in MOE_ROUTER_REPLAY_STRATEGIES and moe_router_replay_requested(cfg)
+
+
+def validate_moe_router_replay_config(cfg: DictConfig) -> None:
+    """Reject router replay on strategies that silently ignore captured routes."""
+    if moe_router_replay_requested(cfg) and cfg.trainer.strategy not in MOE_ROUTER_REPLAY_STRATEGIES:
+        supported = ", ".join(sorted(MOE_ROUTER_REPLAY_STRATEGIES))
+        raise ValueError(
+            f"trainer.policy.fsdp_config.moe_router_replay is not supported with "
+            f"trainer.strategy='{cfg.trainer.strategy}'; use one of: {supported}"
+        )
+
 
 def policy_strict_spread_eligible(cfg: DictConfig) -> bool:
     """Whether a dedicated STRICT_SPREAD policy placement group should be used.
@@ -537,6 +557,7 @@ def validate_hf_export_config(cfg: DictConfig) -> None:
 def validate_cfg(cfg: DictConfig):
     # Validate generation config separately
     validate_generator_cfg(cfg)
+    validate_moe_router_replay_config(cfg)
     validate_hf_export_config(cfg)
     # Validate context-parallel config (no-op when context_parallel_size == 1 for all roles)
     _validate_cp_cfg(cfg)
@@ -978,7 +999,8 @@ def _validate_dcp_cfg(cfg: DictConfig):
         )
     # (e) vLLM rejects DCP together with R3 router capture (enable_return_routed_experts).
     # R3 capture is configured at the generator level (direct flag or engine_init_kwargs),
-    # and the training-side replay is gated by trainer.policy.fsdp_config.moe_router_replay.
+    # Training-side replay also requires an FSDP/FSDP2 strategy; unsupported strategies
+    # reject the flag during top-level config validation.
     #
     # Opt-in bypass: VLLM_ALLOW_ROUTED_EXPERTS_DCP=1 lifts this guard, mirroring the
     # identical env-var-gated bypass in the patched vLLM fork
@@ -993,7 +1015,7 @@ def _validate_dcp_cfg(cfg: DictConfig):
     r3_capture = (
         bool(gen.get("enable_return_routed_experts", False))
         or bool(gen.get("engine_init_kwargs", {}).get("enable_return_routed_experts", False))
-        or bool(cfg.trainer.policy.fsdp_config.get("moe_router_replay", False))
+        or moe_router_replay_enabled(cfg)
     )
     allow_routed_experts_dcp = os.environ.get("VLLM_ALLOW_ROUTED_EXPERTS_DCP", "0") == "1"
     if r3_capture and allow_routed_experts_dcp:

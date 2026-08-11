@@ -46,6 +46,25 @@ from transformers.trainer import get_scheduler
 
 from packaging import version
 
+
+_DEFAULT_OPTIMIZER_NAME = "AdamW"
+_MUONH_OPTIMIZER_NAME = "MuonH"
+
+
+def resolve_fsdp_parameter_storage_dtype(optimizer_name: str, configured_dtype: str | None) -> torch.dtype:
+    """Return the FSDP parameter storage dtype.
+
+    An unset dtype preserves MuonH parameters in FP32 and stores parameters for every other optimizer in BF16.
+    """
+    if configured_dtype is None:
+        return torch.float32 if optimizer_name == _MUONH_OPTIMIZER_NAME else torch.bfloat16
+    if PrecisionType.is_fp32(configured_dtype):
+        return torch.float32
+    if PrecisionType.is_bf16(configured_dtype):
+        return torch.bfloat16
+    raise ValueError(f"fsdp_parameter_storage_dtype must be float32 or bfloat16, got {configured_dtype!r}")
+
+
 if version.parse(torch.__version__) >= version.parse("2.6"):
     from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy
 elif version.parse(torch.__version__) >= version.parse("2.4"):
@@ -80,8 +99,17 @@ class FSDPStrategy(DistributedStrategy):
         self.seed = seed
         self.device_mesh = None
         self.total_training_steps: Optional[int] = num_training_steps
-        self.optimizer_name = optimizer_config.get("optimizer", "AdamW") if optimizer_config is not None else None
-        self.is_muonh_optimizer = self.optimizer_name == "MuonH"
+        self.optimizer_name = (
+            optimizer_config.get("optimizer", _DEFAULT_OPTIMIZER_NAME)
+            if optimizer_config is not None
+            else _DEFAULT_OPTIMIZER_NAME
+        )
+        configured_storage_dtype = (
+            optimizer_config.get("fsdp_parameter_storage_dtype", None) if optimizer_config is not None else None
+        )
+        self.parameter_storage_dtype = resolve_fsdp_parameter_storage_dtype(
+            self.optimizer_name, configured_storage_dtype
+        )
 
         # if we are using fsdp 1 or cpu offload is off for fsdp2, then we need to manually offload weights/optimizer to cpu
         self.manual_offload = self.fsdp_strategy == "fsdp" or not self.fsdp_config.get("cpu_offload")
@@ -474,7 +502,6 @@ class FSDPStrategy(DistributedStrategy):
         optim_config = self.optimizer_config
         if optim_config is not None:
             optimizer_name = self.optimizer_name
-            assert optimizer_name is not None
             if optimizer_name == "Muon":
                 # Hybrid Muon recipe: Muon on the 2-D hidden matmul weights,
                 # AdamW on embeddings / final head / norms / biases / 1-D params.
@@ -495,7 +522,7 @@ class FSDPStrategy(DistributedStrategy):
                     f"(lr={optim_config.lr}). Muon params (first 6): "
                     f"{new_optimizer._muon_param_names[:6]}"
                 )
-            elif optimizer_name == "MuonH":
+            elif optimizer_name == _MUONH_OPTIMIZER_NAME:
                 # Exact Grug production recipe. This is deliberately separate
                 # from the generic "Muon" ablation above.
                 ep_size = int(self.fsdp_config.get("expert_model_parallel_size", 1))

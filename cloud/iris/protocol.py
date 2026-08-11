@@ -11,8 +11,15 @@ from cloud.iris.runtime_environment import RuntimeProfile
 
 class AttemptState(StrEnum):
     PREPARED = "prepared"
+    SUBMITTED = "submitted"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+class LaunchMode(StrEnum):
+    PREPARE = "prepare"
+    DETACH = "detach"
+    WAIT = "wait"
 
 
 @dataclass(frozen=True)
@@ -115,7 +122,7 @@ class SkyRLModel:
 
 
 @dataclass(frozen=True)
-class SkyRLTerminalResponse:
+class SkyRLLaunchResponse:
     run_id: str
     attempt_id: str
     state: AttemptState

@@ -20,13 +20,14 @@ from cloud.iris.protocol import (  # noqa: E402
     AttemptState,
     DataLocator,
     IrisLaunchOptions,
+    LaunchMode,
     ModelLocator,
     RuntimeIdentity,
+    SkyRLLaunchResponse,
     SkyRLLaunchRequest,
     SkyRLJobSpec,
     SkyRLOutputPaths,
     SkyRLRolePlan,
-    SkyRLTerminalResponse,
     SkyRLTopology,
 )
 from cloud.iris.iris_backend import IrisLaunchOutcome, create_parser, job_launch_argv  # noqa: E402
@@ -40,13 +41,21 @@ from iris.rpc import job_pb2  # noqa: E402
 @dataclass(frozen=True)
 class FakeLaunchBackend(JobBackend):
     outcome: IrisLaunchOutcome
+    expected_mode: LaunchMode = LaunchMode.WAIT
 
     def validate(self, spec: SkyRLJobSpec, config_path: str) -> None:
         assert spec.request.config_yaml
         assert Path(config_path).is_file()
 
-    def launch(self, spec: SkyRLJobSpec, config_path: str) -> IrisLaunchOutcome:
+    def launch(
+        self,
+        spec: SkyRLJobSpec,
+        config_path: str,
+        *,
+        mode: LaunchMode = LaunchMode.WAIT,
+    ) -> IrisLaunchOutcome:
         self.validate(spec, config_path)
+        assert mode is self.expected_mode
         return self.outcome
 
 
@@ -58,8 +67,15 @@ class FailedLaunchBackend(JobBackend):
         assert spec.request.config_yaml
         assert Path(config_path).is_file()
 
-    def launch(self, spec: SkyRLJobSpec, config_path: str) -> IrisLaunchOutcome:
+    def launch(
+        self,
+        spec: SkyRLJobSpec,
+        config_path: str,
+        *,
+        mode: LaunchMode = LaunchMode.WAIT,
+    ) -> IrisLaunchOutcome:
         self.validate(spec, config_path)
+        assert mode is LaunchMode.WAIT
         raise self.error
 
 
@@ -238,6 +254,26 @@ def test_execute_job_commits_validated_terminal_model(tmp_path: Path) -> None:
     assert json.loads(attempt.read_text()) == terminal
 
 
+def test_execute_job_detaches_without_validating_terminal_artifacts(tmp_path: Path) -> None:
+    envelope = _spec(tmp_path)
+    backend = FakeLaunchBackend(
+        IrisLaunchOutcome(
+            job_id="/power/iceball-test",
+            job_state="submitted",
+            exit_code=0,
+        ),
+        expected_mode=LaunchMode.DETACH,
+    )
+
+    response = execute_job(envelope, backend=backend, mode=LaunchMode.DETACH)
+
+    assert response.state == AttemptState.SUBMITTED
+    assert response.iris_job_id == "/power/iceball-test"
+    assert response.model is None
+    assert not Path(envelope.request.output.terminal_manifest_uri.removeprefix("file://")).exists()
+    assert not Path(envelope.request.output.attempts_root.removeprefix("file://")).exists()
+
+
 def test_launcher_argv_includes_staged_data_role_plan_and_seed(tmp_path: Path) -> None:
     envelope = _spec(tmp_path)
 
@@ -265,6 +301,12 @@ def test_launcher_argv_satisfies_standalone_required_options(tmp_path: Path) -> 
     assert args.memory == "800GB"
     assert args.disk == "4TB"
     assert args.wandb_entity == "marin-community"
+
+
+def test_launcher_argv_forwards_detached_submission(tmp_path: Path) -> None:
+    args = create_parser().parse_args(job_launch_argv(_spec(tmp_path), "config.yaml", mode=LaunchMode.DETACH))
+
+    assert args.no_wait
 
 
 def test_launcher_rejects_data_entry_outside_staged_source_root(tmp_path: Path) -> None:
@@ -325,7 +367,7 @@ def test_execute_job_rejects_overwriting_terminal_manifest(tmp_path: Path) -> No
     terminal.write_text("{}")
 
     with pytest.raises(ValueError, match="immutable and already exists"):
-        execute_job(envelope, dry_run=True)
+        execute_job(envelope, mode=LaunchMode.PREPARE)
 
 
 def test_materialize_model_export_copies_and_validates_hf_directory(tmp_path: Path) -> None:
@@ -457,20 +499,36 @@ def test_runtime_bundle_rejects_uncommitted_runtime_bytes(runtime_checkout: tupl
         runtime_bundle.build_runtime_bundle(commit)
 
 
-def test_cli_reserves_stdout_for_terminal_json(tmp_path: Path, monkeypatch, capsys) -> None:
+@pytest.mark.parametrize(
+    ("launch_flag", "expected_mode", "state", "iris_job_id", "iris_job_state"),
+    [
+        ("--dry-run", LaunchMode.PREPARE, AttemptState.PREPARED, None, None),
+        ("--no-wait", LaunchMode.DETACH, AttemptState.SUBMITTED, "/power/iceball-test", "submitted"),
+    ],
+)
+def test_cli_reports_launch_state_as_json(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    launch_flag: str,
+    expected_mode: LaunchMode,
+    state: AttemptState,
+    iris_job_id: str | None,
+    iris_job_state: str | None,
+) -> None:
     envelope = _spec(tmp_path)
     request_path = tmp_path / "request.json"
     request_path.write_text(json.dumps(asdict(envelope)))
 
-    def fake_launch(_spec: SkyRLJobSpec, *, dry_run: bool) -> SkyRLTerminalResponse:
-        assert dry_run
+    def fake_launch(_spec: SkyRLJobSpec, *, mode: LaunchMode) -> SkyRLLaunchResponse:
+        assert mode is expected_mode
         print("human launcher log")
-        return SkyRLTerminalResponse(
+        return SkyRLLaunchResponse(
             run_id=envelope.request.run_id,
             attempt_id=envelope.request.attempt_id,
-            state=AttemptState.PREPARED,
-            iris_job_id=None,
-            iris_job_state=None,
+            state=state,
+            iris_job_id=iris_job_id,
+            iris_job_state=iris_job_state,
             runtime=envelope.request.runtime,
             model=None,
             failure=None,
@@ -478,11 +536,20 @@ def test_cli_reserves_stdout_for_terminal_json(tmp_path: Path, monkeypatch, caps
 
     monkeypatch.setattr(job, "execute_job", fake_launch)
 
-    exit_code = job.main(["iris", "launch", "--request", str(request_path), "--dry-run"])
+    exit_code = job.main(["iris", "launch", "--request", str(request_path), launch_flag])
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert json.loads(captured.out)["state"] == "prepared"
+    assert json.loads(captured.out) == {
+        "attempt_id": "attempt-1",
+        "failure": None,
+        "iris_job_id": iris_job_id,
+        "iris_job_state": iris_job_state,
+        "model": None,
+        "run_id": "iceball-test",
+        "runtime": {"commit": envelope.request.runtime.commit, "profile": "fsdp"},
+        "state": state,
+    }
     assert "human launcher log" in captured.err
 
 

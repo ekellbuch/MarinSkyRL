@@ -14,11 +14,16 @@ import tempfile
 from contextlib import contextmanager
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Protocol
 
 import fsspec
 from loguru import logger
 from marinskyrl.resource_locator import is_cloud_uri
 from .s3fs import get_s3_fs, s3_refresh_if_expiring, call_with_s3_retry
+
+
+class DirectoryPublisher(Protocol):
+    def __call__(self, local_path: str, cloud_path: str) -> None: ...
 
 
 def is_cloud_path(path: str) -> bool:
@@ -117,17 +122,26 @@ def remove(path: str) -> None:
         fs.rm(path)
 
 
-def upload_directory(local_path: str, cloud_path: str) -> None:
-    """Upload a local directory to cloud storage."""
+def _upload(local_path: str, cloud_path: str, *, recursive: bool) -> None:
     if not is_cloud_path(cloud_path):
         raise ValueError(f"Destination must be a cloud path, got: {cloud_path}")
-
-    fs = _get_filesystem(cloud_path)
-    source_path = local_path.rstrip("/") + "/"
-    if cloud_path.startswith("s3://"):
-        call_with_s3_retry(fs, fs.put, source_path, fs._strip_protocol(cloud_path), recursive=True)
+    filesystem = _get_filesystem(cloud_path)
+    is_s3_path = cloud_path.startswith("s3://")
+    destination = filesystem._strip_protocol(cloud_path) if is_s3_path else cloud_path
+    if is_s3_path:
+        call_with_s3_retry(filesystem, filesystem.put, local_path, destination, recursive=recursive)
     else:
-        fs.put(source_path, cloud_path, recursive=True)
+        filesystem.put(local_path, destination, recursive=recursive)
+
+
+def upload_file(local_path: str, cloud_path: str) -> None:
+    """Upload one local file to cloud storage."""
+    _upload(local_path, cloud_path, recursive=False)
+
+
+def upload_directory(local_path: str, cloud_path: str) -> None:
+    """Upload a local directory to cloud storage."""
+    _upload(local_path.rstrip("/") + "/", cloud_path, recursive=True)
     logger.info(f"Uploaded {local_path} to {cloud_path}")
 
 
@@ -195,37 +209,26 @@ def local_read_files(input_paths: Sequence[str]):
 
 
 @contextmanager
-def local_work_dir(output_path: str):
-    """
-    Context manager that provides a local working directory.
-
-    For local paths, returns the path directly.
-    For cloud paths, creates a temporary directory and uploads content at the end.
-
-    Args:
-        output_path: The final destination path (local or cloud)
-
-    Yields:
-        str: Local directory path to work with
-
-    Example:
-        with local_work_dir("s3://bucket/model") as work_dir:
-            # Save files to work_dir
-            model.save_pretrained(work_dir)
-            # Files are automatically uploaded to s3://bucket/model at context exit
-    """
+def local_output_dir(
+    output_path: str,
+    publisher: DirectoryPublisher,
+):
+    """Yield ``output_path`` locally, or temporary staging that publishes cloud output on success."""
     if is_cloud_path(output_path):
         with tempfile.TemporaryDirectory() as temp_dir:
-            try:
-                yield temp_dir
-            finally:
-                # Upload everything from temp_dir to cloud path
-                upload_directory(temp_dir, output_path)
-                logger.info(f"Uploaded directory contents to {output_path}")
-    else:
-        # For local paths, ensure directory exists and use it directly
-        makedirs(output_path, exist_ok=True)
-        yield output_path
+            yield temp_dir
+            publisher(temp_dir, output_path)
+        return
+
+    makedirs(output_path, exist_ok=True)
+    yield output_path
+
+
+@contextmanager
+def local_work_dir(output_path: str):
+    """Yield direct local output or cloud staging that uploads on success."""
+    with local_output_dir(output_path, upload_directory) as work_dir:
+        yield work_dir
 
 
 @contextmanager

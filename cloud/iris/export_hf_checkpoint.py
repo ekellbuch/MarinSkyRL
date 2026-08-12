@@ -35,7 +35,9 @@ from pathlib import Path
 
 from cloud.iris.model_paths import model_source_cli_args
 from cloud.iris.runtime_environment import CHECKPOINT_EXPORT_ENTRYPOINT
+from marinskyrl.checkpoint_paths import GLOBAL_STEP_PREFIX, policy_export_path
 from marinskyrl.resource_locator import ModelLocatorError
+from skyrl_train import hf_model_io
 from skyrl_train.hf_export import read_hf_export_request, write_hf_export_request
 from skyrl_train.hf_export_schema import (
     DEFAULT_HF_EXPORT_TIMEOUT,
@@ -45,7 +47,6 @@ from skyrl_train.hf_export_schema import (
     HFExportStatus,
     HFUploadMode,
 )
-from skyrl_train.utils.trainer_utils import GLOBAL_STEP_PREFIX
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -223,25 +224,30 @@ def manual_spec(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Ex
     return operational_spec(args, request, no_wait=args.no_wait)
 
 
-def submit_export(spec: ExportJobSpec, request: HFExportRequest | None, command: list[str]) -> int:
-    """Submit one export job and persist its request lifecycle state."""
-    if request is not None:
-        request = request.with_status(
-            HFExportStatus.IN_PROGRESS,
-            timeout=spec.timeout,
-            increment_attempts=True,
-        )
-        write_hf_export_request(request)
-
+def _run_export(spec: ExportJobSpec, command: list[str]) -> None:
     print(
         f"[export-hf] geometry {spec.request.num_nodes}x{spec.request.gpus_per_node} GPU — this MUST match "
         f"the training geometry or the sharded load will not resolve"
     )
     exit_code = subprocess.call(command, cwd=str(_REPO_ROOT))
-    if request is not None:
-        status = HFExportStatus.COMPLETE if exit_code == 0 else HFExportStatus.PENDING
-        write_hf_export_request(request.with_status(status, last_exit_code=exit_code))
-    return exit_code
+    if exit_code != 0:
+        raise subprocess.CalledProcessError(exit_code, command)
+    if not spec.no_wait:
+        export_path = policy_export_path(spec.request.export_path, spec.request.step)
+        hf_model_io.verify_hf_model_export(export_path)
+
+
+def submit_requested_export(spec: ExportJobSpec, command: list[str]) -> None:
+    """Submit one export job, verify synchronous output, and persist request state."""
+    request = spec.request.with_status(HFExportStatus.IN_PROGRESS, timeout=spec.timeout, increment_attempts=True)
+    write_hf_export_request(request)
+    try:
+        _run_export(spec, command)
+    except BaseException as error:
+        exit_code = error.returncode if isinstance(error, subprocess.CalledProcessError) else 1
+        write_hf_export_request(request.with_status(HFExportStatus.PENDING, last_exit_code=exit_code))
+        raise
+    write_hf_export_request(request.with_status(HFExportStatus.COMPLETE, last_exit_code=0))
 
 
 def main() -> None:
@@ -266,7 +272,10 @@ def main() -> None:
     print("[export-hf]", " ".join(cmd))
     if args.dry_run:
         return
-    raise SystemExit(submit_export(spec, request, cmd))
+    if request is None:
+        _run_export(spec, cmd)
+    else:
+        submit_requested_export(spec, cmd)
 
 
 if __name__ == "__main__":

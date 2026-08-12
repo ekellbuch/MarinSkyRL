@@ -1,5 +1,6 @@
 import os
 import random
+import tempfile
 from datetime import timedelta
 from typing import List, Union, Optional
 from jaxtyping import Float
@@ -38,6 +39,8 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 from transformers import PreTrainedTokenizer
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
+from skyrl_train import hf_model_io
 
 
 # Optimizer checkpoint format and gather transport.
@@ -319,8 +322,10 @@ class MegatronStrategy(DistributedStrategy):
             io.makedirs(output_dir, exist_ok=True)
         dist.barrier()
 
-        # All ranks call into bridge.
-        with io.local_work_dir(output_dir) as work_dir:
+        # Every rank exhausts Bridge's collective conversion; only cloud non-writers discard their local files.
+        rank_writes_output = self.is_rank_0() or not io.is_cloud_path(output_dir)
+        model_dir = hf_model_io.local_hf_model_dir(output_dir) if rank_writes_output else tempfile.TemporaryDirectory()
+        with model_dir as work_dir:
             bridge.save_hf_weights(model.actor_module, work_dir)
             self.print(f"Successfully saved HF safetensors model to {output_dir}")
 

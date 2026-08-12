@@ -2,6 +2,7 @@
 Unit tests for cloud storage I/O utilities.
 """
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -9,7 +10,7 @@ import pytest
 from unittest.mock import patch, Mock
 import torch
 
-
+from skyrl_train.hf_model_io import local_hf_model_dir
 from skyrl_train.utils.io.io import (
     is_cloud_path,
     makedirs,
@@ -403,6 +404,86 @@ class TestContextManagers:
 
         with local_read_dir("s3://bucket/checkpoints/global_step_12/policy") as read_dir:
             assert (Path(read_dir) / ".metadata").is_file()
+
+
+class FakeHFCloudFilesystem:
+    def __init__(self, *, objects=None, upload_error=None):
+        self.objects = objects or {}
+        self.upload_error = upload_error
+        self.uploads = []
+
+    def _strip_protocol(self, path):
+        return path.removeprefix("s3://")
+
+    def exists(self, path):
+        if not is_cloud_path(path):
+            return Path(path).exists()
+        return self._strip_protocol(path) in self.objects
+
+    def isdir(self, path):
+        return False
+
+    def rm(self, path):
+        self.objects.pop(self._strip_protocol(path))
+
+    def put(self, source, destination, recursive):
+        if self.upload_error is not None:
+            raise self.upload_error
+        assert not recursive
+        self.uploads.append(destination)
+
+
+def test_cloud_hf_model_publication_writes_index_after_weight_shards(monkeypatch):
+    filesystem = FakeHFCloudFilesystem()
+    monkeypatch.setattr("skyrl_train.utils.io.io._get_filesystem", lambda path: filesystem)
+
+    with local_hf_model_dir("s3://bucket/export/policy") as work_dir:
+        Path(work_dir, "config.json").write_text("{}")
+        Path(work_dir, "model-00002-of-00002.safetensors").write_bytes(b"second")
+        Path(work_dir, "model-00001-of-00002.safetensors").write_bytes(b"first")
+        Path(work_dir, "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "layer.0.weight": "model-00001-of-00002.safetensors",
+                        "layer.1.weight": "model-00002-of-00002.safetensors",
+                    }
+                }
+            )
+        )
+
+    assert filesystem.uploads == [
+        "bucket/export/policy/model-00001-of-00002.safetensors",
+        "bucket/export/policy/model-00002-of-00002.safetensors",
+        "bucket/export/policy/config.json",
+        "bucket/export/policy/model.safetensors.index.json",
+    ]
+
+
+def test_non_s3_hf_model_publication_preserves_destination_scheme(monkeypatch):
+    filesystem = FakeHFCloudFilesystem()
+    monkeypatch.setattr("skyrl_train.utils.io.io._get_filesystem", lambda path: filesystem)
+
+    with local_hf_model_dir("gs://bucket/export/policy") as work_dir:
+        Path(work_dir, "model.safetensors").write_bytes(b"weights")
+
+    assert filesystem.uploads == ["gs://bucket/export/policy/model.safetensors"]
+
+
+def test_interrupted_cloud_hf_model_publication_removes_stale_index(monkeypatch):
+    index_key = "bucket/export/policy/model.safetensors.index.json"
+    filesystem = FakeHFCloudFilesystem(
+        objects={index_key: b"stale index"},
+        upload_error=OSError("interrupted upload"),
+    )
+    monkeypatch.setattr("skyrl_train.utils.io.io._get_filesystem", lambda path: filesystem)
+
+    with pytest.raises(OSError, match="interrupted upload"):
+        with local_hf_model_dir("s3://bucket/export/policy") as work_dir:
+            Path(work_dir, "model.safetensors").write_bytes(b"weights")
+            Path(work_dir, "model.safetensors.index.json").write_text('{"weight_map": {"x": "model.safetensors"}}')
+
+    assert index_key not in filesystem.objects
 
 
 class TestUploadDownload:

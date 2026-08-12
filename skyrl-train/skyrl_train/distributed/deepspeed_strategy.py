@@ -27,6 +27,8 @@ from skyrl_train.utils.io import io
 
 from safetensors.torch import save_file
 
+from skyrl_train import hf_model_io
+
 
 def _z3_params_to_fetch(param_list):
     return [p for p in param_list if hasattr(p, "ds_id") and p.ds_status == ZeroParamStatus.NOT_AVAILABLE]
@@ -319,9 +321,8 @@ class DeepspeedStrategy(DistributedStrategy):
             if getattr(unwrapped_model.config, "tie_word_embeddings", False) and "lm_head.weight" in full_state_dict:
                 full_state_dict.pop("lm_head.weight", None)
 
-            # Only rank 0 writes; use io.local_work_dir for local→remote sync
-            with io.local_work_dir(output_dir) as work_dir:
-                save_file(full_state_dict, os.path.join(work_dir, "model.safetensors"))
+            with hf_model_io.local_hf_model_dir(output_dir) as work_dir:
+                save_file(full_state_dict, os.path.join(work_dir, hf_model_io.HF_WEIGHT_FILENAME))
                 unwrapped_model.config.save_pretrained(work_dir)
                 if tokenizer is not None:
                     tokenizer.save_pretrained(work_dir)

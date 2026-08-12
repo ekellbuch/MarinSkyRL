@@ -1,4 +1,4 @@
-"""Artifact storage, materialization, and model validation."""
+"""Artifact storage and materialization."""
 
 from __future__ import annotations
 
@@ -46,11 +46,6 @@ def fs_and_path(uri: str) -> tuple[AbstractFileSystem, str]:
         storage_options = {"config_kwargs": {"s3": {"addressing_style": style}}}
     filesystem, _, paths = fsspec.get_fs_token_paths(uri, storage_options=storage_options)
     return filesystem, paths[0]
-
-
-def policy_export_uri(export_root: str, global_step: int) -> str:
-    """Return the trainer-owned Hugging Face policy export location."""
-    return f"{export_root.rstrip('/')}/global_step_{global_step}/policy"
 
 
 def relative_object_key(root: str, path: str) -> str:
@@ -166,13 +161,3 @@ def materialize(
         if backup is not None and backup.exists():
             shutil.rmtree(backup)
     return MaterializedArtifact(source=source, files=inventory)
-
-
-def validate_hf_export(names: set[str], source: str) -> None:
-    """Validate the minimum portable Hugging Face model export contract."""
-    if "config.json" not in names:
-        raise ValueError(f"Model export is missing config.json: {source}")
-    if not any(name.endswith((".safetensors", ".bin")) for name in names):
-        raise ValueError(f"Model export has no weight shards: {source}")
-    if not any(name.startswith("tokenizer") or name.endswith(".model") for name in names):
-        raise ValueError(f"Model export has no tokenizer files: {source}")

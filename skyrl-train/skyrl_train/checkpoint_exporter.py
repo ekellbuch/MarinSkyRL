@@ -12,11 +12,12 @@ from omegaconf import DictConfig
 from ray.util.placement_group import PlacementGroup, placement_group, remove_placement_group
 from transformers import PreTrainedTokenizerBase
 
+from marinskyrl.checkpoint_paths import POLICY_CHECKPOINT_SUBDIRECTORY, policy_export_path
+from skyrl_train import hf_model_io
 from skyrl_train.hf_export_schema import (
     DEFAULT_HF_HUB_REVISION,
     DEFAULT_HF_UPLOAD_MODE,
     HFUploadMode,
-    POLICY_CHECKPOINT_SUBDIRECTORY,
     TRAINER_STATE_FILENAME,
 )
 from skyrl_train.hf_publisher import HuggingFacePublisher
@@ -24,7 +25,6 @@ from skyrl_train.tokenizer import create_tokenizer
 from skyrl_train.utils import get_ray_pg_ready_with_timeout
 from skyrl_train.utils.constants import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl_train.utils.io import io
-from skyrl_train.utils.trainer_utils import GLOBAL_STEP_PREFIX
 from skyrl_train.utils.utils import (
     policy_force_cvd_mask_enabled,
     policy_per_gpu_bundles_enabled,
@@ -48,7 +48,7 @@ class CheckpointExportPlan:
 
     @property
     def policy_export_path(self) -> str:
-        return os.path.join(self.export_root, f"{GLOBAL_STEP_PREFIX}{self.step}", POLICY_CHECKPOINT_SUBDIRECTORY)
+        return policy_export_path(self.export_root, self.step)
 
 
 @dataclass(frozen=True)
@@ -144,8 +144,7 @@ class CheckpointExporter:
             self._workers.initialize(self._plan.model_path)
             self._workers.load_model_checkpoint(self._plan.policy_checkpoint_path)
             self._workers.save_hf_model(self._plan.policy_export_path, self._tokenizer)
-            if not io.exists(self._plan.policy_export_path):
-                raise RuntimeError(f"checkpoint conversion produced no model at {self._plan.policy_export_path}")
+            hf_model_io.verify_hf_model_export(self._plan.policy_export_path)
             if self._publisher is not None:
                 self._publisher.publish(self._plan.policy_export_path, self._plan.step)
             return CheckpointExportResult(step=self._plan.step, export_path=self._plan.policy_export_path)

@@ -382,6 +382,7 @@ def init_inference_engines(
         enable_prefix_caching=True,
         enforce_eager=True,
         shared_pg=pg,
+        engine_init_timeout_seconds=cfg.generator.engine_init_timeout_seconds,
         gpu_memory_utilization=gpu_memory_utilization,
         inference_engine_enable_sleep=sleep,
         async_engine=async_engine,

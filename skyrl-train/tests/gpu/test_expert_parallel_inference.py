@@ -108,6 +108,7 @@ def init_ray_inference_engines(
         vllm_v1_disable_multiproc=True,
         enable_prefix_caching=True,
         enforce_eager=True,
+        engine_init_timeout_seconds=config.generator.engine_init_timeout_seconds,
         shared_pg=shared_pg,
         gpu_memory_utilization=config.generator.gpu_memory_utilization,
         # Colocated runs sleep the engine to free GPU for the trainer (prod derives

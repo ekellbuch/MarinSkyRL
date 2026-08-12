@@ -18,6 +18,14 @@ from skyrl_train.inference_engines.base import (
 from skyrl_train.inference_engines.utils import get_rendezvous_addr_port
 from skyrl_train.models.grug_moe import GRUG_MOE_ARCHITECTURE, GRUG_MOE_MODEL_TYPE
 from skyrl_train.env_vars import EnvVarScope, managed_environment_names
+from skyrl_train.utils import (
+    get_all_env_variables,
+    get_ray_pg_ready_with_timeout,
+    ray_noset_visible_devices,
+)
+from skyrl_train.utils.constants import SKYRL_RAY_PG_TIMEOUT_IN_S
+from skyrl_train.utils.utils import use_per_engine_strict_pack_pg
+from skyrl_train.inference_engines.placement import colocated_engine_bundle_layout
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +233,7 @@ def create_ray_wrapped_inference_engines(
     vllm_v1_disable_multiproc: bool,
     enable_prefix_caching: bool,
     enforce_eager: bool,
+    engine_init_timeout_seconds: float,
     expert_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
     data_parallel_size: int = 1,
@@ -264,10 +273,6 @@ def create_ray_wrapped_inference_engines(
         non-colocated engines (each engine owns its own GPUs); colocated/hybrid engines
         still require the ray backend for shared-GPU resource management.
     """
-    from skyrl_train.utils import ray_noset_visible_devices, get_all_env_variables, get_ray_pg_ready_with_timeout
-    from skyrl_train.utils.utils import use_per_engine_strict_pack_pg
-    from skyrl_train.utils.constants import SKYRL_RAY_PG_TIMEOUT_IN_S
-
     if backend == "vllm":
         import vllm
         from skyrl_train.inference_engines.vllm.vllm_engine import VLLMRayActor, AsyncVLLMRayActor
@@ -300,6 +305,12 @@ def create_ray_wrapped_inference_engines(
     noset_visible_devices = ray_noset_visible_devices(ray.get(get_all_env_variables.remote()))
     use_hybrid_engine = shared_pg is not None
     tp_pp_size = tensor_parallel_size * pipeline_parallel_size
+    colocated_engine_bundles = colocated_engine_bundle_layout(
+        shared_pg,
+        num_inference_engines=num_inference_engines,
+        data_parallel_size=data_parallel_size,
+        tensor_pipeline_size=tp_pp_size,
+    )
     # NOTE: we use the ray backend for tensor parallel size > 1 or pipeline parallel size > 1 to explicitly manage resource allocation
     # mp_backend (opt-in) lets a NON-colocated multi-GPU engine use vLLM's `mp` executor
     # instead, which avoids the Ray Compiled-DAG deadlock on the Qwen3-Next R3 capture path.
@@ -439,8 +450,8 @@ def create_ray_wrapped_inference_engines(
     for i in range(num_inference_engines):
         # Per-engine STRICT_PACK PGs (ray/uni, multi-GPU engines) are engine-LOCAL: each
         # has its own bundle index space 0..per_engine_gpu_count-1, so base_pg_index
-        # resets to 0. The mp PACK PG, the TP==PP==1 flat PACK PG, and the hybrid/sglang
-        # flat PG remain GLOBAL, so they keep the i*per_engine_gpu_count offset.
+        # resets to 0. The mp PACK PG and TP==PP==1 flat PACK PG remain global.
+        # Hybrid engines use colocated_engine_bundles for node-ordered indices.
         use_per_engine_pg = bool(per_engine_pgs)
         if use_per_engine_pg:
             engine_pg = per_engine_pgs[i]
@@ -453,7 +464,10 @@ def create_ray_wrapped_inference_engines(
         # The mp PACK PG has one {GPU: tp_pp_size} bundle per (engine, DP-rank), so the
         # rendezvous bundle for engine i's DP-rank-0 is at i*data_parallel_size (not the
         # per-GPU base_pg_index, which would index past the smaller mp bundle list).
-        rendezvous_pg_index = (i * data_parallel_size) if use_mp_backend else base_pg_index
+        if use_hybrid_engine:
+            rendezvous_pg_index = colocated_engine_bundles[i * data_parallel_size][0]
+        else:
+            rendezvous_pg_index = (i * data_parallel_size) if use_mp_backend else base_pg_index
         data_parallel_address, data_parallel_rpc_port = get_rendezvous_addr_port(
             engine_pg, rendezvous_pg_index, allocated_rendezvous_ports
         )
@@ -488,7 +502,7 @@ def create_ray_wrapped_inference_engines(
 
             # Launch one actor per DP rank
             for dp_rank in range(data_parallel_size):
-                # Contiguous TP*PP slice reserved for a single DP rank.
+                # TP*PP slice reserved for a single DP rank.
                 base_dp_pg_index = base_pg_index + dp_rank * tp_pp_size
                 dp_rank_bundles = (
                     list(range(base_dp_pg_index, base_dp_pg_index + tp_pp_size)) if tp_pp_size > 1 else None
@@ -508,6 +522,9 @@ def create_ray_wrapped_inference_engines(
                         placement_group_bundle_index=i * data_parallel_size + dp_rank,
                     )
                 else:
+                    if use_hybrid_engine:
+                        dp_rank_bundles = colocated_engine_bundles[i * data_parallel_size + dp_rank]
+                        base_dp_pg_index = dp_rank_bundles[0]
                     dp_rank_sched = PlacementGroupSchedulingStrategy(
                         placement_group=engine_pg,
                         placement_group_capture_child_tasks=True,
@@ -608,7 +625,11 @@ def create_ray_wrapped_inference_engines(
             sglang_base_index = 0 if use_per_engine_pg else i * per_engine_gpu_count
             bundle_indices = None
             if per_engine_gpu_count > 1:
-                bundle_indices = list(range(sglang_base_index, sglang_base_index + per_engine_gpu_count))
+                if use_hybrid_engine:
+                    bundle_indices = colocated_engine_bundles[i * data_parallel_size]
+                    sglang_base_index = bundle_indices[0]
+                else:
+                    bundle_indices = list(range(sglang_base_index, sglang_base_index + per_engine_gpu_count))
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=engine_pg,
@@ -672,7 +693,7 @@ def create_ray_wrapped_inference_engines(
     # Readiness gate (DISAGGREGATED-mode init-deadlock fix): block until every engine
     # actor has finished loading its model (weights + CUDA-graph capture) BEFORE the
     # trainer opens the weight-sync NCCL group in init_weight_sync_state. In COLOCATED
-    # mode the sleep barrier below (ray.get(sleep_refs)) already forces this wait; in
+    # mode the bounded sleep barrier below already forces this wait; in
     # DISAGGREGATED mode (inference_engine_enable_sleep=False) nothing otherwise waits,
     # so a slow-loading engine (e.g. Qwen3.6-35B-A3B MoE) is still inside __init__ when
     # the policy ranks post the default-group barrier (worker.py) -> the barrier ALLREDUCE
@@ -683,8 +704,9 @@ def create_ray_wrapped_inference_engines(
     # up (model fully loaded) -> closes the race for any model size / load time. It is a
     # read-only probe (returns hostnames), no side effects. vLLM-only (collective_rpc);
     # the colocated sleep barrier still covers the sglang/colocated paths unchanged.
+    startup_refs = []
     if not inference_engine_enable_sleep and backend == "vllm":
-        ray.get([engine.inference_engine_actor.report_engine_hosts.remote() for engine in engines])
+        startup_refs = [engine.inference_engine_actor.report_engine_hosts.remote() for engine in engines]
 
     if inference_engine_enable_sleep:
         if backend == "vllm":
@@ -695,6 +717,38 @@ def create_ray_wrapped_inference_engines(
             # NOTE(Charlie): we always need to sync weights after waking up: https://github.com/sgl-project/sglang/issues/7939
             assert sleep_level == 2, "SGLang always discards weights, so sleep_level is not applicable."
             sleep_refs = [engine.inference_engine_actor.sleep.remote() for engine in engines]
-        ray.get(sleep_refs)
+        startup_refs = sleep_refs
+
+    if startup_refs:
+        wait_for_inference_engine_startup(
+            startup_refs,
+            [engine.inference_engine_actor for engine in engines],
+            timeout_seconds=engine_init_timeout_seconds,
+        )
 
     return engines
+
+
+def wait_for_inference_engine_startup(
+    startup_refs: list[ray.ObjectRef], actor_handles: list[ActorHandle], *, timeout_seconds: float
+) -> None:
+    """Wait for every engine readiness reference or terminate the actor gang."""
+
+    _, pending = ray.wait(startup_refs, num_returns=len(startup_refs), timeout=timeout_seconds, fetch_local=False)
+    if not pending:
+        try:
+            ray.get(startup_refs)
+        except Exception:
+            for actor in actor_handles:
+                ray.kill(actor)
+            raise
+        return
+
+    pending_set = set(pending)
+    pending_indices = [index for index, ref in enumerate(startup_refs) if ref in pending_set]
+    for actor in actor_handles:
+        ray.kill(actor)
+    raise TimeoutError(
+        f"inference engine startup timed out after {timeout_seconds:g} seconds; "
+        f"pending engine actors: {pending_indices}"
+    )

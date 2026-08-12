@@ -37,6 +37,7 @@ from .algorithm_registry import AdvantageEstimatorRegistry, PolicyLossRegistry, 
 from .logging_utils import format_exception_text
 from .loss_reduction import SUPPORTED_LOSS_REDUCTIONS
 from .nccl_environment import worker_nccl_environment
+from .placement_geometry import validate_colocated_engine_geometry
 
 MOE_ROUTER_REPLAY_STRATEGIES = frozenset({"fsdp", "fsdp2"})
 
@@ -687,6 +688,11 @@ def validate_cfg(cfg: DictConfig):
 
     # Validate placement
     if cfg.trainer.placement.colocate_all:
+        tp_pp_size = (
+            cfg.generator.inference_engine_tensor_parallel_size * cfg.generator.inference_engine_pipeline_parallel_size
+        )
+        gpus_per_node = cfg.trainer.placement.policy_num_gpus_per_node
+        validate_colocated_engine_geometry(tensor_pipeline_size=tp_pp_size, gpus_per_node=gpus_per_node)
         num_policy_gpus = cfg.trainer.placement.policy_num_gpus_per_node * cfg.trainer.placement.policy_num_nodes
         num_rollout_gpus = (
             cfg.generator.num_inference_engines
@@ -697,6 +703,7 @@ def validate_cfg(cfg: DictConfig):
         assert num_policy_gpus == num_rollout_gpus, (
             f"num_policy_gpus ({num_policy_gpus}) and num_rollout_gpus ({num_rollout_gpus}) must be the same when colocating all models"
         )
+
     else:
         use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
         if cfg.trainer.placement.colocate_policy_ref and use_ref_model:
@@ -706,6 +713,9 @@ def validate_cfg(cfg: DictConfig):
             assert cfg.trainer.placement.policy_num_gpus_per_node == cfg.trainer.placement.ref_num_gpus_per_node, (
                 f"policy_num_gpus_per_node ({cfg.trainer.placement.policy_num_gpus_per_node}) and ref_num_gpus_per_node ({cfg.trainer.placement.ref_num_gpus_per_node}) must be the same when colocate policy and ref model."
             )
+
+    if cfg.generator.engine_init_timeout_seconds <= 0:
+        raise ValueError("generator.engine_init_timeout_seconds must be greater than zero")
 
 
 def validate_generator_cfg(cfg: DictConfig):

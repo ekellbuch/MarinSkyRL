@@ -1,5 +1,4 @@
 import asyncio
-from types import MethodType
 
 import pytest
 
@@ -7,11 +6,12 @@ from skyrl_train.fully_async_trainer import (
     FullyAsyncRayPPOTrainer,
     GeneratedOutputGroup,
     _AsyncStalenessManager,
+    _GenerationQueues,
 )
 from skyrl_train.generators.base import TrajectoryID
 
 
-def _generated_group(uid: str, scheduled_step: int) -> GeneratedOutputGroup:
+def _generated_group(uid: str, earliest_model_step: int) -> GeneratedOutputGroup:
     generator_output = {
         "prompt_token_ids": [[1], [1]],
         "response_ids": [[2], [3]],
@@ -30,8 +30,28 @@ def _generated_group(uid: str, scheduled_step: int) -> GeneratedOutputGroup:
     return GeneratedOutputGroup(
         generator_output=generator_output,
         uid=uid,
-        global_step_when_scheduled=scheduled_step,
+        earliest_model_step=earliest_model_step,
+        source_prompts=[{"uid": uid}],
     )
+
+
+def _batch_assembly_state(mini_batch_size: int, accepted: int):
+    trainer = object.__new__(FullyAsyncRayPPOTrainer)
+    trainer.global_step = 10
+    trainer.max_staleness_steps = 2
+    trainer.mini_batch_size = mini_batch_size
+    trainer.all_metrics = {}
+    trainer._stale_groups_discarded_since_step = 0
+    trainer._groups_inspected_since_step = 0
+    trainer._staleness_manager = _AsyncStalenessManager(
+        max_concurrent_generation_groups=accepted,
+        mini_batch_size=mini_batch_size,
+        max_staleness_steps=2,
+    )
+    trainer._staleness_manager._stat.submitted = accepted
+    trainer._staleness_manager._stat.accepted = accepted
+    queues = _GenerationQueues(completed=asyncio.Queue(), retries=asyncio.Queue(), condition=asyncio.Condition())
+    return trainer, queues
 
 
 @pytest.mark.asyncio
@@ -54,20 +74,43 @@ async def test_staleness_manager_blocks_work_beyond_capacity_until_training_adva
     await manager.on_rollout_accepted()
 
 
-def test_stale_groups_do_not_reduce_training_batch_size():
-    trainer = object.__new__(FullyAsyncRayPPOTrainer)
-    trainer.global_step = 10
-    trainer.max_staleness_steps = 2
-    trainer.mini_batch_size = 64
-    trainer.all_metrics = {}
-    trainer.tokenizer = type("Tokenizer", (), {"decode": lambda self, tokens: str(tokens)})()
-    trainer.postprocess_generator_output = MethodType(lambda self, output, uids: output, trainer)
-    trainer.convert_to_training_input = MethodType(lambda self, output, uids: output, trainer)
+@pytest.mark.asyncio
+async def test_batch_assembly_retries_stale_groups_from_entire_buffer():
+    trainer, queues = _batch_assembly_state(mini_batch_size=2, accepted=4)
+    for group in [
+        _generated_group("stale-in-batch", earliest_model_step=7),
+        _generated_group("fresh-1", earliest_model_step=10),
+        _generated_group("fresh-2", earliest_model_step=9),
+        _generated_group("stale-beyond-batch", earliest_model_step=6),
+    ]:
+        queues.completed.put_nowait(group)
 
-    stale_groups = [_generated_group(f"stale-{index}", scheduled_step=7) for index in range(61)]
-    fresh_groups = [_generated_group(f"fresh-{index}", scheduled_step=10) for index in range(3)]
-    training_input = trainer.convert_generation_group_mini_batch_to_training_input(stale_groups + fresh_groups)
+    batch = await trainer._get_fresh_generation_group_mini_batch(queues)
 
-    assert len(training_input["response_ids"]) == 64 * 2
-    assert trainer.all_metrics["async/staleness_violation_count"] == 61
-    assert trainer.all_metrics["async/staleness_violation_rate"] == 61 / 64
+    assert [group.uid for group in batch] == ["fresh-1", "fresh-2"]
+    assert queues.completed.empty()
+    assert [queues.retries.get_nowait()[0]["uid"] for _ in range(2)] == [
+        "stale-in-batch",
+        "stale-beyond-batch",
+    ]
+    assert trainer.all_metrics["async/discarded_count"] == 2
+    assert trainer.all_metrics["async/discard_rate"] == 0.5
+    assert trainer._staleness_manager._stat.accepted == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_assembly_waits_for_fresh_replacement():
+    trainer, queues = _batch_assembly_state(mini_batch_size=1, accepted=1)
+    queues.completed.put_nowait(_generated_group("retry-me", earliest_model_step=7))
+
+    pending_batch = asyncio.create_task(trainer._get_fresh_generation_group_mini_batch(queues))
+    done, _ = await asyncio.wait({pending_batch}, timeout=0)
+    assert pending_batch not in done
+    assert queues.retries.get_nowait()[0]["uid"] == "retry-me"
+
+    async with queues.condition:
+        queues.completed.put_nowait(_generated_group("retry-me", earliest_model_step=10))
+        queues.condition.notify_all()
+    batch = await asyncio.wait_for(pending_batch, timeout=1)
+
+    assert [group.uid for group in batch] == ["retry-me"]

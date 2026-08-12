@@ -18,22 +18,27 @@ Supports two configuration styles:
    ```
 """
 
+import asyncio
+import dataclasses
 import os
 from typing import Any, Dict, List, Optional, Type
 
 from loguru import logger
 from omegaconf import DictConfig
+import torch
 
 from skyrl_train.config.callbacks import has_explicit_callbacks
+from skyrl_train.async_rollout_state import GeneratedOutputGroup, GenerationBufferState, GenerationQueuesProvider
+from skyrl_train.generators.base import GeneratorOutput
 from skyrl_train.json_serialization import to_jsonable
-from skyrl_train.utils.data_tracker import DataConsumptionTracker
+from skyrl_train.utils.data_tracker import DataConsumptionState, DataConsumptionTracker
+from skyrl_train.utils.io import io
 
 from .base import TrainerCallback, TrainerState, TrainerControl, CallbackHandler
 from .types import (
     CHECKPOINT_CALLBACK_TYPE,
     HF_MODEL_SAVE_CALLBACK_TYPE,
 )
-
 
 # Registry mapping callback type names to classes
 # This enables YAML-based callback configuration
@@ -1074,12 +1079,6 @@ class DataTrackingCallback(TrainerCallback):
         control: TrainerControl,
         **kwargs,
     ) -> Optional[TrainerControl]:
-        import dataclasses
-
-        import torch
-
-        from skyrl_train.utils.io import io
-
         trainer = kwargs.get("trainer")
         if trainer is None:
             logger.warning("DataTrackingCallback.on_save: no trainer in kwargs, skipping")
@@ -1123,11 +1122,6 @@ class DataTrackingCallback(TrainerCallback):
         Returns True if state was loaded, False if no artifact found.
         """
 
-        import torch
-
-        from skyrl_train.utils.data_tracker import DataConsumptionState
-        from skyrl_train.utils.io import io
-
         # Try new format first
         artifact_path = os.path.join(ckpt_path, DataTrackingCallback.ARTIFACT_NAME)
         if io.exists(artifact_path):
@@ -1166,106 +1160,89 @@ class DataTrackingCallback(TrainerCallback):
 
 
 class BufferCheckpointCallback(TrainerCallback):
-    """Best-effort save/restore of the async generation buffer at checkpoint time.
+    """Persist async completed groups and retry prompts with each checkpoint.
 
-    Saves all pending GeneratedOutputGroup items from the asyncio.Queue so that
-    on resume the buffer can be restored without re-generating from scratch.
+    Saves completed output groups and stale-group retry prompts so resume preserves
+    every dataset row still needed by the current epoch.
     """
 
     ARTIFACT_NAME = "generation_buffer_state.pt"
-    error_behavior = "warn"
+    error_behavior = "raise"
 
-    def on_save(
+    def __init__(self) -> None:
+        self._queues: Optional[GenerationQueuesProvider] = None
+
+    def bind_queues(self, queues: GenerationQueuesProvider) -> None:
+        """Select the current epoch's queues for checkpoint persistence."""
+        self._queues = queues
+
+    async def on_save_async(
         self,
         state: TrainerState,
         control: TrainerControl,
         **kwargs,
     ) -> Optional[TrainerControl]:
-        import torch
-
-        from skyrl_train.utils.io import io
-
         trainer = kwargs.get("trainer")
         if trainer is None:
-            logger.warning("BufferCheckpointCallback.on_save: no trainer in kwargs, skipping")
+            raise RuntimeError("BufferCheckpointCallback requires trainer context during checkpoint save")
+
+        if self._queues is None:
+            raise RuntimeError("BufferCheckpointCallback queues were not bound before checkpoint save")
+        # This method does not yield before snapshotting, so generation tasks cannot
+        # interleave with the drain-and-restore operation.
+        buffer_state = self._queues.snapshot()
+        items = buffer_state.completed_groups
+        retry_prompts = buffer_state.retry_prompts
+        if not items and not retry_prompts:
             return control
 
-        buf = getattr(trainer, "_generation_output_group_buffer", None)
-        if buf is None:
-            return control
+        serialized = [
+            {
+                "generator_output": dict(item.generator_output),
+                "uid": item.uid,
+                "earliest_model_step": item.earliest_model_step,
+                "source_prompts": item.source_prompts,
+            }
+            for item in items
+        ]
+        ckpt_path = os.path.join(
+            trainer.cfg.trainer.ckpt_path,
+            f"global_step_{state.global_step}",
+        )
+        artifact_path = os.path.join(ckpt_path, self.ARTIFACT_NAME)
 
-        try:
-            # Drain-and-restore: non-destructive snapshot of the queue.
-            # Safe because on_save runs synchronously within the event loop —
-            # no generation worker can interleave between drain and restore.
-            items = []
-            while not buf.empty():
-                try:
-                    items.append(buf.get_nowait())
-                except Exception:
-                    break
-            # Put them all back
-            for item in items:
-                buf.put_nowait(item)
-
-            if not items:
-                return control
-
-            serialized = []
-            for item in items:
-                serialized.append(
-                    {
-                        "generator_output": dict(item.generator_output),
-                        "uid": item.uid,
-                        "global_step_when_scheduled": item.global_step_when_scheduled,
-                    }
-                )
-
-            ckpt_path = os.path.join(
-                trainer.cfg.trainer.ckpt_path,
-                f"global_step_{state.global_step}",
-            )
-            artifact_path = os.path.join(ckpt_path, self.ARTIFACT_NAME)
+        def save_state() -> None:
             with io.open_file(artifact_path, "wb") as f:
-                torch.save(serialized, f)
-            logger.info(f"Saved {len(serialized)} generation buffer items to {artifact_path}")
-        except Exception as e:
-            logger.warning(f"BufferCheckpointCallback.on_save failed (best-effort): {e}")
+                torch.save({"completed_groups": serialized, "retry_prompts": retry_prompts}, f)
+
+        await asyncio.to_thread(save_state)
+        logger.info(
+            f"Saved {len(serialized)} completed generation groups and {len(retry_prompts)} pending retries "
+            f"to {artifact_path}"
+        )
 
         return control
 
     @staticmethod
-    def load_buffer_items(ckpt_path: str):
-        """Load buffer items from a checkpoint directory.
-
-        Returns a list of GeneratedOutputGroup, or empty list if no file found.
-        """
-
-        import torch
-
-        from skyrl_train.fully_async_trainer import GeneratedOutputGroup
-        from skyrl_train.generators.base import GeneratorOutput
-        from skyrl_train.utils.io import io
+    def load_buffer_state(ckpt_path: str) -> GenerationBufferState:
+        """Load completed output groups and retry prompts from a checkpoint."""
 
         artifact_path = os.path.join(ckpt_path, BufferCheckpointCallback.ARTIFACT_NAME)
         if not io.exists(artifact_path):
-            return []
+            return GenerationBufferState(completed_groups=[], retry_prompts=[])
 
-        try:
-            with io.open_file(artifact_path, "rb") as f:
-                serialized = torch.load(f, map_location="cpu", weights_only=False)
+        with io.open_file(artifact_path, "rb") as f:
+            state = torch.load(f, map_location="cpu", weights_only=False)
 
-            items = []
-            for entry in serialized:
-                gen_out: GeneratorOutput = entry["generator_output"]
-                items.append(
-                    GeneratedOutputGroup(
-                        generator_output=gen_out,
-                        uid=entry["uid"],
-                        global_step_when_scheduled=entry["global_step_when_scheduled"],
-                    )
+        items = []
+        for entry in state["completed_groups"]:
+            gen_out: GeneratorOutput = entry["generator_output"]
+            items.append(
+                GeneratedOutputGroup(
+                    generator_output=gen_out,
+                    uid=entry["uid"],
+                    earliest_model_step=entry["earliest_model_step"],
+                    source_prompts=entry["source_prompts"],
                 )
-            return items
-        except Exception as e:
-            logger.warning(f"BufferCheckpointCallback.load_buffer_items failed: {e}")
-            return []
+            )
+        return GenerationBufferState(completed_groups=items, retry_prompts=state["retry_prompts"])

@@ -139,6 +139,7 @@ trainer:
       cp_rotate_method: "allgather"
     sequence_parallel_size: 1
   algorithm:
+    batch_invariant: false
     advantage_estimator: "grpo"
     kl_ctrl:
       type: "fixed"

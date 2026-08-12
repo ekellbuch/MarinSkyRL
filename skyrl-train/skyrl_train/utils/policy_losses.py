@@ -36,6 +36,7 @@ class PolicyClipMetrics:
     ppo_clip_ratio_high: float = 0.0
     ppo_clip_pressure_low: float = 0.0
     ppo_clip_pressure_high: float = 0.0
+    ppo_ratio_exact_unit_fraction: float = 0.0
 
     def as_dict(self) -> dict[str, float]:
         return asdict(self)
@@ -99,12 +100,13 @@ def clipping_metrics(
     eps_clip_high: float,
     pooled_clip_ratio: Optional[float] = None,
 ) -> dict[str, float]:
-    """Partition clipping decisions and pre-clamp pressure by ratio side.
+    """Report clipping decisions, pre-clamp pressure, and exact-unit ratios.
 
     The low/high clip ratios count selected tokens beyond the matching bound;
     pressure counts every token beyond each bound before objective selection.
     The pooled ratio counts all selected tokens unless the caller supplies its
-    own loss-specific ``pooled_clip_ratio``.
+    own loss-specific ``pooled_clip_ratio``. The exact-unit fraction distinguishes
+    a genuinely inert clipping geometry from missing diagnostics.
     """
     low_pressure = ratio < 1 - eps_clip_low
     high_pressure = ratio > 1 + eps_clip_high
@@ -118,6 +120,7 @@ def clipping_metrics(
         ppo_clip_ratio_high=_masked_fraction(high_selected, loss_mask),
         ppo_clip_pressure_low=_masked_fraction(low_pressure, loss_mask),
         ppo_clip_pressure_high=_masked_fraction(high_pressure, loss_mask),
+        ppo_ratio_exact_unit_fraction=_masked_fraction(ratio == 1, loss_mask),
     ).as_dict()
 
 

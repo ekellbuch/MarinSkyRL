@@ -3,6 +3,7 @@ uv  run --isolated --group dev --extra cpu pytest tests/cpu/test_trainer.py
 """
 
 import contextlib
+import asyncio
 import gc
 import weakref
 from types import SimpleNamespace
@@ -65,6 +66,72 @@ class _CapturingPolicyGroup:
         if method_name == "empty_cache":
             return []
         raise AssertionError(f"Unexpected policy method: {method_name}")
+
+
+class _ResidencyPolicyGroup:
+    def __init__(self):
+        self.model_on_gpu = False
+        self.optimizer_on_gpu = False
+
+    def backload_to_gpu(self, backload_optimizer=True, backload_model=True):
+        self.optimizer_on_gpu |= backload_optimizer
+        self.model_on_gpu |= backload_model
+
+    def offload_to_cpu(self, offload_optimizer=True, offload_model=True):
+        if offload_optimizer:
+            self.optimizer_on_gpu = False
+        if offload_model:
+            self.model_on_gpu = False
+
+
+class _ResidencyInferenceClient:
+    def __init__(self):
+        self.awake = True
+        self.wake_tags = []
+
+    async def sleep(self):
+        self.awake = False
+
+    async def wake_up(self, tags):
+        self.wake_tags.append(tags)
+        self.awake = True
+
+
+@pytest.mark.parametrize("save_error", [None, RuntimeError("storage of size 0")])
+def test_colocated_checkpoint_temporarily_backloads_policy_and_restores_rollout_residency(save_error, monkeypatch):
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.colocate_all = True
+    trainer.policy_model = _ResidencyPolicyGroup()
+    trainer.inference_engine_client = _ResidencyInferenceClient()
+    trainer.sync_policy_weights_to_inference_engines = lambda: []
+    trainer.all_timings = {}
+    monkeypatch.setattr(trainer_module.ray, "get", lambda refs: refs)
+    save_observations = []
+
+    def save_checkpoints():
+        save_observations.append(
+            (
+                trainer.policy_model.model_on_gpu,
+                trainer.policy_model.optimizer_on_gpu,
+                trainer.inference_engine_client.awake,
+            )
+        )
+        if save_error is not None:
+            raise save_error
+
+    trainer.save_checkpoints = save_checkpoints
+
+    if save_error is None:
+        asyncio.run(trainer._save_checkpoints_with_residency())
+    else:
+        with pytest.raises(RuntimeError, match="storage of size 0"):
+            asyncio.run(trainer._save_checkpoints_with_residency())
+
+    assert save_observations == [(True, True, False)]
+    assert not trainer.policy_model.model_on_gpu
+    assert not trainer.policy_model.optimizer_on_gpu
+    assert trainer.inference_engine_client.awake
+    assert trainer.inference_engine_client.wake_tags == [["weights"], ["kv_cache"]]
 
 
 def test_sync_trainer_attaches_global_loss_denominator_before_dispatch(monkeypatch):
@@ -778,6 +845,7 @@ def test_ppo_train_batch_calculations():
                     "optimizer_config": {"max_grad_norm": 1.0},
                 },
                 "algorithm": {
+                    "batch_invariant": False,
                     "policy_loss_type": "regular",
                     "loss_reduction": "token_mean",
                 },

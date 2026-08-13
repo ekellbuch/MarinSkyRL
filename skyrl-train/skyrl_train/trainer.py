@@ -407,6 +407,37 @@ class RayPPOTrainer:
         if self._control.should_save_hf_model:
             await asyncio.to_thread(self.handle_hf_export)
 
+    async def _save_checkpoints_with_residency(self) -> None:
+        """Save a checkpoint, swapping colocated training and inference residency when needed."""
+        if not self.colocate_all:
+            await asyncio.to_thread(self.save_checkpoints)
+            return
+
+        await self.inference_engine_client.sleep()
+        try:
+            self.policy_model.backload_to_gpu(backload_optimizer=True, backload_model=True)
+            await asyncio.to_thread(self.save_checkpoints)
+        finally:
+            await self._sync_policy_for_rollouts()
+
+    async def _sync_weights_and_restore_rollout_residency(self) -> None:
+        await self.inference_engine_client.wake_up(tags=["weights"])
+        with Timer("sync_weights", self.all_timings):
+            ray.get(self.sync_policy_weights_to_inference_engines())
+        with Timer("offload_policy_model_to_cpu"):
+            self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
+        await self.inference_engine_client.wake_up(tags=["kv_cache"])
+
+    async def _sync_policy_for_rollouts(self) -> None:
+        if self.colocate_all:
+            try:
+                self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
+            finally:
+                await self._sync_weights_and_restore_rollout_residency()
+        else:
+            with Timer("sync_weights", self.all_timings):
+                ray.get(self.sync_policy_weights_to_inference_engines())
+
     async def _train_loop(self):
         """
         Internal training loop, separated for proper generator lifecycle management.
@@ -440,15 +471,7 @@ class RayPPOTrainer:
                 await self._handle_resume_at_max_steps()
                 return
 
-        if self.colocate_all:
-            self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
-            await self.inference_engine_client.wake_up(tags=["weights"])
-        with Timer("sync_weights"):
-            ray.get(self.sync_policy_weights_to_inference_engines())
-        if self.colocate_all:
-            with Timer("offload_policy_model_to_cpu"):
-                self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
-            await self.inference_engine_client.wake_up(tags=["kv_cache"])
+        await self._sync_policy_for_rollouts()
 
         # initialize kl controller
         if self.cfg.trainer.algorithm.use_kl_in_reward:
@@ -575,15 +598,7 @@ class RayPPOTrainer:
                         status = self.train_critic_and_policy(training_input)
 
                     # 5. sync weights to inference engines (must happen before callbacks)
-                    if self.colocate_all:
-                        self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
-                        await self.inference_engine_client.wake_up(tags=["weights"])
-                    with Timer("sync_weights", self.all_timings):
-                        ray.get(self.sync_policy_weights_to_inference_engines())
-                    if self.colocate_all:
-                        with Timer("offload_policy_model_to_cpu"):
-                            self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
-                        await self.inference_engine_client.wake_up(tags=["kv_cache"])
+                    await self._sync_policy_for_rollouts()
 
                 # 6. Log status and update metrics
                 logger.info(status)
@@ -613,7 +628,7 @@ class RayPPOTrainer:
                 # Handle checkpoint saving
                 if self._control.should_save:
                     with Timer("save_checkpoints", self.all_timings):
-                        self.save_checkpoints()
+                        await self._save_checkpoints_with_residency()
                     # Call on_save callbacks
                     await self.callback_handler.call_event_async("on_save", step_state, self._control, trainer=self)
                     self._control.should_save = False
@@ -1956,7 +1971,10 @@ class RayPPOTrainer:
         elif self.resume_mode == ResumeMode.LATEST:
             latest_checkpoint_file = os.path.join(self.cfg.trainer.ckpt_path, "latest_ckpt_global_step.txt")
             if not io.exists(latest_checkpoint_file):
-                logger.info("No checkpoint found, starting training from scratch")
+                logger.warning(
+                    f"resume_mode=latest found no checkpoint marker at {latest_checkpoint_file}; "
+                    "starting training from global_step 0"
+                )
                 return 0, None
             with io.open_file(latest_checkpoint_file, "r") as f:
                 ckpt_iteration = int(f.read().strip())

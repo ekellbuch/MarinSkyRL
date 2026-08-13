@@ -35,6 +35,8 @@ from typing import Any, Iterable, Optional, Sequence
 
 from upath import UPath
 
+from infra.harbor_results import HARBOR_TRAJECTORY_PATH, MISSING_TOKEN_COUNT, trajectory_count_sequence
+
 # A record's messages is considered part of the SAME trial as a longer record
 # when it is an exact element-wise prefix of the longer messages list.
 Messages = list[dict[str, Any]]
@@ -54,8 +56,8 @@ class LiteralRecord:
     @property
     def counts(self) -> tuple[int, int]:
         """(len(prompt_token_ids), len(completion_token_ids)); -1 if absent."""
-        p = len(self.prompt_token_ids) if self.prompt_token_ids is not None else -1
-        c = len(self.completion_token_ids) if self.completion_token_ids is not None else -1
+        p = len(self.prompt_token_ids) if self.prompt_token_ids is not None else MISSING_TOKEN_COUNT
+        c = len(self.completion_token_ids) if self.completion_token_ids is not None else MISSING_TOKEN_COUNT
         return (p, c)
 
 
@@ -156,24 +158,6 @@ def reconstruct_chains(records: list[LiteralRecord]) -> list[Chain]:
 # --------------------------------------------------------------------------- #
 # Trajectory <-> chain binding
 # --------------------------------------------------------------------------- #
-def trajectory_count_sequence(trajectory: dict[str, Any]) -> list[tuple[int, int]]:
-    """Per-agent-step ``(prompt_tokens, completion_tokens)`` from a trajectory.
-
-    Mirrors the agent-step selection the exporter uses: source=="agent" and not
-    ``is_copied_context``. A step missing either count contributes ``-1`` so it can
-    never spuriously equal a real record length.
-    """
-    seq: list[tuple[int, int]] = []
-    for step in trajectory.get("steps", []):
-        if step.get("source") != "agent" or step.get("is_copied_context"):
-            continue
-        metrics = step.get("metrics") or {}
-        p = metrics.get("prompt_tokens")
-        c = metrics.get("completion_tokens")
-        seq.append((p if isinstance(p, int) else -1, c if isinstance(c, int) else -1))
-    return seq
-
-
 def parse_iso(ts: Any) -> Optional[float]:
     """Parse an ISO-8601 timestamp to a unix float, or None."""
     if not isinstance(ts, str) or not ts:
@@ -205,7 +189,7 @@ def bind_chain(
     the ``agent_execution`` window is used ONLY to break the tie; if still not
     unique, return None (omit rather than mis-join).
     """
-    if not count_sequence or any(-1 in pc for pc in count_sequence):
+    if not count_sequence or any(MISSING_TOKEN_COUNT in pc for pc in count_sequence):
         return None
     matches = [ch for ch in chains if not ch.ambiguous and ch.count_sequence == count_sequence]
     if len(matches) == 1:
@@ -345,7 +329,7 @@ def enrich_trajectories_with_literals(
 
     for trial_dir in iter_trial_dirs(job_dir):
         trial_dir = UPath(trial_dir)
-        traj_path = trial_dir / "agent" / "trajectory.json"
+        traj_path = trial_dir / HARBOR_TRAJECTORY_PATH
         try:
             trajectory = json.loads(traj_path.read_text())
         except (FileNotFoundError, json.JSONDecodeError, NotImplementedError):

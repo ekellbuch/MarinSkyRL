@@ -61,3 +61,29 @@ def test_max_turns_reaches_the_agent_without_deprecated_max_episodes():
     kwargs = _agent_kwargs({"name": "terminus-2", "max_turns": 30})
     assert kwargs["max_turns"] == 30
     assert "max_episodes" not in kwargs
+
+
+def test_passthrough_exceptions_are_never_retried():
+    cfg = OmegaConf.create(
+        {
+            "harbor": {
+                "passthrough_exceptions": ["AgentTimeoutError"],
+                "exclude_exceptions": ["VerifierTimeoutError"],
+            }
+        }
+    )
+
+    retry_config = HarborConfigBuilder(cfg).build_retry_config()
+
+    assert retry_config.exclude_exceptions == {"AgentTimeoutError", "VerifierTimeoutError"}
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {"harbor": {"override_timeout_sec": 123}},
+        {"override_timeout_sec": 123},
+    ],
+)
+def test_agent_timeout_resolution_supports_nested_and_legacy_layouts(cfg):
+    assert HarborConfigBuilder(OmegaConf.create(cfg)).get_agent_timeout_seconds() == 123

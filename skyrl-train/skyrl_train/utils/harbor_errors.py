@@ -1,9 +1,13 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
+from collections.abc import Iterable
 from typing import Any, Mapping
 
 from harbor_config.errors import ErrorCategory, error_category
 from loguru import logger
+
+
+AGENT_TIMEOUT_ERROR = "AgentTimeoutError"
 
 
 class ErrorTreatment(StrEnum):
@@ -57,6 +61,14 @@ class ErrorHandlingConfig:
 
 
 DEFAULT_ERROR_HANDLING_CONFIG = ErrorHandlingConfig()
+
+
+def retry_excluded_exception_types(
+    configured_exclusions: Iterable[str] | None,
+    error_handling: ErrorHandlingConfig,
+) -> frozenset[str]:
+    """Return retry exclusions with every pass-through failure made terminal."""
+    return frozenset(configured_exclusions or ()) | error_handling.passthrough_exceptions
 
 
 _CATEGORY_TREATMENTS = {

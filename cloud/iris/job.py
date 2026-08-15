@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import json
 import posixpath
+import subprocess
 import sys
 import tempfile
 from dataclasses import asdict
@@ -15,9 +16,9 @@ from typing import Any, Protocol
 from iris.client import JobFailedError
 
 from cloud.iris.artifacts import (
-    CHECKPOINT_MARKER_FILENAME,
     fs_and_path,
     relative_object_key,
+    terminal_checkpoint_step,
 )
 from marinskyrl.checkpoint_paths import policy_export_path
 from marinskyrl.hf_model import validate_portable_hf_model_files
@@ -48,6 +49,8 @@ class JobBackend(Protocol):
         mode: LaunchMode = LaunchMode.WAIT,
     ) -> IrisLaunchOutcome: ...
 
+    def export_terminal_policy(self, spec: SkyRLJobSpec, config_path: str) -> None: ...
+
 
 def _write_json(uri: str, value: dict[str, Any]) -> None:
     filesystem, path = fs_and_path(uri)
@@ -58,22 +61,13 @@ def _write_json(uri: str, value: dict[str, Any]) -> None:
         json.dump(value, destination, sort_keys=True)
 
 
-def _read_text(uri: str) -> str:
-    filesystem, path = fs_and_path(uri)
-    with filesystem.open(path, "r") as source:
-        return source.read()
-
-
 def _path_exists(uri: str) -> bool:
     filesystem, path = fs_and_path(uri)
     return filesystem.exists(path)
 
 
 def _policy_export(request: SkyRLLaunchRequest) -> SkyRLModel:
-    checkpoint_marker = posixpath.join(request.output.checkpoint_root, CHECKPOINT_MARKER_FILENAME)
-    if not _path_exists(checkpoint_marker):
-        raise ValueError(f"Successful Iris job did not commit a checkpoint marker: {checkpoint_marker}")
-    global_step = int(_read_text(checkpoint_marker).strip())
+    global_step = terminal_checkpoint_step(request.output.checkpoint_root)
     policy_uri = policy_export_path(request.output.export_root, global_step)
     filesystem, policy_path = fs_and_path(policy_uri)
     files = sorted(path for path in filesystem.find(policy_path) if not filesystem.isdir(path))
@@ -157,10 +151,14 @@ def execute_job(
             job_state = iris_job_state_name(error.status.state)
             outcome = IrisLaunchOutcome(job_id=str(error.job_id), job_state=job_state, exit_code=1)
 
-    if outcome.exit_code != 0:
-        return _record_failed_attempt(spec, outcome, f"Iris job reached {outcome.job_state}")
-    if mode is LaunchMode.DETACH:
-        return _launch_response(spec, AttemptState.SUBMITTED, outcome=outcome)
+        if outcome.exit_code != 0:
+            return _record_failed_attempt(spec, outcome, f"Iris job reached {outcome.job_state}")
+        if mode is LaunchMode.DETACH:
+            return _launch_response(spec, AttemptState.SUBMITTED, outcome=outcome)
+        try:
+            active_backend.export_terminal_policy(spec, config_file.name)
+        except (OSError, subprocess.CalledProcessError, ValueError) as error:
+            return _record_failed_attempt(spec, outcome, f"Terminal policy export failed: {error}")
 
     try:
         model = _policy_export(request)

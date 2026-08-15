@@ -58,6 +58,9 @@ class FakeLaunchBackend(JobBackend):
         assert mode is self.expected_mode
         return self.outcome
 
+    def export_terminal_policy(self, spec: SkyRLJobSpec, config_path: str) -> None:
+        self.validate(spec, config_path)
+
 
 @dataclass(frozen=True)
 class FailedLaunchBackend(JobBackend):
@@ -77,6 +80,9 @@ class FailedLaunchBackend(JobBackend):
         self.validate(spec, config_path)
         assert mode is LaunchMode.WAIT
         raise self.error
+
+    def export_terminal_policy(self, _spec: SkyRLJobSpec, _config_path: str) -> None:
+        raise AssertionError("a failed training launch cannot export a terminal policy")
 
 
 def _git_commit(root: Path) -> str:
@@ -221,14 +227,25 @@ def _write_terminal_training_outputs(envelope: SkyRLJobSpec) -> None:
     output = Path(envelope.request.output.checkpoint_root.removeprefix("file://"))
     output.mkdir(parents=True)
     (output / "latest_ckpt_global_step.txt").write_text("8")
-    export = Path(envelope.request.output.export_root.removeprefix("file://")) / "global_step_8" / "policy"
+    _write_policy_export(envelope.request.output.export_root)
+    resolved = Path(envelope.request.output.resolved_config_uri.removeprefix("file://"))
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text('{"entrypoint":"skyrl_train.entrypoints.main_base","hydra_args":[]}')
+
+
+def _write_policy_export(export_root: str) -> None:
+    export = Path(export_root.removeprefix("file://")) / "global_step_8" / "policy"
     export.mkdir(parents=True)
     (export / "config.json").write_text("{}")
     (export / "model.safetensors").write_bytes(b"weights")
     (export / "tokenizer.json").write_text("{}")
-    resolved = Path(envelope.request.output.resolved_config_uri.removeprefix("file://"))
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    resolved.write_text('{"entrypoint":"skyrl_train.entrypoints.main_base","hydra_args":[]}')
+
+
+@dataclass(frozen=True)
+class CompletingExportBackend(FakeLaunchBackend):
+    def export_terminal_policy(self, spec: SkyRLJobSpec, config_path: str) -> None:
+        self.validate(spec, config_path)
+        _write_policy_export(spec.request.output.export_root)
 
 
 def test_execute_job_commits_validated_terminal_model(tmp_path: Path) -> None:
@@ -252,6 +269,29 @@ def test_execute_job_commits_validated_terminal_model(tmp_path: Path) -> None:
     assert terminal["request"]["runtime"] == asdict(envelope.request.runtime)
     attempt = Path(envelope.request.output.attempts_root.removeprefix("file://")) / "attempt-1.json"
     assert json.loads(attempt.read_text()) == terminal
+
+
+def test_execute_job_exports_terminal_checkpoint_before_committing_model(tmp_path: Path) -> None:
+    envelope = _spec(tmp_path)
+    checkpoint = Path(envelope.request.output.checkpoint_root.removeprefix("file://"))
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "latest_ckpt_global_step.txt").write_text("8")
+    resolved = Path(envelope.request.output.resolved_config_uri.removeprefix("file://"))
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text('{"entrypoint":"skyrl_train.entrypoints.main_base","hydra_args":[]}')
+    backend = CompletingExportBackend(
+        IrisLaunchOutcome(
+            job_id="01KTEST",
+            job_state="succeeded",
+            exit_code=0,
+        )
+    )
+
+    response = execute_job(envelope, backend=backend)
+
+    assert response.state == AttemptState.SUCCEEDED
+    assert response.model is not None
+    assert response.model.policy_export_uri.endswith("/global_step_8/policy")
 
 
 def test_execute_job_detaches_without_validating_terminal_artifacts(tmp_path: Path) -> None:
@@ -291,7 +331,8 @@ def test_launcher_argv_includes_staged_data_role_plan_and_seed(tmp_path: Path) -
 
 
 def test_launcher_argv_satisfies_standalone_required_options(tmp_path: Path) -> None:
-    argv = job_launch_argv(_spec(tmp_path), "config.yaml")
+    envelope = _spec(tmp_path)
+    argv = job_launch_argv(envelope, "config.yaml")
 
     args = create_parser().parse_args(argv)
 
@@ -301,6 +342,9 @@ def test_launcher_argv_satisfies_standalone_required_options(tmp_path: Path) -> 
     assert args.memory == "800GB"
     assert args.disk == "4TB"
     assert args.wandb_entity == "marin-community"
+    assert argv[argv.index("--rendezvous-dir") + 1] == f"{envelope.request.output.attempts_root}/rendezvous"
+    assert argv[argv.index("--ray-spill-dir") + 1] == "/tmp/skyrl-ray-spill"
+    assert argv[argv.index("--ray-spill-backend") + 1] == "local"
 
 
 def test_launcher_argv_forwards_detached_submission(tmp_path: Path) -> None:

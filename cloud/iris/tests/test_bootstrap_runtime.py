@@ -19,7 +19,9 @@ def _write_module(site_packages: Path, relative_path: str, source: str = "") -> 
     path.write_text(source)
 
 
-def _fake_frozen_runtime(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+def _fake_frozen_runtime(
+    tmp_path: Path, *, managed_python_pin_is_unresolvable: bool = False
+) -> tuple[Path, dict[str, str]]:
     environment = tmp_path / "runtime"
     subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(environment)], check=True)
     site_packages = Path(
@@ -119,10 +121,33 @@ def _fake_frozen_runtime(tmp_path: Path) -> tuple[Path, dict[str, str]]:
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    (fake_bin / "python3.12").symlink_to(sys.executable)
     uv = fake_bin / "uv"
-    uv.write_text("#!/bin/sh\nexit 0\n")
+    if managed_python_pin_is_unresolvable:
+        uv.write_text(
+            "#!/bin/sh\n"
+            "selected_python=\n"
+            "downloads_disabled=false\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            "    --python) selected_python=$2; shift 2 ;;\n"
+            "    --no-python-downloads) downloads_disabled=true; shift ;;\n"
+            "    *) shift ;;\n"
+            "  esac\n"
+            "done\n"
+            'if [ "$selected_python" = "$EXPECTED_SYSTEM_PYTHON" ] && "$downloads_disabled"; then\n'
+            "  exit 0\n"
+            "fi\n"
+            "echo 'error: No interpreter found for Python 3.12.13' >&2\n"
+            "exit 2\n"
+        )
+    else:
+        uv.write_text("#!/bin/sh\nexit 0\n")
     uv.chmod(0o755)
-    return environment, os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    return environment, os.environ | {
+        "EXPECTED_SYSTEM_PYTHON": str(fake_bin / "python3.12"),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+    }
 
 
 def _run_bootstrap(
@@ -168,6 +193,14 @@ def test_export_bootstrap_does_not_require_rollout_or_telemetry_packages(tmp_pat
     (site_packages / "harbor" / "utils" / "traces_utils.py").unlink()
 
     result = _run_bootstrap(environment, process_environment, "fsdp-export")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_bootstrap_uses_system_python_when_managed_pin_is_unresolvable(tmp_path: Path) -> None:
+    environment, process_environment = _fake_frozen_runtime(tmp_path, managed_python_pin_is_unresolvable=True)
+
+    result = _run_bootstrap(environment, process_environment, "megatron")
 
     assert result.returncode == 0, result.stderr
 

@@ -363,27 +363,26 @@ def test_resolve_launch_defaults_rejects_non_path_trace_configuration(tmp_path):
         resolve_launch_defaults(args)
 
 
-def test_task_command_applies_bounded_storage_policy(tmp_path):
+def test_task_command_applies_bounded_storage_policy(tmp_path, parse_hydra_overrides):
     args = _args(tmp_path, "opencode", ["--job-name", "storage-policy", "--storage-user", "alice"])
     normalize(args)
     resolve_launch_defaults(args)
 
     options = _shell_options(build_task_command(args)[-1])
-    overrides = set(options["--skyrl_override"])
+    encoded = [override.removesuffix(";") for override in options["--skyrl_override"]]
+    overrides = parse_hydra_overrides(encoded)
 
-    assert "++trainer.max_ckpts_to_keep=2" in overrides
-    assert (
-        "++trainer.ckpt_path=s3://example-bucket/tmp/ttl=14d/skyrl/users/alice/storage-policy/checkpoints" in overrides
-    )
-    assert (
-        "++terminal_bench_config.trials_dir="
-        "s3://example-bucket/tmp/ttl=14d/skyrl/users/alice/storage-policy/trace_jobs" in overrides
-    )
-    assert (
-        "++generator.trajectory_retention.output_path="
-        "s3://example-bucket/tmp/ttl=14d/skyrl/users/alice/storage-policy/trajectories" in overrides
-    )
-    assert "++trainer.export_path=s3://example-bucket/marin/users/alice/skyrl/storage-policy/exports" in overrides
+    assert overrides == {
+        "generator.trajectory_retention.output_path": (
+            "s3://example-bucket/tmp/ttl=14d/skyrl/users/alice/storage-policy/trajectories"
+        ),
+        "terminal_bench_config.trials_dir": (
+            "s3://example-bucket/tmp/ttl=14d/skyrl/users/alice/storage-policy/trace_jobs"
+        ),
+        "trainer.ckpt_path": "s3://example-bucket/tmp/ttl=14d/skyrl/users/alice/storage-policy/checkpoints",
+        "trainer.export_path": "s3://example-bucket/marin/users/alice/skyrl/storage-policy/exports",
+        "trainer.max_ckpts_to_keep": 2,
+    }
 
 
 def test_collective_phase_diagnostics_flag_sets_worker_environment(tmp_path):
@@ -460,6 +459,7 @@ def _spill_preflight_probe(tmp_path: Path, monkeypatch, spill_dir: Path) -> tupl
     runtime_environment = app_dir / ".iris-runtime-env"
     runtime_environment.write_text("true\n")
     monkeypatch.setattr("cloud.iris.iris_backend.APP_DIR", str(app_dir))
+    monkeypatch.setattr("cloud.iris.iris_backend.SKYRL_HOME", str(app_dir))
     monkeypatch.setattr("cloud.iris.iris_backend.MARINSKYRL_ACTIVATION_FILE", str(runtime_environment))
     monkeypatch.setattr("cloud.iris.iris_backend.RL_PYTHON", str(controller))
 
@@ -501,6 +501,43 @@ def test_task_shell_rejects_uncreatable_local_spill_directory_before_controller(
     assert completed.returncode != 0
     assert str(spill_dir) in completed.stderr
     assert not observation.exists()
+
+
+def test_task_shell_keeps_the_controller_in_the_validated_bundle(tmp_path, monkeypatch):
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    runtime_checkout = tmp_path / "selected-runtime"
+    runtime_checkout.mkdir()
+    activation_file = runtime_checkout / ".iris-runtime-env"
+    activation_file.write_text("true\n")
+    observation = tmp_path / "controller-environment"
+    controller = tmp_path / "controller-probe"
+    controller.write_text('#!/bin/sh\nprintf "%s\\n%s\\n" "$PWD" "$PYTHONPATH" > "$CONTROLLER_OBSERVATION"\n')
+    controller.chmod(0o755)
+    monkeypatch.setattr("cloud.iris.iris_backend.APP_DIR", str(app_dir))
+    monkeypatch.setattr("cloud.iris.iris_backend.SKYRL_HOME", str(runtime_checkout))
+    monkeypatch.setattr("cloud.iris.iris_backend.MARINSKYRL_ACTIVATION_FILE", str(activation_file))
+    monkeypatch.setattr("cloud.iris.iris_backend.RL_PYTHON", str(controller))
+
+    args = _args(tmp_path, "opencode")
+    normalize(args)
+    resolve_launch_defaults(args)
+    completed = subprocess.run(
+        build_task_command(args),
+        env={**os.environ, "CONTROLLER_OBSERVATION": str(observation), "PYTHONPATH": "/ambient/python"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    working_directory, pythonpath = observation.read_text().splitlines()
+    assert working_directory == str(app_dir)
+    assert pythonpath.split(":") == [
+        str(app_dir),
+        str(runtime_checkout),
+        str(runtime_checkout / "skyrl-train"),
+        "/ambient/python",
+    ]
 
 
 def test_in_tree_rl_config_is_embedded_in_the_runtime_bundle_environment(tmp_path):

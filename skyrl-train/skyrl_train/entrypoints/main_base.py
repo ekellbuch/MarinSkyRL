@@ -555,6 +555,7 @@ def skyrl_entrypoint(cfg: DictConfig):
 
 def run_ray_driver(cfg: DictConfig, entrypoint: RemoteFunction, *, failure_message: str = "Training failed") -> None:
     """Run one packaged experiment entrypoint with the shared Ray driver lifecycle."""
+    from skyrl_train.entrypoints.ray_lifecycle import exit_without_ray_destructors, shutdown_ray  # noqa: PLC0415
     from skyrl_train.telemetry import DRIVER_ROLE, process_telemetry  # noqa: PLC0415
     from skyrl_train.utils import validate_cfg  # noqa: PLC0415
     from skyrl_train.utils.logging_utils import log_exception_as_text  # noqa: PLC0415
@@ -576,7 +577,7 @@ def run_ray_driver(cfg: DictConfig, entrypoint: RemoteFunction, *, failure_messa
         # timeouts trigger a clean Ray shutdown instead of leaving orphaned actors.
         def _sigterm_handler(signum, frame):
             logger.warning("Received SIGTERM on head node, shutting down Ray...")
-            ray.shutdown()
+            shutdown_ray()
             sys.exit(1)
 
         signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -588,7 +589,9 @@ def run_ray_driver(cfg: DictConfig, entrypoint: RemoteFunction, *, failure_messa
             raise
         finally:
             logger.info("Shutting down Ray on head node...")
-            ray.shutdown()
+            shutdown_ray()
+
+    exit_without_ray_destructors()
 
 
 @hydra.main(config_path=config_dir, config_name="ppo_base_config", version_base=None)

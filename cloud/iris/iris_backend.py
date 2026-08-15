@@ -97,7 +97,12 @@ from cloud.iris.storage_policy import (
     hydra_override_value,
     resolve_storage_paths,
 )
-from cloud.iris.terminal_policy import TerminalPolicyExport, policy_export_geometry, submit_terminal_policy_export
+from cloud.iris.terminal_policy import (
+    TerminalPolicyExport,
+    policy_export_geometry,
+    storage_user_from_resource_path,
+    submit_terminal_policy_export,
+)
 from marinskyrl.resource_locator import (
     ModelLocatorError,
     is_cloud_uri,
@@ -105,7 +110,12 @@ from marinskyrl.resource_locator import (
     join_resource_path,
     model_source_for_path,
 )
-from cloud.iris.rl_config_translation import RL_CONFIG_PAYLOAD_ENV, RL_CONFIG_TASK_DIR, resolve_rl_config_path
+from cloud.iris.rl_config_translation import (
+    RL_CONFIG_PAYLOAD_ENV,
+    RL_CONFIG_TASK_DIR,
+    format_hydra_arg,
+    resolve_rl_config_path,
+)
 from cloud.iris.secrets_env import load_secrets_env_into_os_environ
 from cloud.iris.runtime_bundle import build_runtime_bundle, resolve_launcher_source
 from cloud.iris.protocol import DataLocator, LaunchMode, SkyRLJobSpec
@@ -325,9 +335,9 @@ def job_launch_argv(spec: SkyRLJobSpec, config_path: str, *, mode: LaunchMode = 
         "--resolved-config-uri",
         request.output.resolved_config_uri,
         "--skyrl-override",
-        f"++trainer.ckpt_path={request.output.checkpoint_root}",
+        format_hydra_arg("trainer.ckpt_path", request.output.checkpoint_root, prefix="++"),
         "--skyrl-override",
-        f"++trainer.export_path={request.output.export_root}",
+        format_hydra_arg("trainer.export_path", request.output.export_root, prefix="++"),
         "--skyrl-override",
         "++trainer.resume_mode=latest",
         "--skyrl-override",
@@ -375,9 +385,16 @@ class IrisBackend:
                 model_source_identity=request.model.identity,
                 policy_num_nodes=request.topology.role_plan.policy_num_nodes,
                 policy_num_gpus_per_node=request.topology.role_plan.policy_num_gpus_per_node,
-                cluster=execution.target_cluster or execution.cluster,
+                cluster=execution.cluster,
                 priority=execution.priority,
                 job_name=execution.job_name,
+                cluster_config=execution.cluster_config,
+                target_cluster=execution.target_cluster,
+                parent_cluster_config=execution.parent_cluster_config,
+                cpu=execution.cpu,
+                memory=execution.memory,
+                disk=execution.disk,
+                storage_user=storage_user_from_resource_path(request.output.checkpoint_root),
             )
         )
 
@@ -2145,11 +2162,11 @@ def build_task_command(args: argparse.Namespace) -> List[str]:
         raise RuntimeError("resolve_launch_defaults() must resolve RL storage before building the task command")
     if not checkpoint_export:
         storage_overrides = (
-            f"++trainer.ckpt_path={storage_paths.checkpoint_root}",
-            f"++trainer.export_path={storage_paths.export_root}",
-            f"++trainer.max_ckpts_to_keep={storage_paths.resume_checkpoint_count}",
-            f"++terminal_bench_config.trials_dir={storage_paths.trace_root}",
-            f"++generator.trajectory_retention.output_path={storage_paths.trajectory_root}",
+            format_hydra_arg("trainer.ckpt_path", storage_paths.checkpoint_root, prefix="++"),
+            format_hydra_arg("trainer.export_path", storage_paths.export_root, prefix="++"),
+            format_hydra_arg("trainer.max_ckpts_to_keep", storage_paths.resume_checkpoint_count, prefix="++"),
+            format_hydra_arg("terminal_bench_config.trials_dir", storage_paths.trace_root, prefix="++"),
+            format_hydra_arg("generator.trajectory_retention.output_path", storage_paths.trajectory_root, prefix="++"),
         )
         for override in storage_overrides:
             train_cmd.extend(["--skyrl_override", override])
@@ -2660,9 +2677,16 @@ def export_terminal_policy(args: argparse.Namespace) -> None:
             model_source_identity=args.model_source_identity,
             policy_num_nodes=policy_num_nodes,
             policy_num_gpus_per_node=policy_num_gpus_per_node,
-            cluster=args.target_cluster or args.cluster,
+            cluster=args.cluster,
             priority=args.priority,
             job_name=args.job_name,
+            cluster_config=args.cluster_config,
+            target_cluster=args.target_cluster,
+            parent_cluster_config=args.parent_cluster_config,
+            cpu=args.cpu,
+            memory=args.memory,
+            disk=args.disk,
+            storage_user=args.storage_user,
         )
     )
 

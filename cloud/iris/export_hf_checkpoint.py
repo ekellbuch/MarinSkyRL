@@ -34,11 +34,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cloud.iris.model_paths import model_source_cli_args
+from cloud.iris.rl_config_translation import format_hydra_arg
 from cloud.iris.runtime_environment import CHECKPOINT_EXPORT_ENTRYPOINT
 from marinskyrl.checkpoint_paths import GLOBAL_STEP_PREFIX, policy_export_path
 from marinskyrl.resource_locator import ModelLocatorError
-from skyrl_train import hf_model_io
-from skyrl_train.hf_export import read_hf_export_request, write_hf_export_request
 from skyrl_train.hf_export_schema import (
     DEFAULT_HF_EXPORT_TIMEOUT,
     DEFAULT_HF_HUB_REVISION,
@@ -51,6 +50,24 @@ from skyrl_train.hf_export_schema import (
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _read_hf_export_request(checkpoint_path: str) -> HFExportRequest | None:
+    from skyrl_train.hf_export import read_hf_export_request  # noqa: PLC0415 - keep launcher imports Torch-free
+
+    return read_hf_export_request(checkpoint_path)
+
+
+def _write_hf_export_request(request: HFExportRequest) -> None:
+    from skyrl_train.hf_export import write_hf_export_request  # noqa: PLC0415 - keep launcher imports Torch-free
+
+    write_hf_export_request(request)
+
+
+def _verify_hf_model_export(export_path: str) -> None:
+    from skyrl_train.hf_model_io import verify_hf_model_export  # noqa: PLC0415 - keep launcher imports Torch-free
+
+    verify_hf_model_export(export_path)
+
+
 @dataclass(frozen=True)
 class ExportJobSpec:
     request: HFExportRequest
@@ -60,6 +77,13 @@ class ExportJobSpec:
     job_name: str | None
     timeout: int
     no_wait: bool
+    cluster_config: str | None = None
+    target_cluster: str | None = None
+    parent_cluster_config: str | None = None
+    cpu: float | None = None
+    memory: str | None = None
+    disk: str | None = None
+    storage_user: str | None = None
 
 
 def build_command(spec: ExportJobSpec) -> list[str]:
@@ -67,13 +91,13 @@ def build_command(spec: ExportJobSpec) -> list[str]:
     request = spec.request
 
     overrides = [
-        f"++checkpoint_export.step={request.step}",
-        f"++checkpoint_export.checkpoint_path={request.checkpoint_path}",
-        f"++checkpoint_export.export_root={request.export_path}",
-        f"++checkpoint_export.hf_hub_repo_id={request.hf_hub_repo_id or 'null'}",
-        f"++checkpoint_export.hf_hub_private={str(request.hf_hub_private).lower()}",
-        f"++checkpoint_export.hf_hub_revision={request.hf_hub_revision}",
-        f"++checkpoint_export.hf_upload_mode={request.hf_upload_mode}",
+        format_hydra_arg("checkpoint_export.step", request.step, prefix="++"),
+        format_hydra_arg("checkpoint_export.checkpoint_path", request.checkpoint_path, prefix="++"),
+        format_hydra_arg("checkpoint_export.export_root", request.export_path, prefix="++"),
+        format_hydra_arg("checkpoint_export.hf_hub_repo_id", request.hf_hub_repo_id or "null", prefix="++"),
+        format_hydra_arg("checkpoint_export.hf_hub_private", request.hf_hub_private, prefix="++"),
+        format_hydra_arg("checkpoint_export.hf_hub_revision", request.hf_hub_revision, prefix="++"),
+        format_hydra_arg("checkpoint_export.hf_upload_mode", request.hf_upload_mode, prefix="++"),
     ]
 
     cmd = [
@@ -90,8 +114,6 @@ def build_command(spec: ExportJobSpec) -> list[str]:
         str(request.gpus_per_node),
         "--cluster",
         spec.cluster,
-        "--target-cluster",
-        spec.cluster,
         "--entrypoint",
         CHECKPOINT_EXPORT_ENTRYPOINT,
         "--priority",
@@ -102,6 +124,20 @@ def build_command(spec: ExportJobSpec) -> list[str]:
         "--timeout",
         str(spec.timeout),
     ]
+    if spec.cluster_config:
+        cmd += ["--cluster-config", spec.cluster_config]
+    if spec.target_cluster:
+        cmd += ["--target-cluster", spec.target_cluster]
+    if spec.parent_cluster_config:
+        cmd += ["--parent-cluster-config", spec.parent_cluster_config]
+    if spec.cpu is not None:
+        cmd += ["--cpu", str(spec.cpu)]
+    if spec.memory:
+        cmd += ["--memory", spec.memory]
+    if spec.disk:
+        cmd += ["--disk", spec.disk]
+    if spec.storage_user:
+        cmd += ["--storage-user", spec.storage_user]
     cmd.extend(model_source_cli_args(request.model_source_uri, request.model_source_identity))
     if spec.no_wait:
         cmd.append("--no-wait")
@@ -122,6 +158,13 @@ def argument_parser() -> argparse.ArgumentParser:
     ap.add_argument("--model-source-uri", help="object-store model source for a task-local --model_path")
     ap.add_argument("--model-source-identity", help="immutable identity for --model-source-uri")
     ap.add_argument("--cluster", default="cw-rno2a")
+    ap.add_argument("--cluster-config")
+    ap.add_argument("--target-cluster")
+    ap.add_argument("--parent-cluster-config")
+    ap.add_argument("--cpu", type=float)
+    ap.add_argument("--memory")
+    ap.add_argument("--disk")
+    ap.add_argument("--storage-user")
     ap.add_argument("--num-nodes", type=int)
     ap.add_argument("--gpus-per-node", type=int)
     ap.add_argument("--priority", default="batch")
@@ -170,7 +213,7 @@ def request_spec(args: argparse.Namespace, parser: argparse.ArgumentParser) -> E
     if args.no_wait:
         parser.error("--no-wait cannot be used with --request because completion must be recorded")
     try:
-        request = read_hf_export_request(args.request)
+        request = _read_hf_export_request(args.request)
     except ValueError as error:
         parser.error(f"invalid HF export request: {error}")
     if request is None:
@@ -187,6 +230,13 @@ def operational_spec(args: argparse.Namespace, request: HFExportRequest, *, no_w
         job_name=args.job_name,
         timeout=args.timeout,
         no_wait=no_wait,
+        cluster_config=args.cluster_config,
+        target_cluster=args.target_cluster,
+        parent_cluster_config=args.parent_cluster_config,
+        cpu=args.cpu,
+        memory=args.memory,
+        disk=args.disk,
+        storage_user=args.storage_user,
     )
 
 
@@ -234,20 +284,20 @@ def _run_export(spec: ExportJobSpec, command: list[str]) -> None:
         raise subprocess.CalledProcessError(exit_code, command)
     if not spec.no_wait:
         export_path = policy_export_path(spec.request.export_path, spec.request.step)
-        hf_model_io.verify_hf_model_export(export_path)
+        _verify_hf_model_export(export_path)
 
 
 def submit_requested_export(spec: ExportJobSpec, command: list[str]) -> None:
     """Submit one export job, verify synchronous output, and persist request state."""
     request = spec.request.with_status(HFExportStatus.IN_PROGRESS, timeout=spec.timeout, increment_attempts=True)
-    write_hf_export_request(request)
+    _write_hf_export_request(request)
     try:
         _run_export(spec, command)
     except BaseException as error:
         exit_code = error.returncode if isinstance(error, subprocess.CalledProcessError) else 1
-        write_hf_export_request(request.with_status(HFExportStatus.PENDING, last_exit_code=exit_code))
+        _write_hf_export_request(request.with_status(HFExportStatus.PENDING, last_exit_code=exit_code))
         raise
-    write_hf_export_request(request.with_status(HFExportStatus.COMPLETE, last_exit_code=0))
+    _write_hf_export_request(request.with_status(HFExportStatus.COMPLETE, last_exit_code=0))
 
 
 def main() -> None:

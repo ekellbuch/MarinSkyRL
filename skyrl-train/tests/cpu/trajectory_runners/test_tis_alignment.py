@@ -83,7 +83,7 @@ def test_metrics_fractions():
     stats.n_lcs = 1
     stats.n_unaligned = 1
     stats.n_failed_messages = 0
-    m = stats.as_metrics(prefix="tis/")
+    m = stats.as_metrics(prefix="tis/", lcs_alert_threshold=0.005)
     assert math.isclose(m["tis/exact_match_fraction"], 0.8)
     assert math.isclose(m["tis/lcs_fallback_fraction"], 0.1)
     assert math.isclose(m["tis/unaligned_fraction"], 0.1)
@@ -91,29 +91,27 @@ def test_metrics_fractions():
     assert m["tis/lcs_fallback_alert"] == 1.0
 
 
-def test_lcs_fallback_alert_metric(monkeypatch):
-    monkeypatch.delenv("SKYRL_TIS_LCS_ALERT_THRESHOLD", raising=False)
+def test_lcs_fallback_alert_metric():
     # No LCS -> no alert; always-present (keyset-stable) key.
     clean = AlignmentStats()
     clean.n_tokens = 100
     clean.n_exact = 100
-    mc = clean.as_metrics()
+    mc = clean.as_metrics(lcs_alert_threshold=0.005)
     assert "tis/lcs_fallback_alert" in mc and mc["tis/lcs_fallback_alert"] == 0.0
     # A tiny sub-threshold LCS fraction does NOT alert.
     tiny = AlignmentStats()
     tiny.n_tokens = 1000
     tiny.n_exact = 998
     tiny.n_lcs = 2  # 0.002 < 0.005
-    assert tiny.as_metrics()["tis/lcs_fallback_alert"] == 0.0
+    assert tiny.as_metrics(lcs_alert_threshold=0.005)["tis/lcs_fallback_alert"] == 0.0
     # Above threshold -> alert.
     bad = AlignmentStats()
     bad.n_tokens = 100
     bad.n_exact = 90
     bad.n_lcs = 10  # 0.10 > 0.005
-    assert bad.as_metrics()["tis/lcs_fallback_alert"] == 1.0
-    # Env override raises the bar.
-    monkeypatch.setenv("SKYRL_TIS_LCS_ALERT_THRESHOLD", "0.2")
-    assert bad.as_metrics()["tis/lcs_fallback_alert"] == 0.0
+    assert bad.as_metrics(lcs_alert_threshold=0.005)["tis/lcs_fallback_alert"] == 1.0
+    # Typed threshold raises the bar.
+    assert bad.as_metrics(lcs_alert_threshold=0.2)["tis/lcs_fallback_alert"] == 0.0
 
 
 def test_extract_float_format_no_longer_disables_tis():
@@ -140,28 +138,19 @@ def test_extract_prompt_token_ids():
     assert extract_prompt_token_ids_from_rollout_details([]) is None
 
 
-def test_tito_full_resolution_precedence(monkeypatch):
-    monkeypatch.delenv("SKYRL_TITO_FULL", raising=False)
-
-    # (3) AUTO / unset: follow whether the selected objective consumes rollout logprobs.
+def test_tito_full_resolution_precedence():
+    # AUTO / unset: follow whether the selected objective consumes rollout logprobs.
     assert _tito_full_enabled() is False
     assert _tito_full_enabled(rollout_logprobs_required=True) is True
     assert _tito_full_enabled(rollout_logprobs_required=False) is False
 
-    # (2) explicit config flag overrides the objective when non-None.
+    # Explicit config overrides the objective when non-None.
     assert _tito_full_enabled(rollout_logprobs_required=True, tito_full=False) is False
     assert _tito_full_enabled(rollout_logprobs_required=False, tito_full=True) is True
     assert _tito_full_enabled(rollout_logprobs_required=True, tito_full=None) is True
 
-    # (1) env var wins over everything.
-    monkeypatch.setenv("SKYRL_TITO_FULL", "1")
-    assert _tito_full_enabled(rollout_logprobs_required=False, tito_full=False) is True
-    monkeypatch.setenv("SKYRL_TITO_FULL", "0")
-    assert _tito_full_enabled(rollout_logprobs_required=True, tito_full=True) is False
 
-
-def test_tito_full_without_rollout_logprob_consumer_preserves_existing_assembly(monkeypatch):
-    monkeypatch.delenv("SKYRL_TITO_FULL", raising=False)
+def test_tito_full_without_rollout_logprob_consumer_preserves_existing_assembly():
     assert _tito_full_enabled(rollout_logprobs_required=False, tito_full=None) is False
 
 

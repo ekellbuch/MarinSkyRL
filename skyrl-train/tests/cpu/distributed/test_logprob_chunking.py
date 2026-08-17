@@ -8,18 +8,20 @@ from null (unchunked) to 1024, which routes both the policy and ref logprob forw
 through `ChunkedDistributedLogprob` (per-position log-softmax, chunked along the
 sequence dim), bounding peak memory regardless of sequence length.
 
-These tests pin the two properties that make that default flip safe:
+These tests pin the properties that make the Megatron logprob and entropy paths safe:
   1. The chunked path is numerically identical to the unchunked path — in both the
      forward log-probs AND the backward gradient — so turning it on cannot change
      training results. (Log-softmax is per-position over vocab; chunking only splits
      the independent sequence positions, so it is exact, not approximate.)
   2. The composed base config defaults `logprob_chunk_size` to 1024 for BOTH the
      policy and ref megatron_config (the two keys the workers read).
+  3. Entropy and logprob losses can backpropagate through the same logits tensor,
+     and their combined gradient matches an independent PyTorch reference.
 
 `model_utils` imports `megatron.core.parallel_state` at module load, but the functions
-under test never touch it, so when megatron is not installed (the CPU CI env) we stub
-it via the shared tests/cpu/util.py helper — only if megatron is genuinely absent, so a
-real-megatron env is left untouched.
+under test only need one tensor-parallel group lookup. When megatron is not installed
+(the CPU CI env), the shared tests/cpu/util.py helper stubs the import and the entropy
+test supplies the real single-rank process group. A real-megatron env is left untouched.
 """
 
 import pytest
@@ -29,9 +31,11 @@ from tests.cpu.util import stub_megatron_modules
 
 stub_megatron_modules()
 
+from skyrl_train.distributed.megatron import model_utils  # noqa: E402
 from skyrl_train.distributed.megatron.model_utils import (  # noqa: E402
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    vocab_parallel_entropy,
 )
 
 
@@ -136,8 +140,6 @@ def test_chunked_backward_does_not_allocate_a_full_fp32_gradient(single_rank_gro
     gradient is filled chunk-by-chunk, so a zeroed fp32 destination is neither
     necessary nor safe at this sequence length.
     """
-    import skyrl_train.distributed.megatron.model_utils as model_utils
-
     torch.manual_seed(4)
     logits = torch.randn(1, 9, 16, dtype=torch.bfloat16).requires_grad_(True)
     targets = torch.randint(0, 16, (1, 9))
@@ -153,6 +155,34 @@ def test_chunked_backward_does_not_allocate_a_full_fp32_gradient(single_rank_gro
     _logprobs(logits, targets, single_rank_group, chunk_size=3, inference_only=False).sum().backward()
     assert logits.grad is not None
     assert logits.grad.dtype is torch.bfloat16
+
+
+def test_vocab_parallel_entropy_and_logprob_share_logits_without_corrupting_backward(single_rank_group, monkeypatch):
+    """Entropy and policy losses must backpropagate through the same logits tensor."""
+    monkeypatch.setattr(model_utils.mpu, "get_tensor_model_parallel_group", lambda: single_rank_group, raising=False)
+    torch.manual_seed(5)
+    base_logits = torch.randn(2, 7, 16, dtype=torch.float32)
+    targets = torch.randint(0, base_logits.shape[-1], (base_logits.shape[0], base_logits.shape[1]))
+
+    parallel_logits = base_logits.clone().requires_grad_(True)
+    parallel_logprobs = _logprobs(
+        parallel_logits,
+        targets,
+        single_rank_group,
+        chunk_size=3,
+        inference_only=False,
+    )
+    parallel_entropy = vocab_parallel_entropy(parallel_logits)
+    (parallel_logprobs.sum() + 0.003 * parallel_entropy.sum()).backward()
+
+    reference_logits = base_logits.clone().requires_grad_(True)
+    reference_log_probs = reference_logits.log_softmax(dim=-1)
+    rolled_targets = targets.roll(shifts=-1, dims=-1)
+    reference_chosen = reference_log_probs.gather(-1, rolled_targets.unsqueeze(-1)).squeeze(-1)[:, :-1]
+    reference_entropy = -(reference_log_probs.exp() * reference_log_probs).sum(dim=-1)
+    (reference_chosen.sum() + 0.003 * reference_entropy.sum()).backward()
+
+    assert torch.allclose(parallel_logits.grad, reference_logits.grad, atol=1e-6, rtol=1e-6)
 
 
 def test_packed_logprobs_preserve_left_padded_action_positions(single_rank_group):

@@ -1,8 +1,10 @@
-"""T3: compare independent eager and grouped MoE gradients tensor by tensor.
+"""T3: compare independent eager, grouped-kernel, and attention gradients.
 
-The MoE isolation uses an eager per-expert oracle and the grouped implementation
-with identical fp32 weights and forced routes. The attention isolation compares
-Hugging Face eager attention with FlashAttention2 through its attention boundary.
+The MoE isolation uses an eager per-expert oracle with identical weights and
+forced routes. It covers the SkyRL FP32 for-loop, SkyRL BF16
+``torch._grouped_mm``, and Megatron Core ``TEGroupedMLP`` paths. Attention
+coverage compares Hugging Face eager attention with FlashAttention2 and PyTorch
+SDPA with Transformer Engine ``DotProductAttention``.
 
 Run on one GPU::
 
@@ -11,8 +13,14 @@ Run on one GPU::
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from torch import nn
+from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear, TERowParallelGroupedLinear
+from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupedMLP
+from megatron.core.transformer.transformer_config import TransformerConfig
+from transformer_engine.pytorch.attention import DotProductAttention
 from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
 from skyrl_train.models.layers.moe import MoE
@@ -58,6 +66,77 @@ class _EagerMoE(nn.Module):
         return output.view_as(inputs)
 
 
+class _SingletonProcessGroup:
+    def size(self) -> int:
+        return 1
+
+    def rank(self) -> int:
+        return 0
+
+
+class _SingletonModelCommProcessGroups:
+    def __init__(self) -> None:
+        group = _SingletonProcessGroup()
+        self.ep = group
+        self.expt_tp = group
+        self.expt_dp = group
+
+
+class _MegatronGroupedMoE(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.router = nn.Linear(MODEL_SIZE, NUM_EXPERTS, bias=False, dtype=torch.bfloat16)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=MODEL_SIZE,
+            num_attention_heads=4,
+            ffn_hidden_size=HIDDEN_SIZE,
+            num_moe_experts=NUM_EXPERTS,
+            moe_ffn_hidden_size=HIDDEN_SIZE,
+            moe_router_topk=TOP_K,
+            moe_grouped_gemm=True,
+            gated_linear_unit=True,
+            activation_func=torch.nn.functional.silu,
+            add_bias_linear=False,
+            params_dtype=torch.bfloat16,
+            perform_initialization=False,
+        )
+        self.experts = TEGroupedMLP(
+            NUM_EXPERTS,
+            config,
+            GroupedMLPSubmodules(
+                linear_fc1=TEColumnParallelGroupedLinear,
+                linear_fc2=TERowParallelGroupedLinear,
+            ),
+            pg_collection=_SingletonModelCommProcessGroups(),
+        )
+
+    def forward(self, inputs: torch.Tensor, routes: torch.Tensor) -> torch.Tensor:
+        flat = inputs.flatten(0, 1)
+        flat_routes = routes.flatten(0, 1)
+        probabilities = torch.softmax(self.router(flat).float(), dim=-1)
+        weights = probabilities.gather(-1, flat_routes)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        routed_inputs = []
+        routed_weights = []
+        routed_token_indices = []
+        tokens_per_expert = []
+        for expert in range(NUM_EXPERTS):
+            token_indices, slots = torch.where(flat_routes == expert)
+            routed_inputs.append(flat[token_indices])
+            routed_weights.append(weights[token_indices, slots])
+            routed_token_indices.append(token_indices)
+            tokens_per_expert.append(token_indices.numel())
+        permuted_inputs = torch.cat(routed_inputs)
+        permuted_weights = torch.cat(routed_weights)
+        token_indices = torch.cat(routed_token_indices)
+        counts = torch.tensor(tokens_per_expert, device=inputs.device, dtype=torch.int64)
+        routed_output, _ = self.experts(permuted_inputs, counts, permuted_weights)
+        output = torch.zeros_like(flat)
+        output.scatter_add_(0, token_indices[:, None].expand(-1, flat.shape[-1]), routed_output)
+        return output.view_as(inputs)
+
+
 def _copy_moe_weights(reference: _EagerMoE, candidate: MoE) -> None:
     with torch.no_grad():
         candidate.router.gate.weight.copy_(reference.router.weight)
@@ -65,6 +144,17 @@ def _copy_moe_weights(reference: _EagerMoE, candidate: MoE) -> None:
             candidate.experts.w1[expert].copy_(reference.gate[expert].weight)
             candidate.experts.w3[expert].copy_(reference.up[expert].weight)
             candidate.experts.w2[expert].copy_(reference.down[expert].weight)
+
+
+def _copy_megatron_moe_weights(reference: _EagerMoE, candidate: _MegatronGroupedMoE) -> None:
+    with torch.no_grad():
+        candidate.router.weight.copy_(reference.router.weight)
+        for expert in range(NUM_EXPERTS):
+            weight1 = getattr(candidate.experts.linear_fc1, f"weight{expert}")
+            weight2 = getattr(candidate.experts.linear_fc2, f"weight{expert}")
+            weight1[:HIDDEN_SIZE].copy_(reference.gate[expert].weight)
+            weight1[HIDDEN_SIZE:].copy_(reference.up[expert].weight)
+            weight2.copy_(reference.down[expert].weight)
 
 
 def _comparison_row(
@@ -104,35 +194,139 @@ def _comparison_rows(reference: _EagerMoE, candidate: MoE) -> list[dict[str, flo
     return rows
 
 
-def test_t3_moe_eager_and_grouped_fp32_gradients_match() -> None:
-    require_cuda_gpus(1)
-    device = torch.device("cuda", 0)
+def _megatron_comparison_rows(
+    reference: _EagerMoE,
+    candidate: _MegatronGroupedMoE,
+) -> list[dict[str, float | str | bool]]:
+    pairs = [("router.weight", reference.router.weight.grad, candidate.router.weight.grad)]
+    for expert in range(NUM_EXPERTS):
+        weight1 = getattr(candidate.experts.linear_fc1, f"weight{expert}").grad
+        weight2 = getattr(candidate.experts.linear_fc2, f"weight{expert}").grad
+        pairs.extend(
+            [
+                (f"expert.{expert}.gate", reference.gate[expert].weight.grad, weight1[:HIDDEN_SIZE]),
+                (f"expert.{expert}.up", reference.up[expert].weight.grad, weight1[HIDDEN_SIZE:]),
+                (f"expert.{expert}.down", reference.down[expert].weight.grad, weight2),
+            ]
+        )
+    rows = [
+        _comparison_row(name, "router" if name.startswith("router") else "expert", expected, actual)
+        for name, expected, actual in pairs
+    ]
+    rows.sort(key=lambda row: (row["category"] != "router", row["parameter"]))
+    return rows
+
+
+def _backward_moe_pair(
+    reference: _EagerMoE,
+    candidate_forward: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    generator = torch.Generator(device=device).manual_seed(SEED + 1)
+    inputs = torch.randn(
+        BATCH_SIZE,
+        SEQUENCE_LENGTH,
+        MODEL_SIZE,
+        generator=generator,
+        device=device,
+        dtype=dtype,
+    )
+    routes = torch.topk(reference.router(inputs).float(), TOP_K, dim=-1).indices
+    weights = torch.randn(inputs.shape, generator=generator, device=device, dtype=dtype)
+    (reference(inputs, routes) * weights).float().sum().backward()
+    (candidate_forward(inputs, routes) * weights).float().sum().backward()
+
+
+def _write_moe_rows(
+    artifact_name: str,
+    isolation: str,
+    rows: list[dict[str, float | str | bool]],
+) -> None:
+    write_rows(
+        artifact_name,
+        rows,
+        {
+            "isolation": isolation,
+            "cosine_tolerance": COSINE_TOLERANCE,
+            "norm_ratio_interval": [NORM_RATIO_LOW, NORM_RATIO_HIGH],
+        },
+    )
+
+
+def _moe_comparison(
+    device: torch.device,
+    *,
+    dtype: torch.dtype,
+    use_grouped_mm: bool,
+    artifact_name: str,
+    isolation: str,
+) -> list[dict[str, float | str | bool]]:
     torch.manual_seed(SEED)
-    reference = _EagerMoE().to(device)
+    reference = _EagerMoE().to(device=device, dtype=dtype)
     candidate = MoE(
         dim=MODEL_SIZE,
         hidden_dim=HIDDEN_SIZE,
         num_experts=NUM_EXPERTS,
         top_k=TOP_K,
         route_norm=True,
-        use_grouped_mm=False,
-    ).to(device)
+        use_grouped_mm=use_grouped_mm,
+    ).to(device=device, dtype=dtype)
     _copy_moe_weights(reference, candidate)
-    generator = torch.Generator(device=device).manual_seed(SEED + 1)
-    inputs = torch.randn(BATCH_SIZE, SEQUENCE_LENGTH, MODEL_SIZE, generator=generator, device=device)
-    routes = torch.topk(reference.router(inputs).float(), TOP_K, dim=-1).indices
-    weights = torch.randn(inputs.shape, generator=generator, device=device)
-    (reference(inputs, routes) * weights).sum().backward()
-    (candidate(inputs, routed_experts=routes) * weights).sum().backward()
+    _backward_moe_pair(
+        reference,
+        lambda inputs, routes: candidate(inputs, routed_experts=routes),
+        device=device,
+        dtype=dtype,
+    )
     rows = _comparison_rows(reference, candidate)
-    write_rows(
-        "t3-moe-isolation-fp32",
+    _write_moe_rows(artifact_name, isolation, rows)
+    return rows
+
+
+def test_t3_moe_eager_and_for_loop_fp32_gradients_match() -> None:
+    require_cuda_gpus(1)
+    rows = _moe_comparison(
+        torch.device("cuda", 0),
+        dtype=torch.float32,
+        use_grouped_mm=False,
+        artifact_name="t3-moe-for-loop-fp32",
+        isolation="eager per-expert oracle versus SkyRL for-loop experts",
+    )
+    assert all(row["passed"] for row in rows)
+
+
+def test_t3_moe_eager_and_grouped_mm_bf16_gradients_match() -> None:
+    require_cuda_gpus(1)
+    rows = _moe_comparison(
+        torch.device("cuda", 0),
+        dtype=torch.bfloat16,
+        use_grouped_mm=True,
+        artifact_name="t3-moe-grouped-mm-bf16",
+        isolation="eager per-expert oracle versus torch._grouped_mm experts",
+    )
+    assert all(row["passed"] for row in rows)
+
+
+def test_t3_megatron_grouped_moe_bf16_gradients_match_eager_reference() -> None:
+    require_cuda_gpus(1)
+    device = torch.device("cuda", 0)
+    torch.manual_seed(SEED)
+    reference = _EagerMoE().to(device=device, dtype=torch.bfloat16)
+    candidate = _MegatronGroupedMoE().to(device)
+    _copy_megatron_moe_weights(reference, candidate)
+    _backward_moe_pair(
+        reference,
+        candidate,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    rows = _megatron_comparison_rows(reference, candidate)
+    _write_moe_rows(
+        "t3-megatron-grouped-moe-bf16",
+        "shared eager router and routes; eager experts versus Megatron GroupedMLP",
         rows,
-        {
-            "isolation": "shared eager attention; eager experts versus grouped experts",
-            "cosine_tolerance": COSINE_TOLERANCE,
-            "norm_ratio_interval": [NORM_RATIO_LOW, NORM_RATIO_HIGH],
-        },
     )
     assert all(row["passed"] for row in rows)
 
@@ -187,6 +381,73 @@ def test_t3_attention_eager_and_flash_attention2_gradients_match() -> None:
         rows,
         {
             "isolation": "frozen MoE; eager attention versus FlashAttention2",
+            "cosine_tolerance": COSINE_TOLERANCE,
+            "norm_ratio_interval": [NORM_RATIO_LOW, NORM_RATIO_HIGH],
+        },
+    )
+    assert all(row["passed"] for row in rows)
+
+
+def test_t3_transformer_engine_attention_gradients_match_sdpa_reference() -> None:
+    require_cuda_gpus(1)
+    device = torch.device("cuda", 0)
+    batch = 2
+    sequence = 11
+    heads = 4
+    head_dim = 16
+    generator = torch.Generator(device=device).manual_seed(SEED + 2)
+    inputs = tuple(
+        torch.randn(
+            batch,
+            sequence,
+            heads,
+            head_dim,
+            generator=generator,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        for _ in range(3)
+    )
+    reference_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+    candidate_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+    output_weights = torch.randn(
+        batch,
+        sequence,
+        heads,
+        head_dim,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    query, key, value = reference_inputs
+    reference_output = torch.nn.functional.scaled_dot_product_attention(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        is_causal=True,
+    ).transpose(1, 2)
+    (reference_output * output_weights).float().sum().backward()
+
+    attention = DotProductAttention(
+        num_attention_heads=heads,
+        kv_channels=head_dim,
+        num_gqa_groups=heads,
+        attention_dropout=0.0,
+        qkv_format="bshd",
+        attn_mask_type="causal",
+    ).to(device)
+    candidate_output = attention(*candidate_inputs).view(batch, sequence, heads, head_dim)
+    (candidate_output * output_weights).float().sum().backward()
+
+    rows = [
+        _comparison_row(f"attention.{name}", "attention", expected.grad, actual.grad)
+        for name, expected, actual in zip(("query", "key", "value"), reference_inputs, candidate_inputs, strict=True)
+    ]
+    write_rows(
+        "t3-transformer-engine-attention-bf16",
+        rows,
+        {
+            "isolation": "PyTorch SDPA versus Transformer Engine DotProductAttention",
             "cosine_tolerance": COSINE_TOLERANCE,
             "norm_ratio_interval": [NORM_RATIO_LOW, NORM_RATIO_HIGH],
         },

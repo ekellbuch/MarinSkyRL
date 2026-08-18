@@ -6,7 +6,12 @@ from typing import Any
 from omegaconf import DictConfig
 
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
-from skyrl_gym.envs.lcb.livecodebench import compute_score, normalize_lcb_ground_truth
+from skyrl_gym.envs.lcb.livecodebench import (
+    BINARY_REWARD_MODE,
+    LCB_REWARD_MODES,
+    compute_score,
+    normalize_lcb_ground_truth,
+)
 
 logger = logging.getLogger(__name__)
 _INVALID_GROUND_TRUTH_ERROR = "invalid reward_model.ground_truth"
@@ -25,6 +30,9 @@ class LCBEnv(BaseTextEnv):
         extras: dict[str, Any] | None = None,
     ):
         super().__init__()
+        self.reward_mode = str(env_config.get("reward_mode", BINARY_REWARD_MODE))
+        if self.reward_mode not in LCB_REWARD_MODES:
+            raise ValueError(f"Unsupported LCB reward_mode: {self.reward_mode!r}.")
 
         reward_model = (extras or {}).get("reward_model")
         ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, Mapping) else None
@@ -46,7 +54,7 @@ class LCBEnv(BaseTextEnv):
                 done=True,
                 metadata={"parsed_code": None, "verifier_error": _INVALID_GROUND_TRUTH_ERROR},
             )
-        parsed_code, reward = compute_score(action, self.tests)
+        parsed_code, reward = compute_score(action, self.tests, self.reward_mode)
 
         # RL on LCB w/ single-turn
         return BaseTextEnvStepOutput(observations=[], reward=reward, done=True, metadata={"parsed_code": parsed_code})

@@ -1,0 +1,40 @@
+trials_dir: /home/gcpuser/outputs/rl_one_task/runs/clean-two-step-072226/trace_jobs
+harbor:
+  name: terminus-2
+  environment_type: gke
+  environment_kwargs:
+    project_id: soe-hazy-gemini
+    cluster_name: harbor-tb21
+    region: asia-northeast3
+    namespace: harbor
+    registry_location: asia-northeast3
+    registry_name: harbor-tasks
+  max_episodes: 16
+  enable_summarize: false
+  store_all_messages: true
+  enable_episode_logging: true
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+  override_timeout_sec: 900
+  override_cpus: 1
+  override_memory_mb: 2048
+  override_storage_mb: 2048
+  verifier_override_timeout_sec: 120
+  enable_error_classification: true
+  max_retries: 3
+  min_wait_sec: 10.0
+  max_wait_sec: 120.0
+  wait_multiplier: 2.0
+  exclude_exceptions:
+  - AgentTimeoutError
+  - VerifierTimeoutError
+  - RewardFileNotFoundError
+  - RewardFileEmptyError
+  - VerifierOutputParseError
+  - ContextLengthExceededError
+  n_concurrent_trials: 7
+  log_level: INFO
+model_info:
+  max_input_tokens: 32768
+  max_output_tokens: 8192

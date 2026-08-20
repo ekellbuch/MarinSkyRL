@@ -144,6 +144,34 @@ def _output() -> TrajectoryBatch:
     }
 
 
+_INPUT_BATCH_SEQUENCE_KEYS = ("prompts", "env_classes", "env_extras", "trajectory_ids")
+_OUTPUT_BATCH_SEQUENCE_KEYS = (
+    "prompt_token_ids",
+    "response_ids",
+    "rewards",
+    "unshaped_rewards",
+    "reward_shaping_components",
+    "reward_shaping_loop_spans",
+    "loop_advantages",
+    "reward_shaping_versions",
+    "loss_masks",
+    "stop_reasons",
+    "trajectory_ids",
+)
+
+
+def _select_batch_rows(indices) -> tuple[TrajectoryRequestBatch, TrajectoryBatch]:
+    input_batch = _input()
+    output = _output()
+    for key in _INPUT_BATCH_SEQUENCE_KEYS:
+        values = input_batch[key]
+        input_batch[key] = [values[index % len(values)] for index in indices]
+    for key in _OUTPUT_BATCH_SEQUENCE_KEYS:
+        values = output[key]
+        output[key] = [values[index % len(values)] for index in indices]
+    return input_batch, output
+
+
 def _config(output_path: Path, **overrides):
     raw = {
         "enabled": True,
@@ -334,6 +362,46 @@ def test_retention_is_deterministic_and_enforces_compressed_byte_bound_before_wr
     assert _records(tmp_path) == []
 
 
+def test_retention_publishes_a_full_training_batch_as_one_archive(tmp_path):
+    batch_size = 256
+    input_batch, output = _select_batch_rows(range(batch_size))
+    trajectory_ids = [TrajectoryID(instance_id=f"sample-{index}", repetition_id=0) for index in range(batch_size)]
+    input_batch["trajectory_ids"] = trajectory_ids
+    output["unshaped_rewards"] = [0.0] * batch_size
+    output["trajectory_ids"] = trajectory_ids
+    config = _config(tmp_path)
+
+    metrics = _sink(config).retain(input_batch, output)
+
+    archives = list(tmp_path.rglob("*.zip"))
+    assert metrics["generate/trajectory_retention/written"] == batch_size
+    assert len(_records(tmp_path)) == batch_size
+    assert len(archives) == 1
+
+
+def test_retention_targets_compressed_record_bytes_and_ignores_archive_overhead(tmp_path):
+    sizing_path = tmp_path / "sizing"
+    input_batch = _input()
+    output = _output()
+    _sink(_config(sizing_path)).retain(input_batch, output)
+    with zipfile.ZipFile(next(sizing_path.rglob("*.zip"))) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+    retained_manifest = manifest["records"][:2]
+    payload_limit = sum(record["bytes"] for record in retained_manifest)
+    expected_record_ids = {record["record_id"] for record in retained_manifest}
+
+    bounded_path = tmp_path / "bounded"
+    config = _config(bounded_path, max_bytes_per_step=payload_limit)
+    metrics = _sink(config).retain(input_batch, output)
+
+    archives = list(bounded_path.rglob("*.zip"))
+    assert metrics["generate/trajectory_retention/written"] == 2.0
+    assert metrics["generate/trajectory_retention/dropped_by_bounds"] == 1.0
+    assert {record["record_id"] for record in _records(bounded_path)} == expected_record_ids
+    assert len(archives) == 1
+    assert archives[0].stat().st_size > config.max_bytes_per_step
+
+
 def test_custom_stop_contract_controls_non_termination_selection(tmp_path):
     output = _output()
     for index in range(3):
@@ -383,23 +451,7 @@ def test_sample_count_is_global_and_order_independent_across_async_completions(t
     for directory, order in ((tmp_path / "forward", range(3)), (tmp_path / "reverse", reversed(range(3)))):
         sink = _sink(_config(directory, **config_overrides))
         for index in order:
-            input_batch = _input()
-            output = _output()
-            for key in ("prompts", "env_classes", "env_extras", "trajectory_ids"):
-                input_batch[key] = [input_batch[key][index]]
-            for key in (
-                "prompt_token_ids",
-                "response_ids",
-                "rewards",
-                "unshaped_rewards",
-                "reward_shaping_components",
-                "reward_shaping_loop_spans",
-                "reward_shaping_versions",
-                "loss_masks",
-                "stop_reasons",
-                "trajectory_ids",
-            ):
-                output[key] = [output[key][index]]
+            input_batch, output = _select_batch_rows([index])
             sink.retain(input_batch, output)
         records = _records(directory)
         assert len(records) == 1

@@ -327,6 +327,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.num_parallel_generation_workers = cfg.trainer.fully_async.num_parallel_generation_workers
         self.mini_batch_size = cfg.trainer.policy_mini_batch_size
         self.max_staleness_steps = cfg.trainer.fully_async.max_staleness_steps
+        self.admission_stall_timeout = int(cfg.trainer.fully_async.admission_stall_timeout)
+        if self.admission_stall_timeout <= 0:
+            raise ValueError("trainer.fully_async.admission_stall_timeout must be positive")
         self._group_selection_policy = GroupSelectionPolicy.for_fully_async(cfg.trainer.algorithm.dynamic_sampling.type)
         self._dynamic_sampling_type = self._group_selection_policy.sampling_type
         max_sample_batches = int(cfg.trainer.algorithm.dynamic_sampling.max_sample_batches)
@@ -1208,13 +1211,14 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         return self._generation_stall_timeout()
 
     def _check_admission_stall(self, elapsed: float, rejection_counts: collections.Counter[str]) -> float:
-        """Raise on rejected-only progress, or return the next ordinary stall timeout."""
+        """Raise on rejected-only progress, or restart the admission deadline."""
         if rejection_counts:
             raise GenerationStalledError(
                 f"Generation stalled: no groups admitted for {elapsed:.0f}s; "
                 f"rejected completions={dict(rejection_counts)}"
             )
-        return self._check_generation_stall(elapsed)
+        self._check_generation_stall(elapsed)
+        return float(self.admission_stall_timeout)
 
     def _select_dynamic_sampling_candidates(
         self,
@@ -1259,7 +1263,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         accepted_groups = []
         loop = asyncio.get_event_loop()
         last_admitted_progress = loop.time()
-        stall_timeout = self._generation_stall_timeout()
+        stall_timeout = float(self.admission_stall_timeout)
         rejection_counts_since_admission: collections.Counter[str] = collections.Counter()
         dynamic_candidate_count = 0
         dynamic_discarded_count = 0
@@ -1306,7 +1310,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                 if selection.admitted_groups:
                     last_admitted_progress = loop.time()
-                    stall_timeout = self._generation_stall_timeout()
+                    stall_timeout = float(self.admission_stall_timeout)
                     rejection_counts_since_admission.clear()
 
                 if len(accepted_groups) >= self.mini_batch_size:

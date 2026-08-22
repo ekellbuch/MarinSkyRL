@@ -26,6 +26,7 @@ from skyrl_train.models.grug_query_bias import (
     GrugQueryBiasObservation,
 )
 from skyrl_train.models.layers.moe_routing import TokenReorderer, grouped_expert_contributions
+from skyrl_train.models.router_instrumentation import NativeRouterObserverEmitter, emit_router_forward
 from skyrl_train.utils.flash_attention import (
     FLASH_ATTN_IMPORT_ERROR,
     flash_attn_func,
@@ -412,7 +413,7 @@ class GrugMoeRouterOutput(NamedTuple):
     combine_weights: torch.Tensor
 
 
-class GrugMoeRouter(nn.Module):
+class GrugMoeRouter(nn.Module, NativeRouterObserverEmitter):
     def __init__(self, config: GrugMoeConfig) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.empty(config.num_local_experts, config.hidden_size))
@@ -451,6 +452,15 @@ class GrugMoeRouter(nn.Module):
             combine_weights = torch.sigmoid(selected_logits)
             combine_weights = combine_weights * (
                 _ROUTING_RENORM_SUM / (combine_weights.sum(dim=-1, keepdim=True) + 1e-9)
+            )
+
+            emit_router_forward(
+                router=self,
+                router_inputs=hidden_states,
+                selection_logits=biased_logits,
+                natural_selected_experts=selected_experts,
+                selected_experts=selected_experts,
+                combine_weights=combine_weights,
             )
 
             if self._capture_q is not None:

@@ -48,7 +48,7 @@ dependencies = [
     "tensordict",
     "jaxtyping",
     "skyrl-gym",
-    "flash-attn",
+    "flash-attn==2.8.3",
     "polars",
     "s3fs",
     "boto3",
@@ -123,6 +123,7 @@ skyrl-gym = { path = "./skyrl-gym" , editable = true }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "extra == 'vllm'" }
+flash-attn = { url = "https://github.com/ekellbuch/MarinSkyRL/releases/download/flash-attn-2.8.3-cu130-cp312/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux'" }
 torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "a1fdd7e" }
 deep-ep = { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_x86_64.whl" }
 # Megatron backend (see the `megatron` extra). These are sdist-only on PyPI and build CUDA
@@ -158,7 +159,6 @@ sandboxes = [
 ]
 vllm = [
     "vllm==0.20.2",
-    "flash-attn==2.6.3",
     "torch==2.11.0",
     "flashinfer-python==0.6.8.post1",
     "flashinfer-jit-cache==0.6.8.post1",

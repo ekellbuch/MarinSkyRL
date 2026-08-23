@@ -11,6 +11,7 @@ Regression guard for the r5 engine-starvation investigation
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
@@ -55,3 +56,39 @@ def test_yaml_false_is_honored_no_falsy_bug():
     # The r5 case: explicit `false` must NOT be swallowed by the default.
     kwargs = _agent_kwargs({"name": "terminus-2", "record_terminal_session": False})
     assert kwargs["record_terminal_session"] is False
+
+
+def test_custom_agent_import_path_and_kwargs_reach_harbor(tmp_path: Path):
+    task = tmp_path / "task"
+    task.mkdir()
+    cfg = OmegaConf.create(
+        {
+            "harbor": {
+                "name": "terminus-2",
+                "agent_import_path": "experiment_agents:Terminus2Edit",
+                "agent_kwargs": {
+                    "prompt_variant": "task_completion_discouraged",
+                    "prompt_options": {"require_evidence": True},
+                    "api_base": "http://wrong.example/v1",
+                    "max_episodes": 99,
+                },
+                "max_episodes": 12,
+            }
+        }
+    )
+
+    trial = HarborConfigBuilder(cfg).build_trial_config(
+        task_path=str(task),
+        trials_dir=str(tmp_path / "trials"),
+        model_name="hosted_vllm/Qwen3-1.7B",
+        api_base="http://localhost:8000/v1",
+        session_id="trial-1",
+    )
+
+    assert cfg.harbor.name == "terminus-2"
+    assert trial.agent.name is None
+    assert trial.agent.import_path == "experiment_agents:Terminus2Edit"
+    assert trial.agent.kwargs["prompt_variant"] == "task_completion_discouraged"
+    assert trial.agent.kwargs["prompt_options"] == {"require_evidence": True}
+    assert trial.agent.kwargs["api_base"] == "http://localhost:8000/v1"
+    assert trial.agent.kwargs["max_episodes"] == 12

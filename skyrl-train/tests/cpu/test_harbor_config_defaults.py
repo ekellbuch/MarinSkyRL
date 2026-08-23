@@ -11,7 +11,6 @@ Regression guard for the r5 engine-starvation investigation
 
 import os
 import sys
-from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
@@ -58,9 +57,7 @@ def test_yaml_false_is_honored_no_falsy_bug():
     assert kwargs["record_terminal_session"] is False
 
 
-def test_custom_agent_import_path_and_kwargs_reach_harbor(tmp_path: Path):
-    task = tmp_path / "task"
-    task.mkdir()
+def test_custom_agent_import_path_and_kwargs_reach_harbor():
     cfg = OmegaConf.create(
         {
             "harbor": {
@@ -78,8 +75,8 @@ def test_custom_agent_import_path_and_kwargs_reach_harbor(tmp_path: Path):
     )
 
     trial = HarborConfigBuilder(cfg).build_trial_config(
-        task_path=str(task),
-        trials_dir=str(tmp_path / "trials"),
+        task_path="/tasks/example",
+        trials_dir="/trials",
         model_name="hosted_vllm/Qwen3-1.7B",
         api_base="http://localhost:8000/v1",
         session_id="trial-1",

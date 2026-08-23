@@ -138,6 +138,8 @@ RENDEZVOUS_WRITE_ATTEMPTS = 5
 RENDEZVOUS_WRITE_TIMEOUT = 30  # seconds per attempt
 # Bound `ray start --head` so a hung Ray CLI fails loud (TimeoutExpired).
 RAY_START_HEAD_TIMEOUT = 300  # seconds
+# Failure reporting must never keep an Iris task alive after its driver exits.
+FAILURE_ARTIFACT_TIMEOUT = 30
 
 
 def _log(msg: str) -> None:
@@ -1557,6 +1559,15 @@ def launch_training_driver(train_argv: list[str], env: dict[str, str]) -> subpro
     return subprocess.Popen(train_argv, env=env, cwd=runtime_checkout, start_new_session=True)
 
 
+def _persist_failure_artifacts_bounded(action, timeout: float) -> None:
+    """Give failure evidence a bounded upload window without delaying task failure indefinitely."""
+    artifact_thread = threading.Thread(target=action, daemon=True, name="failure-artifact-sync")
+    artifact_thread.start()
+    artifact_thread.join(timeout)
+    if artifact_thread.is_alive():
+        _log(f"Failure artifact upload exceeded {timeout}s; continuing task teardown")
+
+
 def run_head(args: argparse.Namespace, train_argv: list[str], derived_gloo_ifname: str | None = None) -> int:
     num_tasks = _num_tasks()
     head_ip = _own_ip()
@@ -1566,6 +1577,12 @@ def run_head(args: argparse.Namespace, train_argv: list[str], derived_gloo_ifnam
     _log(f"ROLE=head rank=0/{num_tasks} head_ip={head_ip} ray_port={ray_port}")
     ray_log_sync_stop: threading.Event | None = None
     ray_log_sync = RayLogSyncSession(args.ray_log_dir, node_id)
+
+    def persist_runtime_artifacts(reason: str) -> None:
+        if ray_log_sync_stop is not None:
+            ray_log_sync_stop.set()
+        ray_log_sync.sync_bounded(reason)
+        sync_debug_artifacts(args.rendezvous_dir, node_id, reason)
 
     # Install the SIGTERM/SIGINT handler + termination-artifact capture at the TOP of
     # bring-up (BEFORE clear_rendezvous / ray_start_head / rendezvous write), so a reap
@@ -1652,12 +1669,20 @@ def run_head(args: argparse.Namespace, train_argv: list[str], derived_gloo_ifnam
 
         exit_code = process.wait()
         if exit_code != 0:
-            capture_termination_artifacts(args.rendezvous_dir, f"driver exit_code={exit_code} (head rank 0)")
+
+            def persist_failure_artifacts() -> None:
+                reason = f"driver exit_code={exit_code} (head rank 0)"
+                capture_termination_artifacts(args.rendezvous_dir, reason)
+                persist_runtime_artifacts(reason)
+
+            _persist_failure_artifacts_bounded(
+                persist_failure_artifacts,
+                timeout=FAILURE_ARTIFACT_TIMEOUT,
+            )
+            ray_stop()
+            return exit_code
         # Final flush of this node's Ray session logs before teardown reaps them.
-        if ray_log_sync_stop is not None:
-            ray_log_sync_stop.set()
-        ray_log_sync.sync_bounded(f"driver exit_code={exit_code} (head)")
-        sync_debug_artifacts(args.rendezvous_dir, node_id, f"driver exit_code={exit_code} (head)")
+        persist_runtime_artifacts(f"driver exit_code={exit_code} (head)")
     # Signal workers to unpark, then tear down.
     if args.rendezvous_dir and num_tasks > 1:
         _set_marker(args.rendezvous_dir, DONE_FILENAME)

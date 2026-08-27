@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import ray
 from loguru import logger
@@ -29,7 +31,11 @@ def ray_init_fixture():
         )
 
     logger.info(f"Initializing Ray with environment variables: {env_vars}")
-    ray.init(runtime_env={"env_vars": env_vars})
+    metrics_export_port = os.environ.get("SKYRL_RAY_METRICS_EXPORT_PORT")
+    ray_init_kwargs = {}
+    if metrics_export_port is not None:
+        ray_init_kwargs["_metrics_export_port"] = int(metrics_export_port)
+    ray.init(runtime_env={"env_vars": env_vars}, **ray_init_kwargs)
 
     yield
     # call ray shutdown after a test regardless

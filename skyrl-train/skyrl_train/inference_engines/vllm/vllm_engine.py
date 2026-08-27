@@ -470,6 +470,9 @@ class WorkerWrap:
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             finalize_layerwise_reload(model, self.model_config)
         self._skyrl_weight_update_active = False
+        lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
+        if lm_head_compute_dtype is not None:
+            configure_vllm_model_instance_lm_head_compute_dtype(model, lm_head_compute_dtype)
 
     def begin_weight_update(self) -> None:
         """Start accumulating weights for batched load_weights call.
@@ -649,7 +652,7 @@ class WorkerWrap:
             else:
                 model.load_weights(weights=iter(self._accumulated_weights))
             lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
-            if lm_head_compute_dtype is not None:
+            if lm_head_compute_dtype is not None and not getattr(self, "_skyrl_weight_update_active", False):
                 configure_vllm_model_instance_lm_head_compute_dtype(model, lm_head_compute_dtype)
             self._accumulated_weights.clear()
             del self._accumulated_weights
@@ -681,7 +684,9 @@ class WorkerWrap:
         else:
             # Immediate mode (default): load right away
             self.model_runner.model.load_weights(weights=weight_list)
-            if any(name == "lm_head.weight" or name.endswith("embed_tokens.weight") for name, _ in weight_list):
+            if not getattr(self, "_skyrl_weight_update_active", False) and any(
+                name == "lm_head.weight" or name.endswith("embed_tokens.weight") for name, _ in weight_list
+            ):
                 lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
                 if lm_head_compute_dtype is not None:
                     configure_vllm_model_instance_lm_head_compute_dtype(
@@ -838,6 +843,41 @@ class WorkerWrap:
             except Exception as e:  # never crash the collective_rpc
                 out[name] = {"found": False, "error": repr(e)}
         return out
+
+    def fp32_projection_parity(self):
+        """TEST-ONLY: compare the live vLLM projection with direct FP32 logits."""
+        import torch.nn.functional as _functional
+
+        model = self.model_runner.model
+        language_model = getattr(model, "language_model", None) or model
+        lm_head = getattr(language_model, "lm_head", None)
+        weight = getattr(lm_head, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            raise TypeError("Expected a materialized vLLM lm_head.weight")
+        if weight.dtype != torch.float32:
+            raise TypeError(f"Expected FP32 vLLM lm_head.weight, got {weight.dtype}")
+
+        hidden = torch.linspace(-0.75, 0.75, weight.shape[1], device=weight.device, dtype=torch.float32)[None, :]
+        with torch.no_grad():
+            actual = model.compute_logits(hidden)
+            if actual is None:
+                raise RuntimeError("vLLM compute_logits returned None")
+            reference = _functional.linear(hidden, weight)
+            reference = reference[..., : actual.shape[-1]]
+            actual = actual.float()
+            actual_logprobs = actual.log_softmax(dim=-1)
+            reference_logprobs = reference.log_softmax(dim=-1)
+            selected_token = int(reference.argmax(dim=-1).item())
+
+        return {
+            "actual_top1": int(actual.argmax(dim=-1).item()),
+            "reference_top1": selected_token,
+            "selected_token": selected_token,
+            "actual_selected_logprob": float(actual_logprobs[0, selected_token].item()),
+            "reference_selected_logprob": float(reference_logprobs[0, selected_token].item()),
+            "max_abs_logit_error": float((actual - reference).abs().max().item()),
+            "weight_dtype": torch_dtype_to_str(weight.dtype),
+        }
 
     def read_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 disaggregated-receive diag): return THIS engine worker's
@@ -1968,6 +2008,11 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         """
         engine = self._get_engine()
         return await engine.collective_rpc("read_named_weights", args=(list(hf_names), dump_inventory))
+
+    async def read_fp32_projection_parity(self):
+        """TEST-ONLY: run direct FP32 projection parity on each engine worker."""
+        engine = self._get_engine()
+        return await engine.collective_rpc("fp32_projection_parity")
 
     async def read_engine_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 diag): per-engine-worker RAW FusedMoE local-slot weights +

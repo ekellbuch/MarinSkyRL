@@ -55,6 +55,8 @@ def restore_vllm_lm_head_compute_dtype(model: Any, dtype_name: str | None = None
             if embed_tokens is None:
                 embed_tokens = getattr(candidate, "embed_tokens", None)
             tied_projection = lm_head is embed_tokens or getattr(candidate, "_marinskyrl_tied_projection", False)
+            if not hasattr(lm_head, "weight") or (tied_projection and not hasattr(embed_tokens, "weight")):
+                continue
             if tied_projection and lm_head is embed_tokens:
                 lm_head = copy.deepcopy(embed_tokens)
                 candidate.lm_head = lm_head

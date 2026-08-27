@@ -157,7 +157,13 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         def generate_with_logprob_checks(update_index: int):
             sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
             sampling_params["logprobs"] = 1
-            outputs = asyncio.run(run_inference(client, get_test_prompts(MODEL), sampling_params))
+            if VERIFY_PARITY:
+                prompts = [[{"role": "user", "content": "Reply with one word."}]]
+                sampling_params["max_tokens"] = 1
+                sampling_params["temperature"] = 0.0
+            else:
+                prompts = get_test_prompts(MODEL)
+            outputs = asyncio.run(run_inference(client, prompts, sampling_params))
 
             assert len(outputs["responses"]) == len(outputs["response_ids"])
             response_logprobs = outputs["response_logprobs"]
@@ -171,15 +177,39 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             )
             return outputs
 
+        def verify_fp32_projection(update_index: int):
+            engine_actor = client.engines[0].inference_engine_actor
+            results = ray.get(engine_actor.read_fp32_projection_parity.remote())
+            assert len(results) == 1, results
+            result = results[0]
+            assert result["weight_dtype"] == "float32"
+            assert result["actual_top1"] == result["reference_top1"]
+            assert result["max_abs_logit_error"] <= 1e-5, result
+            assert abs(result["actual_selected_logprob"] - result["reference_selected_logprob"]) <= 1e-5, result
+            print(f"Verified direct FP32 projection after complete load {update_index}: {result}")
+            return result
+
         if VERIFY_PARITY:
             first_engine_weights = verify_synced_weights(1)
+            verify_fp32_projection(1)
             generate_with_logprob_checks(1)
+
+            mutation_results = ray.get(
+                policy.async_run_ray_method("pass_through", "perturb_weight_for_sync_test", "lm_head.weight", 0.5)
+            )
+            assert mutation_results and all(result["changed"] for result in mutation_results), mutation_results
+            print(f"Changed learner state before complete load 2: {mutation_results}")
 
             asyncio.run(client.reset_prefix_cache())
             ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
             second_engine_weights = verify_synced_weights(2)
+            verify_fp32_projection(2)
             second_outputs = generate_with_logprob_checks(2)
 
+            assert not torch.equal(
+                first_engine_weights["lm_head.weight"]["tensor"],
+                second_engine_weights["lm_head.weight"]["tensor"],
+            )
             for identity_key in ("internal_name", "parameter_id", "data_ptr"):
                 assert (
                     first_engine_weights["lm_head.weight"][identity_key]

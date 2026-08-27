@@ -6,6 +6,7 @@ from skyrl_train.models.lm_head_precision import (
     configure_hf_lm_head_compute_dtype,
     configure_vllm_model_instance_lm_head_compute_dtype,
     patch_vllm_model_class_lm_head_compute_dtype,
+    restore_vllm_lm_head_compute_dtype,
 )
 from torch import nn
 from torch.nn import functional
@@ -123,3 +124,22 @@ def test_vllm_tied_lm_head_survives_two_complete_loads_without_stale_storage():
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+def test_vllm_lm_head_restore_waits_for_layerwise_reload_to_materialize_weights():
+    class IncompleteEmbedding(nn.Module):
+        pass
+
+    language_model = type(
+        "IncompleteVLLMModel",
+        (),
+        {
+            "_marinskyrl_lm_head_compute_dtype": "float32",
+            "_marinskyrl_tied_projection": True,
+        },
+    )()
+    language_model.embed_tokens = IncompleteEmbedding()
+    language_model.lm_head = IncompleteEmbedding()
+    shell = type("IncompleteShell", (), {"language_model": language_model})()
+
+    assert not restore_vllm_lm_head_compute_dtype(shell)

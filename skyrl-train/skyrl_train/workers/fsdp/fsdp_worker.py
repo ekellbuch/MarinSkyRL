@@ -507,6 +507,34 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                     collected[name] = tensor.detach().to("cpu", dtype=torch.float32).contiguous()
         return collected
 
+    def perturb_weight_for_sync_test(self, name: str, delta: float):
+        """TEST-ONLY: change one local parameter element before a repeat sync."""
+        matches = []
+        for parameter_name, parameter in self.model.model.named_parameters():
+            normalized_name = parameter_name.replace(FSDPWeightExtractor._FSDP_SEG, ".")
+            if normalized_name == name:
+                matches.append((parameter_name, parameter))
+        if len(matches) != 1:
+            raise KeyError(f"Expected one live parameter named {name!r}, found {[entry[0] for entry in matches]}")
+
+        parameter_name, parameter = matches[0]
+        local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+        flat_parameter = local_parameter.reshape(-1)
+        if flat_parameter.numel() == 0:
+            return {"name": parameter_name, "changed": False, "rank": torch.distributed.get_rank()}
+
+        with torch.no_grad():
+            before = flat_parameter[0].float().item()
+            flat_parameter[0].copy_((flat_parameter[0].float() + delta).to(dtype=flat_parameter.dtype))
+            after = flat_parameter[0].float().item()
+        return {
+            "name": parameter_name,
+            "changed": before != after,
+            "before": before,
+            "after": after,
+            "rank": torch.distributed.get_rank(),
+        }
+
     def grug_validation_snapshot(self, names=()):
         """Return the calling rank and requested Grug weights gathered on rank 0.
 

@@ -14,6 +14,7 @@ import ray
 import torch
 from omegaconf import DictConfig
 from skyrl_train.entrypoints.main_base import config_dir
+from skyrl_train.inference_engines.base import InferenceEngineInput
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
 
 from tests.gpu.utils import get_test_prompts, init_inference_engines, init_worker_with_type, run_inference
@@ -161,9 +162,21 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 prompts = [[{"role": "user", "content": "Reply with one word."}]]
                 sampling_params["max_tokens"] = 1
                 sampling_params["temperature"] = 0.0
+                prompt_token_ids = client.tokenizer.apply_chat_template(
+                    prompts,
+                    add_generation_prompt=True,
+                    add_special_tokens=False,
+                    return_dict=True,
+                    tokenize=True,
+                )["input_ids"]
+                outputs = asyncio.run(
+                    client.generate(
+                        InferenceEngineInput(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
+                    )
+                )
             else:
                 prompts = get_test_prompts(MODEL)
-            outputs = asyncio.run(run_inference(client, prompts, sampling_params))
+                outputs = asyncio.run(run_inference(client, prompts, sampling_params))
 
             assert len(outputs["responses"]) == len(outputs["response_ids"])
             response_logprobs = outputs["response_logprobs"]
@@ -171,27 +184,36 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             assert len(response_logprobs) == len(outputs["response_ids"])
             assert all(len(ids) == len(logprobs) for ids, logprobs in zip(outputs["response_ids"], response_logprobs))
             assert all(math.isfinite(logprob) for logprobs in response_logprobs for logprob in logprobs)
+            if VERIFY_PARITY:
+                assert len(outputs["response_ids"]) == 1 and len(outputs["response_ids"][0]) == 1
+                selected_token = outputs["response_ids"][0][0]
+                learner_results = ray.get(
+                    policy.async_run_ray_method(
+                        "pass_through",
+                        "direct_next_token_parity_for_sync_test",
+                        prompt_token_ids[0],
+                        selected_token,
+                    )
+                )
+                assert learner_results, learner_results
+                assert all(result["top1"] == selected_token for result in learner_results), learner_results
+                rollout_logprob = response_logprobs[0][0]
+                assert all(
+                    abs(result["selected_logprob"] - rollout_logprob) <= 1e-5 for result in learner_results
+                ), (learner_results, rollout_logprob)
+                print(
+                    f"Verified learner/vLLM FP32 top-1 and selected-token logprob after complete load "
+                    f"{update_index}: prompt_token_ids={prompt_token_ids[0]}, learner={learner_results}, "
+                    f"rollout_logprob={rollout_logprob}"
+                )
             print(
                 f"Verified rollout logprobs after complete load {update_index} "
                 f"for {sum(map(len, response_logprobs))} tokens"
             )
             return outputs
 
-        def verify_fp32_projection(update_index: int):
-            engine_actor = client.engines[0].inference_engine_actor
-            results = ray.get(engine_actor.read_fp32_projection_parity.remote())
-            assert len(results) == 1, results
-            result = results[0]
-            assert result["weight_dtype"] == "float32"
-            assert result["actual_top1"] == result["reference_top1"]
-            assert result["max_abs_logit_error"] <= 1e-5, result
-            assert abs(result["actual_selected_logprob"] - result["reference_selected_logprob"]) <= 1e-5, result
-            print(f"Verified direct FP32 projection after complete load {update_index}: {result}")
-            return result
-
         if VERIFY_PARITY:
             first_engine_weights = verify_synced_weights(1)
-            verify_fp32_projection(1)
             generate_with_logprob_checks(1)
 
             mutation_results = ray.get(
@@ -203,7 +225,6 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             asyncio.run(client.reset_prefix_cache())
             ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
             second_engine_weights = verify_synced_weights(2)
-            verify_fp32_projection(2)
             second_outputs = generate_with_logprob_checks(2)
 
             assert not torch.equal(

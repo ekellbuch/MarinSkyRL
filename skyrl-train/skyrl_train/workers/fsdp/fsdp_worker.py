@@ -292,7 +292,7 @@ class FSDPWeightExtractor(WeightExtractor):
         """
         from skyrl_train.distributed.fsdp_utils import gather_dtensor_strided_safe
 
-        device = torch.cuda.current_device()
+        device = torch.device("cuda", torch.cuda.current_device())
         if not isinstance(param, DTensor):
             return param
         out = gather_dtensor_strided_safe(param.to(device, non_blocking=True))
@@ -534,6 +534,35 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             "after": after,
             "rank": torch.distributed.get_rank(),
         }
+
+    def direct_next_token_parity_for_sync_test(self, prompt_token_ids, selected_token: int):
+        """TEST-ONLY: score one rollout token with the live learner's FP32 head."""
+        device = torch.cuda.current_device()
+        input_ids = torch.tensor([prompt_token_ids], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids)
+        model = self.model.model
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits[0, -1]
+                if logits.dtype != torch.float32:
+                    raise TypeError(f"Expected learner FP32 final-token logits, got {logits.dtype}")
+                logsumexp = logits.logsumexp(dim=-1)
+                selected_logit = logits[selected_token]
+                result = {
+                    "rank": torch.distributed.get_rank(),
+                    "top1": int(logits.argmax(dim=-1).item()),
+                    "selected_token": selected_token,
+                    "selected_logit": float(selected_logit.item()),
+                    "logsumexp": float(logsumexp.item()),
+                    "selected_logprob": float((selected_logit - logsumexp).item()),
+                    "logits_dtype": str(logits.dtype),
+                }
+        finally:
+            if was_training:
+                model.train()
+        return result
 
     def grug_validation_snapshot(self, names=()):
         """Return the calling rank and requested Grug weights gathered on rank 0.

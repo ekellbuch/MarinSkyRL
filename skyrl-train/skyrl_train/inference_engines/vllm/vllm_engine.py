@@ -844,41 +844,6 @@ class WorkerWrap:
                 out[name] = {"found": False, "error": repr(e)}
         return out
 
-    def fp32_projection_parity(self):
-        """TEST-ONLY: compare the live vLLM projection with direct FP32 logits."""
-        import torch.nn.functional as _functional
-
-        model = self.model_runner.model
-        language_model = getattr(model, "language_model", None) or model
-        lm_head = getattr(language_model, "lm_head", None)
-        weight = getattr(lm_head, "weight", None)
-        if not isinstance(weight, torch.Tensor):
-            raise TypeError("Expected a materialized vLLM lm_head.weight")
-        if weight.dtype != torch.float32:
-            raise TypeError(f"Expected FP32 vLLM lm_head.weight, got {weight.dtype}")
-
-        hidden = torch.linspace(-0.75, 0.75, weight.shape[1], device=weight.device, dtype=torch.float32)[None, :]
-        with torch.no_grad():
-            actual = model.compute_logits(hidden)
-            if actual is None:
-                raise RuntimeError("vLLM compute_logits returned None")
-            reference = _functional.linear(hidden, weight)
-            reference = reference[..., : actual.shape[-1]]
-            actual = actual.float()
-            actual_logprobs = actual.log_softmax(dim=-1)
-            reference_logprobs = reference.log_softmax(dim=-1)
-            selected_token = int(reference.argmax(dim=-1).item())
-
-        return {
-            "actual_top1": int(actual.argmax(dim=-1).item()),
-            "reference_top1": selected_token,
-            "selected_token": selected_token,
-            "actual_selected_logprob": float(actual_logprobs[0, selected_token].item()),
-            "reference_selected_logprob": float(reference_logprobs[0, selected_token].item()),
-            "max_abs_logit_error": float((actual - reference).abs().max().item()),
-            "weight_dtype": torch_dtype_to_str(weight.dtype),
-        }
-
     def read_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 disaggregated-receive diag): return THIS engine worker's
         RAW per-local-slot FusedMoE expert weights + the engine's OWN expert_map for
@@ -2008,11 +1973,6 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         """
         engine = self._get_engine()
         return await engine.collective_rpc("read_named_weights", args=(list(hf_names), dump_inventory))
-
-    async def read_fp32_projection_parity(self):
-        """TEST-ONLY: run direct FP32 projection parity on each engine worker."""
-        engine = self._get_engine()
-        return await engine.collective_rpc("fp32_projection_parity")
 
     async def read_engine_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 diag): per-engine-worker RAW FusedMoE local-slot weights +

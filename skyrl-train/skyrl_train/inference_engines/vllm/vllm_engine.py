@@ -757,6 +757,12 @@ class WorkerWrap:
                         direct_name = "language_model.model." + name.removeprefix("model.")
                     elif name.startswith("lm_head."):
                         direct_name = "language_model.lm_head." + name.removeprefix("lm_head.")
+                        language_model = getattr(model, "language_model", None)
+                        language_config = getattr(language_model, "config", None)
+                        if direct_name not in all_params and getattr(
+                            language_config, "tie_word_embeddings", False
+                        ):
+                            direct_name = "language_model.model.embed_tokens.weight"
                 if direct_name in all_params:
                     tensor = all_params[direct_name]
                     entry = {

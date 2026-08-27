@@ -146,6 +146,10 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                     actual = actual[: expected.shape[0]]
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             assert engine_per_rank[0]["lm_head.weight"]["dtype"] == "float32"
+            assert (
+                engine_per_rank[0]["lm_head.weight"]["internal_name"]
+                == engine_per_rank[0]["model.language_model.embed_tokens.weight"]["internal_name"]
+            )
             print(f"Verified exact learner/vLLM weights: {weight_names}")
 
         sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)

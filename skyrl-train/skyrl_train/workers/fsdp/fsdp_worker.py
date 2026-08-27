@@ -537,6 +537,12 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
     def direct_next_token_parity_for_sync_test(self, prompt_token_ids, selected_token: int):
         """TEST-ONLY: score one rollout token with the live learner's FP32 head."""
+        from transformers.models.qwen3_5.modeling_qwen3_5 import is_fast_path_available
+
+        if not is_fast_path_available:
+            raise RuntimeError(
+                "Qwen3.5 learner parity requires the flash-linear-attention and causal-conv1d fast path"
+            )
         device = torch.cuda.current_device()
         input_ids = torch.tensor([prompt_token_ids], dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids)
@@ -558,6 +564,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                     "logsumexp": float(logsumexp.item()),
                     "selected_logprob": float((selected_logit - logsumexp).item()),
                     "logits_dtype": str(logits.dtype),
+                    "gdn_fast_path": True,
                 }
         finally:
             if was_training:

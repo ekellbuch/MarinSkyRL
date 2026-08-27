@@ -196,11 +196,21 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                     )
                 )
                 assert learner_results, learner_results
+                assert all(result["gdn_fast_path"] for result in learner_results), learner_results
                 assert all(result["top1"] == selected_token for result in learner_results), learner_results
                 rollout_logprob = response_logprobs[0][0]
+                parity_values = [
+                    {
+                        "rank": result["rank"],
+                        "learner_logprob": result["selected_logprob"],
+                        "rollout_logprob": rollout_logprob,
+                        "absolute_error": abs(result["selected_logprob"] - rollout_logprob),
+                    }
+                    for result in learner_results
+                ]
                 assert all(
                     abs(result["selected_logprob"] - rollout_logprob) <= 1e-5 for result in learner_results
-                ), (learner_results, rollout_logprob)
+                ), parity_values
                 print(
                     f"Verified learner/vLLM FP32 top-1 and selected-token logprob after complete load "
                     f"{update_index}: prompt_token_ids={prompt_token_ids[0]}, learner={learner_results}, "

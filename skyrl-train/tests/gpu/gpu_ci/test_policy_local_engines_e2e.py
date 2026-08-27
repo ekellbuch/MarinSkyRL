@@ -48,6 +48,7 @@ def get_test_actor_config() -> DictConfig:
         pytest.param(True, "nccl", "deepspeed", "vllm", 2, marks=pytest.mark.vllm),
         pytest.param(False, "nccl", "fsdp2", "vllm", 2, marks=pytest.mark.vllm),
         pytest.param(True, "nccl", "fsdp2", "vllm", 2, marks=pytest.mark.vllm),
+        pytest.param(False, "nccl", "fsdp2", "vllm", 1, marks=pytest.mark.vllm),
         # TODO(Charlie): add TP > 1 tests for sglang when we support it
         pytest.param(False, "nccl", "deepspeed", "sglang", 1, marks=pytest.mark.sglang),
         pytest.param(True, "nccl", "deepspeed", "sglang", 1, marks=pytest.mark.sglang),
@@ -65,6 +66,7 @@ def get_test_actor_config() -> DictConfig:
         "colocate_nccl_deepspeed_vllm",
         "no_colocate_nccl_fsdp2_vllm",
         "colocate_nccl_fsdp2_vllm",
+        "no_colocate_nccl_fsdp2_vllm_tp1",
         "no_colocate_nccl_deepspeed_sglang",
         "colocate_nccl_deepspeed_sglang",
         "no_colocate_nccl_fsdp2_sglang",

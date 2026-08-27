@@ -1,6 +1,7 @@
 import inspect
 from types import SimpleNamespace
 
+import pytest
 import torch
 from skyrl_train.models.lm_head_precision import (
     configure_hf_lm_head_compute_dtype,
@@ -143,3 +144,45 @@ def test_vllm_lm_head_restore_waits_for_layerwise_reload_to_materialize_weights(
     shell = type("IncompleteShell", (), {"language_model": language_model})()
 
     assert not restore_vllm_lm_head_compute_dtype(shell)
+
+
+def test_vllm_tied_lm_head_registers_two_layerwise_reloads():
+    reload_module = pytest.importorskip("vllm.model_executor.model_loader.reload")
+
+    class TinyReloadableModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(tie_word_embeddings=True, vocab_size=3)
+            self.embed_tokens = nn.Embedding(5, 4, dtype=torch.bfloat16)
+            self.lm_head = self.embed_tokens
+
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return functional.linear(hidden_states, self.lm_head.weight)[:, : self.config.vocab_size]
+
+    def load_parameter(module: nn.Module, value: torch.Tensor) -> None:
+        parameter = module.weight
+        loader = getattr(parameter, "weight_loader", None)
+        if loader is None:
+            parameter.data.copy_(value)
+        else:
+            loader(parameter, value)
+
+    model = TinyReloadableModel()
+    reload_module.record_metadata_for_reloading(model)
+    configure_vllm_model_instance_lm_head_compute_dtype(model, "float32")
+    head_identity = (id(model.lm_head), id(model.lm_head.weight), model.lm_head.weight.data_ptr())
+    loads = (
+        torch.arange(20, dtype=torch.float32).reshape(5, 4).to(torch.bfloat16) / 8,
+        torch.arange(20, 40, dtype=torch.float32).reshape(5, 4).to(torch.bfloat16) / 16,
+    )
+
+    for weight in loads:
+        reload_module.initialize_layerwise_reload(model)
+        load_parameter(model.embed_tokens, weight)
+        load_parameter(model.lm_head, weight.float())
+        reload_module.finalize_layerwise_reload(model, SimpleNamespace(dtype=torch.bfloat16))
+        configure_vllm_model_instance_lm_head_compute_dtype(model, "float32")
+
+        assert (id(model.lm_head), id(model.lm_head.weight), model.lm_head.weight.data_ptr()) == head_identity
+        torch.testing.assert_close(model.embed_tokens.weight, weight, rtol=0, atol=0)
+        torch.testing.assert_close(model.lm_head.weight, weight.float(), rtol=0, atol=0)

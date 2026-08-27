@@ -13,6 +13,15 @@ FP32_DTYPE_NAME = "float32"
 VLLM_LM_HEAD_COMPUTE_DTYPE_ENV = "SKYRL_VLLM_LM_HEAD_COMPUTE_DTYPE"
 
 
+def _record_vllm_reload_metadata(module: nn.Module) -> None:
+    """Teach vLLM's layerwise reloader about a projection created after model init."""
+    try:
+        from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+    except ImportError:
+        return
+    record_metadata_for_reloading(module)
+
+
 def configure_hf_lm_head_compute_dtype(model: nn.Module, dtype_name: str | None) -> bool:
     """Run a Hugging Face causal LM's final projection in the requested dtype."""
     if dtype_name is None:
@@ -57,13 +66,17 @@ def restore_vllm_lm_head_compute_dtype(model: Any, dtype_name: str | None = None
             tied_projection = lm_head is embed_tokens or getattr(candidate, "_marinskyrl_tied_projection", False)
             if not hasattr(lm_head, "weight") or (tied_projection and not hasattr(embed_tokens, "weight")):
                 continue
+            created_projection = False
             if tied_projection and lm_head is embed_tokens:
                 lm_head = copy.deepcopy(embed_tokens)
                 candidate.lm_head = lm_head
                 candidate._marinskyrl_tied_projection = True
+                created_projection = True
             lm_head.float()
             if tied_projection:
                 lm_head.weight.data.copy_(embed_tokens.weight.data.to(dtype=lm_head.weight.dtype))
+            if created_projection:
+                _record_vllm_reload_metadata(lm_head)
             return True
     return False
 

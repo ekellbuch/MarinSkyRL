@@ -340,6 +340,7 @@ generator:
   vllm_stats_interval: 1
   gpu_memory_utilization: 0.8
   max_num_seqs: 1024
+  max_logprobs: 1
   remote_inference_engine_urls: ["127.0.0.1:8001"]
   enable_http_endpoint: false
   http_endpoint_host: "127.0.0.1"

@@ -540,9 +540,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         from transformers.models.qwen3_5.modeling_qwen3_5 import is_fast_path_available
 
         if not is_fast_path_available:
-            raise RuntimeError(
-                "Qwen3.5 learner parity requires the flash-linear-attention and causal-conv1d fast path"
-            )
+            raise RuntimeError("Qwen3.5 learner parity requires the flash-linear-attention and causal-conv1d fast path")
         device = torch.cuda.current_device()
         input_ids = torch.tensor([prompt_token_ids], dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids)
@@ -556,9 +554,20 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                     raise TypeError(f"Expected learner FP32 final-token logits, got {logits.dtype}")
                 logsumexp = logits.logsumexp(dim=-1)
                 selected_logit = logits[selected_token]
+                top_logits, top_tokens = logits.topk(k=2)
+                top_logprobs = top_logits - logsumexp
                 result = {
                     "rank": torch.distributed.get_rank(),
                     "top1": int(logits.argmax(dim=-1).item()),
+                    "top_candidates": [
+                        {
+                            "token": int(token.item()),
+                            "logit": float(logit.item()),
+                            "logprob": float(logprob.item()),
+                        }
+                        for token, logit, logprob in zip(top_tokens, top_logits, top_logprobs, strict=True)
+                    ],
+                    "top1_margin": float((top_logits[0] - top_logits[1]).item()),
                     "selected_token": selected_token,
                     "selected_logit": float(selected_logit.item()),
                     "logsumexp": float(logsumexp.item()),

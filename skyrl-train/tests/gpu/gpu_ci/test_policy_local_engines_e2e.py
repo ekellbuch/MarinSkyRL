@@ -5,8 +5,10 @@ uv run --isolated --group dev --extra vllm --extra deepspeed pytest tests/gpu/gp
 """
 
 import asyncio
+import json
 import math
 import os
+from pathlib import Path
 
 import hydra
 import pytest
@@ -23,6 +25,47 @@ MODEL = os.environ.get("SKYRL_GPU_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 LM_HEAD_COMPUTE_DTYPE = os.environ.get("SKYRL_GPU_TEST_LM_HEAD_COMPUTE_DTYPE")
 FLASH_ATTN = os.environ.get("SKYRL_GPU_TEST_FLASH_ATTN", "0") == "1"
 VERIFY_PARITY = os.environ.get("SKYRL_GPU_TEST_VERIFY_PARITY", "0") == "1"
+PARITY_OUTPUT = os.environ.get("SKYRL_GPU_TEST_PARITY_OUTPUT")
+CALIBRATION_PROMPTS = (
+    "Reply with four words about the sky.",
+    "Name four common kitchen items.",
+    "Give four words associated with winter.",
+    "Reply with four words about music.",
+    "Name four colors.",
+    "Give four words associated with travel.",
+    "Reply with four words about a library.",
+    "Name four common animals.",
+)
+CALIBRATION_TOKENS_PER_PROMPT = 4
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def _error_summary(values: list[dict]) -> dict:
+    absolute_errors = [value["absolute_error"] for value in values]
+    relative_errors = [value["relative_error"] for value in values]
+    return {
+        "comparisons": len(values),
+        "top1_matches": sum(value["top1_match"] for value in values),
+        "absolute_error": {
+            "max": max(absolute_errors),
+            "p50": _percentile(absolute_errors, 0.50),
+            "p95": _percentile(absolute_errors, 0.95),
+        },
+        "relative_error": {
+            "max": max(relative_errors),
+            "p50": _percentile(relative_errors, 0.50),
+            "p95": _percentile(relative_errors, 0.95),
+        },
+    }
 
 
 def get_test_actor_config() -> DictConfig:
@@ -93,6 +136,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         cfg.trainer.strategy = strategy
         cfg.generator.backend = backend
         cfg.generator.inference_engine_tensor_parallel_size = tp_size
+        if VERIFY_PARITY:
+            cfg.generator.max_logprobs = 2
 
         # If colocate is True, this will load the engine, sleep, and wake up the engine
         client, pg = init_inference_engines(
@@ -116,6 +161,44 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         ray.get(policy.async_run_ray_method("pass_through", "init_weight_sync_state", client))
         asyncio.run(client.reset_prefix_cache())
         ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
+        parity_values = []
+
+        def write_parity_checkpoint():
+            assert PARITY_OUTPUT, "SKYRL_GPU_TEST_PARITY_OUTPUT is required for the parity calibration"
+            expected_per_load = len(CALIBRATION_PROMPTS) * CALIBRATION_TOKENS_PER_PROMPT
+            completed_loads = [
+                update_index
+                for update_index in (1, 2)
+                if sum(value["load"] == update_index for value in parity_values) == expected_per_load
+            ]
+            payload = {
+                "schema_version": 1,
+                "design": {
+                    "prompts": list(CALIBRATION_PROMPTS),
+                    "tokens_per_prompt": CALIBRATION_TOKENS_PER_PROMPT,
+                    "loads": 2,
+                    "temperature": 0.0,
+                    "ignore_eos": True,
+                },
+                "status": {
+                    "completed_loads": completed_loads,
+                    "comparisons": len(parity_values),
+                    "expected_comparisons": 2 * expected_per_load,
+                    "complete": completed_loads == [1, 2],
+                },
+                "loads": {
+                    str(update_index): _error_summary(
+                        [value for value in parity_values if value["load"] == update_index]
+                    )
+                    for update_index in completed_loads
+                },
+                "overall": _error_summary(parity_values),
+                "pairs": parity_values,
+            }
+            output_path = Path(PARITY_OUTPUT)
+            temporary_path = output_path.with_name(f".{output_path.name}.tmp")
+            temporary_path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
+            temporary_path.replace(output_path)
 
         def verify_synced_weights(update_index: int):
             weight_names = [
@@ -159,9 +242,10 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
             sampling_params["logprobs"] = 1
             if VERIFY_PARITY:
-                prompts = [[{"role": "user", "content": "Reply with one word."}]]
-                sampling_params["max_tokens"] = 1
+                prompts = [[{"role": "user", "content": content}] for content in CALIBRATION_PROMPTS]
+                sampling_params["max_tokens"] = CALIBRATION_TOKENS_PER_PROMPT
                 sampling_params["temperature"] = 0.0
+                sampling_params["ignore_eos"] = True
                 prompt_token_ids = client.tokenizer.apply_chat_template(
                     prompts,
                     add_generation_prompt=True,
@@ -185,37 +269,96 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             assert all(len(ids) == len(logprobs) for ids, logprobs in zip(outputs["response_ids"], response_logprobs))
             assert all(math.isfinite(logprob) for logprobs in response_logprobs for logprob in logprobs)
             if VERIFY_PARITY:
-                assert len(outputs["response_ids"]) == 1 and len(outputs["response_ids"][0]) == 1
-                selected_token = outputs["response_ids"][0][0]
-                learner_results = ray.get(
-                    policy.async_run_ray_method(
-                        "pass_through",
-                        "direct_next_token_parity_for_sync_test",
-                        prompt_token_ids[0],
-                        selected_token,
+                assert len(outputs["response_ids"]) == len(CALIBRATION_PROMPTS)
+                assert all(len(tokens) == CALIBRATION_TOKENS_PER_PROMPT for tokens in outputs["response_ids"])
+                scoring_params = dict(sampling_params)
+                scoring_params.update({"max_tokens": 1, "logprobs": 0, "prompt_logprobs": 2})
+                scored_outputs = asyncio.run(
+                    client.generate(
+                        InferenceEngineInput(
+                            prompt_token_ids=[
+                                prompt_ids + response_ids
+                                for prompt_ids, response_ids in zip(
+                                    prompt_token_ids, outputs["response_ids"], strict=True
+                                )
+                            ],
+                            sampling_params=scoring_params,
+                        )
                     )
                 )
-                assert learner_results, learner_results
-                assert all(result["gdn_fast_path"] for result in learner_results), learner_results
-                assert all(result["top1"] == selected_token for result in learner_results), learner_results
-                rollout_logprob = response_logprobs[0][0]
-                parity_values = [
-                    {
-                        "rank": result["rank"],
-                        "learner_logprob": result["selected_logprob"],
-                        "rollout_logprob": rollout_logprob,
-                        "absolute_error": abs(result["selected_logprob"] - rollout_logprob),
-                    }
-                    for result in learner_results
-                ]
-                assert all(
-                    abs(result["selected_logprob"] - rollout_logprob) <= 1e-5 for result in learner_results
-                ), parity_values
+                prompt_logprobs = scored_outputs["prompt_logprobs"]
+                assert prompt_logprobs is not None
+                assert len(prompt_logprobs) == len(outputs["response_ids"])
+                for prompt_index, (prompt_ids, response_ids, rollout_logprobs) in enumerate(
+                    zip(prompt_token_ids, outputs["response_ids"], response_logprobs, strict=True)
+                ):
+                    for token_index, (selected_token, rollout_logprob) in enumerate(
+                        zip(response_ids, rollout_logprobs, strict=True)
+                    ):
+                        rollout_candidates = prompt_logprobs[prompt_index][len(prompt_ids) + token_index]
+                        assert rollout_candidates is not None
+                        assert selected_token in rollout_candidates
+                        ranked_rollout_candidates = sorted(
+                            rollout_candidates.items(), key=lambda item: item[1], reverse=True
+                        )
+                        assert len(ranked_rollout_candidates) >= 2
+                        rollout_top_candidates = [
+                            {"token": int(token), "logprob": float(logprob)}
+                            for token, logprob in ranked_rollout_candidates[:2]
+                        ]
+                        learner_results = ray.get(
+                            policy.async_run_ray_method(
+                                "pass_through",
+                                "direct_next_token_parity_for_sync_test",
+                                prompt_ids + response_ids[:token_index],
+                                selected_token,
+                            )
+                        )
+                        assert len(learner_results) == 1, learner_results
+                        result = learner_results[0]
+                        assert result["gdn_fast_path"], result
+                        assert math.isfinite(result["selected_logprob"]), result
+                        assert math.isfinite(result["selected_logit"]), result
+                        assert math.isfinite(result["logsumexp"]), result
+                        assert math.isclose(
+                            result["selected_logprob"],
+                            result["selected_logit"] - result["logsumexp"],
+                            rel_tol=0.0,
+                            abs_tol=1e-6,
+                        ), result
+                        assert len(result["top_candidates"]) == 2, result
+                        absolute_error = abs(result["selected_logprob"] - rollout_logprob)
+                        relative_error = absolute_error / max(abs(rollout_logprob), 1e-12)
+                        parity_values.append(
+                            {
+                                "load": update_index,
+                                "prompt_index": prompt_index,
+                                "token_index": token_index,
+                                "selected_token": selected_token,
+                                "learner_top1": result["top1"],
+                                "learner_top_candidates": result["top_candidates"],
+                                "learner_top1_margin": result["top1_margin"],
+                                "rollout_top1": rollout_top_candidates[0]["token"],
+                                "rollout_top_candidates": rollout_top_candidates,
+                                "rollout_top1_margin": (
+                                    rollout_top_candidates[0]["logprob"] - rollout_top_candidates[1]["logprob"]
+                                ),
+                                "top1_match": result["top1"] == selected_token,
+                                "learner_selected_logit": result["selected_logit"],
+                                "learner_logsumexp": result["logsumexp"],
+                                "learner_logprob": result["selected_logprob"],
+                                "rollout_logprob": rollout_logprob,
+                                "absolute_error": absolute_error,
+                                "relative_error": relative_error,
+                            }
+                        )
+                load_values = [value for value in parity_values if value["load"] == update_index]
+                assert len(load_values) == len(CALIBRATION_PROMPTS) * CALIBRATION_TOKENS_PER_PROMPT
                 print(
-                    f"Verified learner/vLLM FP32 top-1 and selected-token logprob after complete load "
-                    f"{update_index}: prompt_token_ids={prompt_token_ids[0]}, learner={learner_results}, "
-                    f"rollout_logprob={rollout_logprob}"
+                    f"Measured learner/vLLM selected-token logprobs after complete load {update_index}: "
+                    f"{json.dumps({'summary': _error_summary(load_values), 'pairs': load_values}, sort_keys=True)}"
                 )
+                write_parity_checkpoint()
             print(
                 f"Verified rollout logprobs after complete load {update_index} "
                 f"for {sum(map(len, response_logprobs))} tokens"
@@ -227,7 +370,14 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             generate_with_logprob_checks(1)
 
             mutation_results = ray.get(
-                policy.async_run_ray_method("pass_through", "perturb_weight_for_sync_test", "lm_head.weight", 0.5)
+                policy.async_run_ray_method(
+                    # The learner is the unwrapped text tower (``model.*``); the
+                    # extractor adds ``model.language_model.*`` for vLLM.
+                    "pass_through",
+                    "perturb_weight_for_sync_test",
+                    "model.embed_tokens.weight",
+                    0.5,
+                )
             )
             assert mutation_results and all(result["changed"] for result in mutation_results), mutation_results
             print(f"Changed learner state before complete load 2: {mutation_results}")
@@ -247,6 +397,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                     == second_engine_weights["lm_head.weight"][identity_key]
                 )
             print("Verified stable FP32 projection storage across two complete loads")
+            assert len(parity_values) == 2 * len(CALIBRATION_PROMPTS) * CALIBRATION_TOKENS_PER_PROMPT
+            assert all(value["top1_match"] for value in parity_values), parity_values
             outputs = second_outputs
         else:
             sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)

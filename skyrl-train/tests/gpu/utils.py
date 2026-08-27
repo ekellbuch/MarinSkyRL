@@ -387,6 +387,7 @@ def init_inference_engines(
         async_engine=async_engine,
         max_num_batched_tokens=8192,
         max_num_seqs=max_num_seqs,
+        max_logprobs=cfg.generator.max_logprobs,
         tokenizer=tokenizer,
         backend=backend,
         sleep_level=sleep_level,

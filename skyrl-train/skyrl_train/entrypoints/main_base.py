@@ -66,6 +66,7 @@ def create_ray_wrapped_inference_engines_from_config(cfg: DictConfig, colocate_p
         "async_engine": cfg.generator.async_engine,
         "max_num_batched_tokens": cfg.generator.max_num_batched_tokens,
         "max_num_seqs": cfg.generator.max_num_seqs,
+        "max_logprobs": cfg.generator.max_logprobs,
         "tokenizer": tokenizer,
         "backend": cfg.generator.backend,
         "vllm_attention_backend": cfg.generator.get("vllm_attention_backend", None),

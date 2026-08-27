@@ -62,7 +62,10 @@ from skyrl_train.inference_engines.base import (
 )
 from skyrl_train.weight_sync import WeightLoader
 from skyrl_train.models.grug_moe import is_grug_router_bias
-from skyrl_train.models.lm_head_precision import configure_vllm_qwen3_5_lm_head_compute_dtype
+from skyrl_train.models.lm_head_precision import (
+    configure_vllm_qwen3_5_lm_head_compute_dtype,
+    restore_vllm_lm_head_compute_dtype,
+)
 from skyrl_train.inference_engines.vllm.utils import (
     pop_openai_kwargs,
     ensure_token_ids_in_sse_chunk,
@@ -644,6 +647,7 @@ class WorkerWrap:
                 torch.cuda.empty_cache()
             else:
                 model.load_weights(weights=iter(self._accumulated_weights))
+            restore_vllm_lm_head_compute_dtype(model)
             self._accumulated_weights.clear()
             del self._accumulated_weights
             gc.collect()
@@ -674,6 +678,8 @@ class WorkerWrap:
         else:
             # Immediate mode (default): load right away
             self.model_runner.model.load_weights(weights=weight_list)
+            if any(name == "lm_head.weight" or name.endswith("embed_tokens.weight") for name, _ in weight_list):
+                restore_vllm_lm_head_compute_dtype(self.model_runner.model)
             for weight in weight_list:
                 del weight
 

@@ -2,6 +2,7 @@ import torch
 from skyrl_train.models.lm_head_precision import (
     configure_hf_lm_head_compute_dtype,
     patch_vllm_model_class_lm_head_compute_dtype,
+    restore_vllm_lm_head_compute_dtype,
 )
 from torch import nn
 from torch.nn import functional
@@ -46,3 +47,22 @@ def test_vllm_lm_head_float32_compute_casts_parameters_and_activations():
 
     assert model.lm_head.weight.dtype == torch.float32
     assert output.dtype == torch.float32
+
+
+def test_vllm_lm_head_float32_compute_is_restored_after_tied_weight_load():
+    class TinyVLLMModel:
+        def __init__(self) -> None:
+            self.embed_tokens = nn.Embedding(2, 3, dtype=torch.bfloat16)
+            self.lm_head = self.embed_tokens
+
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return functional.linear(hidden_states, self.lm_head.weight)
+
+    patch_vllm_model_class_lm_head_compute_dtype(TinyVLLMModel, "float32")
+    language_model = TinyVLLMModel()
+    language_model.lm_head.weight.data = language_model.lm_head.weight.data.bfloat16()
+    shell = type("TinyShell", (), {"language_model": language_model})()
+
+    assert restore_vllm_lm_head_compute_dtype(shell)
+    assert language_model.embed_tokens.weight.dtype == torch.float32
+    assert language_model.lm_head.weight.dtype == torch.float32

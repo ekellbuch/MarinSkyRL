@@ -32,6 +32,24 @@ def configure_hf_lm_head_compute_dtype(model: nn.Module, dtype_name: str | None)
     return True
 
 
+def restore_vllm_lm_head_compute_dtype(model: Any) -> bool:
+    """Restore the configured vLLM projection dtype after a weight update."""
+    candidates = (model, getattr(model, "language_model", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        dtype_name = getattr(type(candidate), "_marinskyrl_lm_head_compute_dtype", None)
+        if dtype_name is None:
+            continue
+        if dtype_name != FP32_DTYPE_NAME:
+            raise ValueError(f"Unsupported lm_head_compute_dtype: {dtype_name}")
+        lm_head = getattr(candidate, "lm_head", None)
+        if lm_head is not None and hasattr(lm_head, "float"):
+            lm_head.float()
+            return True
+    return False
+
+
 def patch_vllm_model_class_lm_head_compute_dtype(model_class: type, dtype_name: str) -> bool:
     """Run a vLLM model class's final projection in the requested dtype."""
     if dtype_name != FP32_DTYPE_NAME:
@@ -46,10 +64,8 @@ def patch_vllm_model_class_lm_head_compute_dtype(model_class: type, dtype_name: 
 
     def fp32_init(self, *args, **kwargs) -> None:
         original_init(self, *args, **kwargs)
-        lm_head = getattr(self, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "float"):
+        if not restore_vllm_lm_head_compute_dtype(self):
             raise TypeError("lm_head_compute_dtype requires a vLLM model with a floating-point lm_head")
-        lm_head.float()
 
     def fp32_compute_logits(self, hidden_states, *args, **kwargs):
         if isinstance(hidden_states, torch.Tensor):

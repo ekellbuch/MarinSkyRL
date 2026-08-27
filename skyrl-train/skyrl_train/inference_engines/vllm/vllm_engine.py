@@ -779,7 +779,9 @@ class WorkerWrap:
                 if direct_name in all_params:
                     tensor = all_params[direct_name]
                     entry = {
+                        "data_ptr": tensor.data_ptr(),
                         "found": True,
+                        "parameter_id": id(tensor),
                         "mode": "direct",
                         "internal_name": direct_name,
                         "dtype": torch_dtype_to_str(tensor.dtype),

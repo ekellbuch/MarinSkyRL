@@ -116,7 +116,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         asyncio.run(client.reset_prefix_cache())
         ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
 
-        if VERIFY_PARITY:
+        def verify_synced_weights(update_index: int):
             weight_names = [
                 "model.language_model.embed_tokens.weight",
                 "model.language_model.layers.0.input_layernorm.weight",
@@ -151,21 +151,46 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 engine_per_rank[0]["lm_head.weight"]["internal_name"]
                 != engine_per_rank[0]["model.language_model.embed_tokens.weight"]["internal_name"]
             )
-            print(f"Verified exact learner/vLLM weights: {weight_names}")
+            print(f"Verified exact learner/vLLM weights after complete load {update_index}: {weight_names}")
+            return engine_per_rank[0]
 
-        sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
-        if VERIFY_PARITY:
+        def generate_with_logprob_checks(update_index: int):
+            sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
             sampling_params["logprobs"] = 1
-        outputs = asyncio.run(run_inference(client, get_test_prompts(MODEL), sampling_params))
+            outputs = asyncio.run(run_inference(client, get_test_prompts(MODEL), sampling_params))
 
-        assert len(outputs["responses"]) == len(outputs["response_ids"])
-        if VERIFY_PARITY:
+            assert len(outputs["responses"]) == len(outputs["response_ids"])
             response_logprobs = outputs["response_logprobs"]
             assert response_logprobs is not None
             assert len(response_logprobs) == len(outputs["response_ids"])
             assert all(len(ids) == len(logprobs) for ids, logprobs in zip(outputs["response_ids"], response_logprobs))
             assert all(math.isfinite(logprob) for logprobs in response_logprobs for logprob in logprobs)
-            print(f"Verified rollout logprobs for {sum(map(len, response_logprobs))} tokens")
+            print(
+                f"Verified rollout logprobs after complete load {update_index} "
+                f"for {sum(map(len, response_logprobs))} tokens"
+            )
+            return outputs
+
+        if VERIFY_PARITY:
+            first_engine_weights = verify_synced_weights(1)
+            generate_with_logprob_checks(1)
+
+            asyncio.run(client.reset_prefix_cache())
+            ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
+            second_engine_weights = verify_synced_weights(2)
+            second_outputs = generate_with_logprob_checks(2)
+
+            for identity_key in ("internal_name", "parameter_id", "data_ptr"):
+                assert (
+                    first_engine_weights["lm_head.weight"][identity_key]
+                    == second_engine_weights["lm_head.weight"][identity_key]
+                )
+            print("Verified stable FP32 projection storage across two complete loads")
+            outputs = second_outputs
+        else:
+            sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
+            outputs = asyncio.run(run_inference(client, get_test_prompts(MODEL), sampling_params))
+            assert len(outputs["responses"]) == len(outputs["response_ids"])
         print(f"Example output: {outputs['responses'][0]}, {outputs['stop_reasons'][0]}")
     finally:
         ray.shutdown()

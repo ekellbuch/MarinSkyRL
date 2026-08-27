@@ -1,7 +1,7 @@
 """Explicit precision control for final language-model projections."""
 
 import copy
-
+import functools
 from collections.abc import Callable
 from typing import Any
 
@@ -78,11 +78,13 @@ def patch_vllm_model_class_lm_head_compute_dtype(model_class: type, dtype_name: 
     original_init: Callable[..., None] = model_class.__init__
     original_compute_logits: Callable[..., Any] = model_class.compute_logits
 
+    @functools.wraps(original_init)
     def fp32_init(self, *args, **kwargs) -> None:
         original_init(self, *args, **kwargs)
         if not restore_vllm_lm_head_compute_dtype(self):
             raise TypeError("lm_head_compute_dtype requires a vLLM model with a floating-point lm_head")
 
+    @functools.wraps(original_compute_logits)
     def fp32_compute_logits(self, hidden_states, *args, **kwargs):
         if isinstance(hidden_states, torch.Tensor):
             hidden_states = hidden_states.float()

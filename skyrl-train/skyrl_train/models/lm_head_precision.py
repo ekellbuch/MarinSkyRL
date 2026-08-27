@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn import functional
 
 FP32_DTYPE_NAME = "float32"
+VLLM_LM_HEAD_COMPUTE_DTYPE_ENV = "SKYRL_VLLM_LM_HEAD_COMPUTE_DTYPE"
 
 
 def configure_hf_lm_head_compute_dtype(model: nn.Module, dtype_name: str | None) -> bool:
@@ -32,17 +33,19 @@ def configure_hf_lm_head_compute_dtype(model: nn.Module, dtype_name: str | None)
     return True
 
 
-def restore_vllm_lm_head_compute_dtype(model: Any) -> bool:
+def restore_vllm_lm_head_compute_dtype(model: Any, dtype_name: str | None = None) -> bool:
     """Restore the configured vLLM projection dtype after a weight update."""
+    if dtype_name is not None and dtype_name != FP32_DTYPE_NAME:
+        raise ValueError(f"Unsupported lm_head_compute_dtype: {dtype_name}")
     candidates = (model, getattr(model, "language_model", None))
     for candidate in candidates:
         if candidate is None:
             continue
-        dtype_name = getattr(type(candidate), "_marinskyrl_lm_head_compute_dtype", None)
-        if dtype_name is None:
+        candidate_dtype = dtype_name or getattr(type(candidate), "_marinskyrl_lm_head_compute_dtype", None)
+        if candidate_dtype is None:
             continue
-        if dtype_name != FP32_DTYPE_NAME:
-            raise ValueError(f"Unsupported lm_head_compute_dtype: {dtype_name}")
+        if candidate_dtype != FP32_DTYPE_NAME:
+            raise ValueError(f"Unsupported lm_head_compute_dtype: {candidate_dtype}")
         lm_head = getattr(candidate, "lm_head", None)
         if lm_head is not None and hasattr(lm_head, "float"):
             lm_head.float()
@@ -76,6 +79,14 @@ def patch_vllm_model_class_lm_head_compute_dtype(model_class: type, dtype_name: 
     model_class.compute_logits = fp32_compute_logits
     model_class._marinskyrl_lm_head_compute_dtype = dtype_name
     return True
+
+
+def configure_vllm_model_instance_lm_head_compute_dtype(model: Any, dtype_name: str) -> None:
+    """Configure an already-created vLLM model inside its EngineCore process."""
+    candidate = getattr(model, "language_model", None) or model
+    patch_vllm_model_class_lm_head_compute_dtype(type(candidate), dtype_name)
+    if not restore_vllm_lm_head_compute_dtype(model, dtype_name):
+        raise TypeError("lm_head_compute_dtype requires a vLLM model with a floating-point lm_head")
 
 
 def configure_vllm_qwen3_5_lm_head_compute_dtype(dtype_name: str | None) -> tuple[str, ...]:

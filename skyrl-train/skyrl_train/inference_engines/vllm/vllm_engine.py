@@ -63,8 +63,9 @@ from skyrl_train.inference_engines.base import (
 from skyrl_train.weight_sync import WeightLoader
 from skyrl_train.models.grug_moe import is_grug_router_bias
 from skyrl_train.models.lm_head_precision import (
+    VLLM_LM_HEAD_COMPUTE_DTYPE_ENV,
+    configure_vllm_model_instance_lm_head_compute_dtype,
     configure_vllm_qwen3_5_lm_head_compute_dtype,
-    restore_vllm_lm_head_compute_dtype,
 )
 from skyrl_train.inference_engines.vllm.utils import (
     pop_openai_kwargs,
@@ -647,7 +648,9 @@ class WorkerWrap:
                 torch.cuda.empty_cache()
             else:
                 model.load_weights(weights=iter(self._accumulated_weights))
-            restore_vllm_lm_head_compute_dtype(model)
+            lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
+            if lm_head_compute_dtype is not None:
+                configure_vllm_model_instance_lm_head_compute_dtype(model, lm_head_compute_dtype)
             self._accumulated_weights.clear()
             del self._accumulated_weights
             gc.collect()
@@ -679,7 +682,11 @@ class WorkerWrap:
             # Immediate mode (default): load right away
             self.model_runner.model.load_weights(weights=weight_list)
             if any(name == "lm_head.weight" or name.endswith("embed_tokens.weight") for name, _ in weight_list):
-                restore_vllm_lm_head_compute_dtype(self.model_runner.model)
+                lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
+                if lm_head_compute_dtype is not None:
+                    configure_vllm_model_instance_lm_head_compute_dtype(
+                        self.model_runner.model, lm_head_compute_dtype
+                    )
             for weight in weight_list:
                 del weight
 
@@ -939,6 +946,10 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
     def __init__(self, *args, bundle_indices: list = None, **kwargs):
         setup_envvars_for_vllm(kwargs, bundle_indices)
         lm_head_compute_dtype = kwargs.pop("lm_head_compute_dtype", None)
+        if lm_head_compute_dtype is None:
+            os.environ.pop(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV, None)
+        else:
+            os.environ[VLLM_LM_HEAD_COMPUTE_DTYPE_ENV] = lm_head_compute_dtype
         patched_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(lm_head_compute_dtype)
         if patched_model_classes:
             logger.info(f"Configured {', '.join(patched_model_classes)} with {lm_head_compute_dtype} lm_head compute")

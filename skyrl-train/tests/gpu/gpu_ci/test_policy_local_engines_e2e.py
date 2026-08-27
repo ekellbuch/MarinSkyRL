@@ -31,6 +31,7 @@ def get_test_actor_config() -> DictConfig:
         cfg.trainer.critic.model.path = ""
         cfg.trainer.placement.policy_num_gpus_per_node = 2
         cfg.generator.async_engine = True
+        cfg.generator.enable_ray_prometheus_stats = True
         cfg.generator.num_inference_engines = 1
         cfg.generator.run_engines_locally = True
 

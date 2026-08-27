@@ -16,7 +16,7 @@ class TinyCausalLM(nn.Module):
         return self.lm_head
 
 
-def test_hf_lm_head_float32_compute_matches_explicit_projection_and_backpropagates():
+def test_hf_lm_head_float32_compute_preserves_bf16_parameters_and_backpropagates():
     model = TinyCausalLM()
     hidden_states = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.bfloat16, requires_grad=True)
     expected = functional.linear(hidden_states.float(), model.lm_head.weight.float())
@@ -26,7 +26,7 @@ def test_hf_lm_head_float32_compute_matches_explicit_projection_and_backpropagat
     actual.sum().backward()
 
     assert actual.dtype == torch.float32
-    assert model.lm_head.weight.dtype == torch.float32
+    assert model.lm_head.weight.dtype == torch.bfloat16
     torch.testing.assert_close(actual, expected)
     assert model.lm_head.weight.grad is not None
     assert hidden_states.grad is not None

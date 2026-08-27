@@ -23,16 +23,9 @@ def configure_hf_lm_head_compute_dtype(model: nn.Module, dtype_name: str | None)
     if getattr(lm_head, "_marinskyrl_compute_dtype", None) == dtype_name:
         return False
 
-    is_zero3_lm_head = any(hasattr(parameter, "ds_id") for parameter in lm_head.parameters(recurse=False))
-    if not is_zero3_lm_head:
-        lm_head.float()
-    original_forward = lm_head.forward
-
     def fp32_forward(hidden_states: torch.Tensor) -> torch.Tensor:
-        if is_zero3_lm_head:
-            bias = lm_head.bias.float() if lm_head.bias is not None else None
-            return functional.linear(hidden_states.float(), lm_head.weight.float(), bias)
-        return original_forward(hidden_states.float())
+        bias = lm_head.bias.float() if lm_head.bias is not None else None
+        return functional.linear(hidden_states.float(), lm_head.weight.float(), bias)
 
     lm_head.forward = fp32_forward
     lm_head._marinskyrl_compute_dtype = dtype_name

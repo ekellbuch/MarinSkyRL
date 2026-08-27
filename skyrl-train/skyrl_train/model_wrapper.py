@@ -520,12 +520,16 @@ class HFModelWrapper(nn.Module):
             # lm_head into a plain ``Qwen3_5MoeForCausalLM`` (no re-download; the
             # text weights map 1:1) and drop vision/MTP.
             from skyrl_train.models.qwen3_5_vlm import (
+                is_qwen3_5_text_tower,
                 is_qwen3_5_vlm_shell,
+                remove_vision_no_split_modules,
                 unwrap_to_text_causal_lm,
             )
 
             if is_qwen3_5_vlm_shell(self.model.config):
                 self.model = unwrap_to_text_causal_lm(self.model)
+            if is_qwen3_5_text_tower(self.model.config):
+                remove_vision_no_split_modules(self.model)
 
             # gpt oss
             if Version(transformers.__version__) >= Version("4.56.2"):

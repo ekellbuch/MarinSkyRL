@@ -129,6 +129,20 @@ def map_text_name_to_vlm_engine(name: str) -> str:
     return name
 
 
+def remove_vision_no_split_modules(model) -> None:
+    """Keep the Qwen3.5 text policy's FSDP wrap classes text-only.
+
+    Transformers currently leaves ``Qwen3_5VisionBlock`` in
+    ``_no_split_modules`` even when ``AutoModelForCausalLM`` returns a
+    ``Qwen3_5ForCausalLM`` text tower. Marin's FSDP auto-wrap resolver requires
+    every listed class to occur in the model, so the stale vision entry prevents
+    FSDP initialization.
+    """
+    no_split_modules = getattr(model, "_no_split_modules", None)
+    if no_split_modules:
+        model._no_split_modules = [name for name in no_split_modules if "Vision" not in name]
+
+
 def unwrap_to_text_causal_lm(vlm_model):
     """Convert a loaded Qwen3.5/3.6 ``*ForConditionalGeneration`` shell into its
     text ``Qwen3_5MoeForCausalLM`` tower, reusing the already-loaded submodules.
@@ -183,9 +197,7 @@ def unwrap_to_text_causal_lm(vlm_model):
     # module. transformers stores `_no_split_modules` as a per-instance *set* on
     # the constructed model (the class attribute is a list); we overwrite the
     # instance attribute with a plain list of the surviving (text) classes.
-    nsm = getattr(text_model, "_no_split_modules", None)
-    if nsm:
-        text_model._no_split_modules = [c for c in nsm if "Vision" not in c]
+    remove_vision_no_split_modules(text_model)
 
     logger.info(
         "[qwen3_5_vlm] unwrapped %s -> %s (text tower); dropped vision + MTP head. _no_split_modules=%s",

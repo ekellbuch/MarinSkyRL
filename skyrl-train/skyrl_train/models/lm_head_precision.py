@@ -1,5 +1,7 @@
 """Explicit precision control for final language-model projections."""
 
+import copy
+
 from collections.abc import Callable
 from typing import Any
 
@@ -48,7 +50,18 @@ def restore_vllm_lm_head_compute_dtype(model: Any, dtype_name: str | None = None
             raise ValueError(f"Unsupported lm_head_compute_dtype: {candidate_dtype}")
         lm_head = getattr(candidate, "lm_head", None)
         if lm_head is not None and hasattr(lm_head, "float"):
+            model_body = getattr(candidate, "model", None)
+            embed_tokens = getattr(model_body, "embed_tokens", None)
+            if embed_tokens is None:
+                embed_tokens = getattr(candidate, "embed_tokens", None)
+            tied_projection = lm_head is embed_tokens or getattr(candidate, "_marinskyrl_tied_projection", False)
+            if tied_projection and lm_head is embed_tokens:
+                lm_head = copy.deepcopy(embed_tokens)
+                candidate.lm_head = lm_head
+                candidate._marinskyrl_tied_projection = True
             lm_head.float()
+            if tied_projection:
+                lm_head.weight.data.copy_(embed_tokens.weight.data.to(dtype=lm_head.weight.dtype))
             return True
     return False
 

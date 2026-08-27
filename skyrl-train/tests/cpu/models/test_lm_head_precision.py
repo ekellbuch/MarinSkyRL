@@ -49,7 +49,7 @@ def test_vllm_lm_head_float32_compute_casts_parameters_and_activations():
     assert output.dtype == torch.float32
 
 
-def test_vllm_lm_head_float32_compute_is_restored_after_tied_weight_load():
+def test_vllm_tied_lm_head_uses_fp32_copy_without_promoting_input_embedding():
     class TinyVLLMModel:
         def __init__(self) -> None:
             self.embed_tokens = nn.Embedding(2, 3, dtype=torch.bfloat16)
@@ -64,6 +64,17 @@ def test_vllm_lm_head_float32_compute_is_restored_after_tied_weight_load():
     configure_vllm_model_instance_lm_head_compute_dtype(shell, "float32")
     output = language_model.compute_logits(torch.ones((1, 3), dtype=torch.bfloat16))
 
-    assert language_model.embed_tokens.weight.dtype == torch.float32
+    assert language_model.embed_tokens.weight.dtype == torch.bfloat16
     assert language_model.lm_head.weight.dtype == torch.float32
+    assert language_model.lm_head is not language_model.embed_tokens
     assert output.dtype == torch.float32
+
+    language_model.embed_tokens.weight.data.fill_(2)
+    configure_vllm_model_instance_lm_head_compute_dtype(shell, "float32")
+
+    torch.testing.assert_close(
+        language_model.lm_head.weight,
+        language_model.embed_tokens.weight.float(),
+        rtol=0,
+        atol=0,
+    )

@@ -745,11 +745,18 @@ class WorkerWrap:
             entry = {"found": False}
             try:
                 # 1. Direct (replicated) match: router gate, norms, etc.
-                if name in all_params:
-                    tensor = all_params[name]
+                direct_name = name
+                if direct_name not in all_params:
+                    if name.startswith("model."):
+                        direct_name = "language_model.model." + name.removeprefix("model.")
+                    elif name.startswith("lm_head."):
+                        direct_name = "language_model.lm_head." + name.removeprefix("lm_head.")
+                if direct_name in all_params:
+                    tensor = all_params[direct_name]
                     entry = {
                         "found": True,
                         "mode": "direct",
+                        "internal_name": direct_name,
                         "dtype": torch_dtype_to_str(tensor.dtype),
                         "tensor": _cpu(tensor),
                     }

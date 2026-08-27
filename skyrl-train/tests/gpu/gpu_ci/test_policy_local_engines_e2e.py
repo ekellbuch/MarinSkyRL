@@ -5,11 +5,13 @@ uv run --isolated --group dev --extra vllm --extra deepspeed pytest tests/gpu/gp
 """
 
 import asyncio
+import math
 import os
 
 import hydra
 import pytest
 import ray
+import torch
 from omegaconf import DictConfig
 from skyrl_train.entrypoints.main_base import config_dir
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
@@ -19,6 +21,7 @@ from tests.gpu.utils import get_test_prompts, init_inference_engines, init_worke
 MODEL = os.environ.get("SKYRL_GPU_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 LM_HEAD_COMPUTE_DTYPE = os.environ.get("SKYRL_GPU_TEST_LM_HEAD_COMPUTE_DTYPE")
 FLASH_ATTN = os.environ.get("SKYRL_GPU_TEST_FLASH_ATTN", "0") == "1"
+VERIFY_PARITY = os.environ.get("SKYRL_GPU_TEST_VERIFY_PARITY", "0") == "1"
 
 
 def get_test_actor_config() -> DictConfig:
@@ -112,10 +115,52 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         ray.get(policy.async_run_ray_method("pass_through", "init_weight_sync_state", client))
         asyncio.run(client.reset_prefix_cache())
         ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
+
+        if VERIFY_PARITY:
+            weight_names = [
+                "model.embed_tokens.weight",
+                "model.layers.0.input_layernorm.weight",
+                "lm_head.weight",
+            ]
+            policy_weights = {}
+            per_rank = ray.get(policy.async_run_ray_method("pass_through", "read_post_step_weights", weight_names))
+            for rank_weights in per_rank:
+                if isinstance(rank_weights, dict):
+                    policy_weights.update(
+                        {name: tensor for name, tensor in rank_weights.items() if isinstance(tensor, torch.Tensor)}
+                    )
+            assert set(policy_weights) == set(weight_names), policy_weights.keys()
+
+            engine_actor = client.engines[0].inference_engine_actor
+            engine_per_rank = ray.get(engine_actor.read_engine_weights.remote(weight_names, False))
+            if isinstance(engine_per_rank, dict):
+                engine_per_rank = [engine_per_rank]
+            assert len(engine_per_rank) == 1, len(engine_per_rank)
+            for name in weight_names:
+                entry = engine_per_rank[0][name]
+                assert entry["found"], (name, entry)
+                actual = entry["tensor"]
+                expected = policy_weights[name].to(actual.dtype)
+                if name in {"model.embed_tokens.weight", "lm_head.weight"}:
+                    assert actual.shape[0] >= expected.shape[0], (name, actual.shape, expected.shape)
+                    actual = actual[: expected.shape[0]]
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert engine_per_rank[0]["lm_head.weight"]["dtype"] == "float32"
+            print(f"Verified exact learner/vLLM weights: {weight_names}")
+
         sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
+        if VERIFY_PARITY:
+            sampling_params["logprobs"] = 1
         outputs = asyncio.run(run_inference(client, get_test_prompts(MODEL), sampling_params))
 
         assert len(outputs["responses"]) == len(outputs["response_ids"])
+        if VERIFY_PARITY:
+            response_logprobs = outputs["response_logprobs"]
+            assert response_logprobs is not None
+            assert len(response_logprobs) == len(outputs["response_ids"])
+            assert all(len(ids) == len(logprobs) for ids, logprobs in zip(outputs["response_ids"], response_logprobs))
+            assert all(math.isfinite(logprob) for logprobs in response_logprobs for logprob in logprobs)
+            print(f"Verified rollout logprobs for {sum(map(len, response_logprobs))} tokens")
         print(f"Example output: {outputs['responses'][0]}, {outputs['stop_reasons'][0]}")
     finally:
         ray.shutdown()

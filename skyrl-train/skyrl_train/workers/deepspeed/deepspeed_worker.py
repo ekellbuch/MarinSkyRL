@@ -126,6 +126,7 @@ class DeepSpeedPolicyWorkerBase(PolicyWorkerBase):
             training_strategy=self.cfg.trainer.strategy,
             model_load_retry=self.cfg.trainer.model_load_retry,
             gdn_backend=str(self.cfg.generator.gdn_backend),
+            lm_head_compute_dtype=self.cfg.trainer.policy.model.lm_head_compute_dtype,
         )
 
     def init_model(self, model_id_or_path, num_training_steps: int = None):

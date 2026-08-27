@@ -34,6 +34,7 @@ from skyrl_train.models.grug_moe import (
     validate_grug_training_strategy,
 )
 from skyrl_train.models.layers.moe_checkpoint import moe_recompute_context_fn
+from skyrl_train.models.lm_head_precision import configure_hf_lm_head_compute_dtype
 from skyrl_train.utils.flash_attention import (
     flash_pad_input,
     flash_unpad_input,
@@ -384,6 +385,7 @@ class HFModelWrapper(nn.Module):
         training_strategy: str | None = None,
         model_load_retry=None,
         gdn_backend: str = "torch",
+        lm_head_compute_dtype: str | None = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -611,6 +613,7 @@ class HFModelWrapper(nn.Module):
             self.model = pretrain_or_model
 
         _enable_native_grug_grouping(self.model, use_grouped_mm)
+        configure_hf_lm_head_compute_dtype(self.model, lm_head_compute_dtype)
 
         # CP mask contract probe (computed once): does this HF model's forward
         # accept the per-layer-type mask DICT escape hatch? Dense Qwen3 does;

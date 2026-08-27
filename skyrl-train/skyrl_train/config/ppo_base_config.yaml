@@ -63,6 +63,7 @@ trainer:
       path: "Qwen/Qwen2.5-1.5B-Instruct"
       source_uri: null
       source_identity: null
+      lm_head_compute_dtype: null
       lora:
           rank: 0
           alpha: 16
@@ -186,6 +187,8 @@ trainer:
     advantage_batch_normalize: false
     value_head_prefix: "value_head"
     policy_loss_type: "regular"
+    dppo_divergence_type: "tv"
+    dppo_divergence_threshold: 0.1
     loss_reduction: "token_mean"
     grpo_norm_by_std: true
     rloo_n_filter_zero_reward_groups: true

@@ -52,6 +52,11 @@ class LossScaling(StrEnum):
     MEGATRON_PIPELINE = "megatron_pipeline"
 
 
+class DPPODivergenceType(StrEnum):
+    TV = "tv"
+    KL = "kl"
+
+
 @dataclass(frozen=True)
 class PolicyObjective:
     """Backend-neutral policy objective and its observable components."""
@@ -190,7 +195,7 @@ def _policy_objective_metrics(
     config: DictConfig,
 ) -> dict[str, float]:
     metrics = complete_clip_metrics(policy_loss_metrics)
-    if config.use_tis or config.get("policy_loss_type") == PolicyLossType.BEHAVIOR_CLIP:
+    if config.use_tis or config.get("policy_loss_type") in (PolicyLossType.BEHAVIOR_CLIP, PolicyLossType.DPPO):
         metrics.update(
             compute_tis_diagnostics(
                 old_action_log_probs,
@@ -377,6 +382,105 @@ def behavior_clipped_policy_loss(
         global_denom=global_loss_denom,
     )
     return loss, clip_metrics
+
+
+def _dppo_binary_divergence(
+    behavior_logprobs: torch.Tensor,
+    policy_logprobs: torch.Tensor,
+    divergence_type: str,
+) -> torch.Tensor:
+    """Compute TMax's sampled-token Bernoulli approximation to policy divergence."""
+    epsilon = 1e-9
+    behavior_probability = torch.exp(behavior_logprobs.clamp(min=-30.0, max=0.0))
+    policy_probability = torch.exp(policy_logprobs.clamp(min=-30.0, max=0.0))
+    if divergence_type == DPPODivergenceType.TV:
+        return (behavior_probability - policy_probability).abs()
+    if divergence_type == DPPODivergenceType.KL:
+        behavior_probability = behavior_probability.clamp(epsilon, 1.0 - epsilon)
+        policy_probability = policy_probability.clamp(epsilon, 1.0 - epsilon)
+        return behavior_probability * (behavior_probability.log() - policy_probability.log()) + (
+            1.0 - behavior_probability
+        ) * ((1.0 - behavior_probability).log() - (1.0 - policy_probability).log())
+    raise ValueError(f"Unknown DPPO divergence type: {divergence_type}")
+
+
+def compute_dppo_mask(
+    policy_logprobs: torch.Tensor,
+    behavior_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    ratio: torch.Tensor,
+    response_mask: Optional[torch.Tensor],
+    divergence_type: str,
+    divergence_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute the directional DPPO mask from the pinned TMax implementation."""
+    if response_mask is None:
+        response_mask = torch.ones_like(policy_logprobs, dtype=torch.bool)
+    else:
+        response_mask = response_mask.bool()
+
+    with torch.no_grad():
+        divergence = _dppo_binary_divergence(
+            behavior_logprobs=behavior_logprobs,
+            policy_logprobs=policy_logprobs,
+            divergence_type=divergence_type,
+        )
+        divergence = torch.where(response_mask, divergence, torch.zeros_like(divergence))
+        outside_region = divergence > divergence_threshold
+        bad_high = (advantages > 0) & (ratio > 1.0) & outside_region
+        bad_low = (advantages < 0) & (ratio < 1.0) & outside_region
+        keep = (~(bad_high | bad_low) & response_mask).to(policy_logprobs.dtype)
+    return keep, divergence
+
+
+@register_policy_loss(PolicyLossType.DPPO)
+def dppo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    config: DictConfig,
+    loss_mask: Optional[torch.Tensor] = None,
+    rollout_logprobs: Optional[torch.Tensor] = None,
+    global_loss_denom: Optional[float] = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Apply TMax's directional DPPO trust-region mask against the rollout policy."""
+    del old_log_probs
+    if rollout_logprobs is None:
+        raise ValueError("rollout_logprobs are required for dppo policy loss")
+    if config.use_tis:
+        raise ValueError("dppo cannot be combined with use_tis; DPPO uses the full rollout importance ratio")
+    if config.loss_reduction not in SUPPORTED_LOSS_REDUCTIONS:
+        raise ValueError(f"loss_reduction must be one of {list(SUPPORTED_LOSS_REDUCTIONS)}")
+
+    # Match the pinned TMax DPPO oracle exactly. Unlike the generic PPO paths,
+    # TMax does not truncate the behavior importance ratio before applying its
+    # directional trust-region mask.
+    ratio = torch.exp((log_probs - rollout_logprobs).float()).to(log_probs.dtype)
+    keep, divergence = compute_dppo_mask(
+        policy_logprobs=log_probs,
+        behavior_logprobs=rollout_logprobs,
+        advantages=advantages,
+        ratio=ratio,
+        response_mask=loss_mask,
+        divergence_type=config.dppo_divergence_type,
+        divergence_threshold=config.dppo_divergence_threshold,
+    )
+
+    loss = -advantages * ratio * keep
+    loss = reduce_loss(
+        loss,
+        loss_mask,
+        config.loss_reduction,
+        config.max_seq_len,
+        global_denom=global_loss_denom,
+    )
+    masked_divergence = divergence if loss_mask is None else divergence.masked_fill(loss_mask == 0, 0)
+    metrics = {
+        "dppo/masked_fraction": 1.0 - _masked_fraction(keep, loss_mask),
+        "dppo/divergence_mean": masked_mean(divergence, loss_mask).mean().detach().item(),
+        "dppo/divergence_max": masked_divergence.max().detach().item(),
+    }
+    return loss, metrics
 
 
 @register_policy_loss(PolicyLossType.SAPO)

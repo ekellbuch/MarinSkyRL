@@ -809,6 +809,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 training_strategy=self.cfg.trainer.strategy,
                 model_load_retry=self.cfg.trainer.model_load_retry,
                 gdn_backend=str(self.cfg.generator.gdn_backend),
+                lm_head_compute_dtype=self.cfg.trainer.policy.model.lm_head_compute_dtype,
             )
             # in-place patch
             self._seq_parallel_monkey_patch(model=wrapped_model.model)

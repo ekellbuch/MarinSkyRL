@@ -62,6 +62,7 @@ from skyrl_train.inference_engines.base import (
 )
 from skyrl_train.weight_sync import WeightLoader
 from skyrl_train.models.grug_moe import is_grug_router_bias
+from skyrl_train.models.lm_head_precision import configure_vllm_qwen3_5_lm_head_compute_dtype
 from skyrl_train.inference_engines.vllm.utils import (
     pop_openai_kwargs,
     ensure_token_ids_in_sse_chunk,
@@ -912,6 +913,10 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
 
     def __init__(self, *args, bundle_indices: list = None, **kwargs):
         setup_envvars_for_vllm(kwargs, bundle_indices)
+        lm_head_compute_dtype = kwargs.pop("lm_head_compute_dtype", None)
+        patched_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(lm_head_compute_dtype)
+        if patched_model_classes:
+            logger.info(f"Configured {', '.join(patched_model_classes)} with {lm_head_compute_dtype} lm_head compute")
         vllm_v1_disable_multiproc = kwargs.pop("vllm_v1_disable_multiproc", False)
         logger.info(
             f"BaseVLLMInferenceEngine: vllm_v1_disable_multiproc={vllm_v1_disable_multiproc}, "

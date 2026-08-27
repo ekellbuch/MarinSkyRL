@@ -106,7 +106,12 @@ class _RemoteCapture:
         return _Actor
 
 
-def _run_create(monkeypatch, dcp: int, attention_backend: str | None = None):
+def _run_create(
+    monkeypatch,
+    dcp: int,
+    attention_backend: str | None = None,
+    lm_head_compute_dtype: str | None = None,
+):
     """Drive the real create_ray_wrapped_inference_engines with Ray/PG/actor mocked.
 
     Uses tp=1, pp=1 (uni backend) so no real GPU/PG bundle reservation is needed; the
@@ -161,6 +166,7 @@ def _run_create(monkeypatch, dcp: int, attention_backend: str | None = None):
         tensor_parallel_size=1,
         model_dtype="bfloat16",
         pretrain="dummy/model",
+        lm_head_compute_dtype=lm_head_compute_dtype,
         seed=0,
         vllm_v1_disable_multiproc=True,
         enable_prefix_caching=False,
@@ -177,6 +183,11 @@ def _run_create(monkeypatch, dcp: int, attention_backend: str | None = None):
         engine_init_timeout_seconds=60,
     )
     return capture
+
+
+def test_lm_head_compute_dtype_forwarded_to_vllm_actor(monkeypatch):
+    capture = _run_create(monkeypatch, dcp=1, lm_head_compute_dtype="float32")
+    assert capture.remote_calls[0]["lm_head_compute_dtype"] == "float32"
 
 
 def test_dcp_disabled_kwarg_absent_from_remote(monkeypatch):

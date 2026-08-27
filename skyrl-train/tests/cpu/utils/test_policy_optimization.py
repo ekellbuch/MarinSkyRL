@@ -558,6 +558,32 @@ def test_validate_cfg_rejects_stacked_behavior_clip_and_tis():
         validate_cfg(cfg)
 
 
+def test_validate_cfg_rejects_stacked_dppo_and_tis():
+    cfg = _validatable_dummy_config()
+    cfg.trainer.algorithm.policy_loss_type = "dppo"
+    cfg.trainer.algorithm.use_tis = True
+
+    with pytest.raises(ValueError, match="cannot be combined with use_tis"):
+        validate_cfg(cfg)
+
+
+def test_validate_cfg_rejects_dppo_with_kl_penalty():
+    cfg = _validatable_dummy_config()
+    cfg.trainer.algorithm.policy_loss_type = "dppo"
+    cfg.trainer.algorithm.use_kl_loss = True
+
+    with pytest.raises(ValueError, match="requires use_kl_loss=false"):
+        validate_cfg(cfg)
+
+
+def test_validate_cfg_rejects_unsupported_lm_head_compute_dtype():
+    cfg = _validatable_dummy_config()
+    cfg.trainer.policy.model.lm_head_compute_dtype = "bfloat16"
+
+    with pytest.raises(ValueError, match="lm_head_compute_dtype"):
+        validate_cfg(cfg)
+
+
 def test_validate_cfg_rejects_gspo_without_sequence_mean_reduction():
     cfg = _validatable_dummy_config()
     cfg.trainer.algorithm.policy_loss_type = "gspo"

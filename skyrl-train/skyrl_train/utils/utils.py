@@ -711,11 +711,24 @@ def validate_cfg(cfg: DictConfig):
         )
 
     behavior_clip = cfg.trainer.algorithm.policy_loss_type == "behavior_clip"
-    if behavior_clip and cfg.trainer.algorithm.use_tis:
+    dppo = cfg.trainer.algorithm.policy_loss_type == "dppo"
+    if (behavior_clip or dppo) and cfg.trainer.algorithm.use_tis:
         raise ValueError(
-            "trainer.algorithm.policy_loss_type=behavior_clip cannot be combined with use_tis=true; "
-            "behavior clipping already uses the full rollout importance ratio"
+            f"trainer.algorithm.policy_loss_type={cfg.trainer.algorithm.policy_loss_type} cannot be combined with "
+            "use_tis=true; the selected loss already uses the full rollout importance ratio"
         )
+
+    if dppo:
+        if cfg.trainer.algorithm.dppo_divergence_type not in ("tv", "kl"):
+            raise ValueError("trainer.algorithm.dppo_divergence_type must be 'tv' or 'kl'")
+        if cfg.trainer.algorithm.dppo_divergence_threshold <= 0:
+            raise ValueError("trainer.algorithm.dppo_divergence_threshold must be positive")
+        if cfg.trainer.algorithm.use_kl_loss:
+            raise ValueError("trainer.algorithm.policy_loss_type=dppo requires use_kl_loss=false for TMax parity")
+
+    lm_head_compute_dtype = cfg.trainer.policy.model.lm_head_compute_dtype
+    if lm_head_compute_dtype not in (None, "float32"):
+        raise ValueError("trainer.policy.model.lm_head_compute_dtype must be null or 'float32'")
 
     if cfg.trainer.algorithm.use_tis:
         if cfg.trainer.algorithm.tis_imp_ratio_cap <= 0:
@@ -736,15 +749,18 @@ def validate_cfg(cfg: DictConfig):
             "dual_clip",
         ], "TIS is only implemented for regular and dual_clip policy loss types"
 
-    if behavior_clip:
+    if behavior_clip or dppo:
         if cfg.generator.sampling_params.logprobs is None:
             logger.warning(
-                "`generator.sampling_params.logprobs` is `None` but behavior_clip requires rollout logprobs. "
+                f"`generator.sampling_params.logprobs` is `None` but {cfg.trainer.algorithm.policy_loss_type} "
+                "requires rollout logprobs. "
                 "Setting `logprobs` to 0."
             )
             cfg.generator.sampling_params.logprobs = 0
         if cfg.generator.backend == "sglang":
-            raise NotImplementedError("behavior_clip requires rollout logprobs; use the vLLM generator backend")
+            raise NotImplementedError(
+                f"{cfg.trainer.algorithm.policy_loss_type} requires rollout logprobs; use the vLLM generator backend"
+            )
 
     if cfg.trainer.policy.model.lora.rank > 0:
         # LoRA enabled

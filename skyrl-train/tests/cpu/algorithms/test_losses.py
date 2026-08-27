@@ -11,8 +11,9 @@ import torch
 from omegaconf import DictConfig
 
 from skyrl_train.utils.algorithm_registry import PolicyLossRegistry
-from skyrl_train.utils.policy_math import masked_mean
 from skyrl_train.utils.loss_reduction import reduce_loss
+from skyrl_train.utils.policy_math import masked_mean
+from skyrl_train.utils.policy_losses import compute_dppo_mask
 
 
 def _clipping_config(loss_name: str, *, eps_clip_low: float, eps_clip_high: float) -> DictConfig:
@@ -208,6 +209,110 @@ def test_behavior_clip_rejects_tis_multiplication():
             config,
             rollout_logprobs=torch.zeros((1, 1)),
         )
+
+
+def test_behavior_clip_large_logprob_delta_remains_finite():
+    config = _clipping_config("behavior_clip", eps_clip_low=0.2, eps_clip_high=0.2)
+    loss, _ = PolicyLossRegistry.get("behavior_clip")(
+        torch.tensor([[100.0]]),
+        torch.zeros((1, 1)),
+        -torch.ones((1, 1)),
+        config,
+        rollout_logprobs=torch.zeros((1, 1)),
+    )
+
+    assert torch.isfinite(loss)
+
+
+def _dppo_config(divergence_type: str = "tv", threshold: float = 0.1) -> DictConfig:
+    config = _clipping_config("dppo", eps_clip_low=0.2, eps_clip_high=0.2)
+    config.dppo_divergence_type = divergence_type
+    config.dppo_divergence_threshold = threshold
+    return config
+
+
+def test_dppo_matches_tmax_directional_tv_mask_value_and_gradient():
+    behavior_probabilities = torch.tensor([[0.1, 0.5, 0.1, 0.5]])
+    policy_probabilities = torch.tensor([[0.4, 0.1, 0.4, 0.1]])
+    rollout_logprobs = behavior_probabilities.log()
+    log_probs = policy_probabilities.log().requires_grad_(True)
+    advantages = torch.tensor([[1.0, 1.0, -1.0, -1.0]])
+
+    loss, metrics = PolicyLossRegistry.get("dppo")(
+        log_probs,
+        torch.zeros_like(log_probs),
+        advantages,
+        _dppo_config(),
+        rollout_logprobs=rollout_logprobs,
+    )
+    loss.backward()
+
+    ratio = policy_probabilities / behavior_probabilities
+    expected_token_losses = -advantages * ratio * torch.tensor([[0.0, 1.0, 1.0, 0.0]])
+    torch.testing.assert_close(loss, expected_token_losses.mean())
+    torch.testing.assert_close(log_probs.grad, torch.tensor([[0.0, -0.05, 1.0, 0.0]]))
+    assert metrics["dppo/masked_fraction"] == pytest.approx(0.5)
+    assert metrics["dppo/divergence_mean"] == pytest.approx(0.35)
+
+
+def test_dppo_keeps_updates_at_the_tv_threshold():
+    rollout_logprobs = torch.tensor([[0.1]]).log()
+    log_probs = torch.tensor([[0.2]]).log()
+
+    loss, metrics = PolicyLossRegistry.get("dppo")(
+        log_probs,
+        torch.zeros_like(log_probs),
+        torch.ones_like(log_probs),
+        _dppo_config(threshold=0.1),
+        rollout_logprobs=rollout_logprobs,
+    )
+
+    torch.testing.assert_close(loss, torch.tensor(-2.0))
+    assert metrics["dppo/masked_fraction"] == pytest.approx(0.0)
+
+
+def test_dppo_requires_rollout_logprobs():
+    with pytest.raises(ValueError, match="rollout_logprobs are required"):
+        PolicyLossRegistry.get("dppo")(
+            torch.zeros((1, 1)),
+            torch.zeros((1, 1)),
+            torch.ones((1, 1)),
+            _dppo_config(),
+        )
+
+
+def test_dppo_mask_matches_pinned_tmax_oracle_across_boundary_cases():
+    # Oracle: hamishivi/tmax@7387d2f9142397a458dc39f0827a2ab0b4c03cda,
+    # open_instruct.grpo_utils.compute_dppo_mask.
+    behavior_probabilities = torch.tensor([[0.10, 0.10, 0.20, 0.20, 0.90, 0.90, 0.40]])
+    policy_probabilities = torch.tensor([[0.20, 0.21, 0.10, 0.09, 0.70, 0.89, 0.80]])
+    behavior_logprobs = behavior_probabilities.log()
+    policy_logprobs = policy_probabilities.log()
+    advantages = torch.tensor([[1.0, 1.0, -1.0, -1.0, 1.0, 0.0, -1.0]])
+    response_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0]], dtype=torch.bool)
+    ratio = torch.exp(policy_logprobs - behavior_logprobs)
+
+    oracle_divergence = torch.where(
+        response_mask,
+        (behavior_probabilities - policy_probabilities).abs(),
+        torch.zeros_like(policy_probabilities),
+    )
+    outside = oracle_divergence > 0.1
+    oracle_bad = ((advantages > 0) & (ratio > 1.0) & outside) | ((advantages < 0) & (ratio < 1.0) & outside)
+    oracle_mask = (~oracle_bad & response_mask).to(policy_logprobs.dtype)
+
+    actual_mask, actual_divergence = compute_dppo_mask(
+        policy_logprobs=policy_logprobs,
+        behavior_logprobs=behavior_logprobs,
+        advantages=advantages,
+        ratio=ratio,
+        response_mask=response_mask,
+        divergence_type="tv",
+        divergence_threshold=0.1,
+    )
+
+    torch.testing.assert_close(actual_divergence, oracle_divergence, atol=1e-6, rtol=1e-6)
+    assert torch.equal(actual_mask, oracle_mask)
 
 
 def test_policy_loss_cispo():

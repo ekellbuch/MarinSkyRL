@@ -45,6 +45,7 @@ def create_ray_wrapped_inference_engines_from_config(cfg: DictConfig, colocate_p
         "pipeline_parallel_size": cfg.generator.inference_engine_pipeline_parallel_size,
         "model_dtype": cfg.generator.model_dtype,
         "pretrain": cfg.trainer.policy.model.path,
+        "lm_head_compute_dtype": cfg.trainer.policy.model.lm_head_compute_dtype,
         "seed": cfg.trainer.seed,
         "vllm_v1_disable_multiproc": cfg.generator.vllm_v1_disable_multiproc,
         "enable_prefix_caching": cfg.generator.enable_prefix_caching,

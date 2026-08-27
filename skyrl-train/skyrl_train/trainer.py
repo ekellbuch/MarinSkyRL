@@ -1143,7 +1143,9 @@ class RayPPOTrainer:
         )
         behavior_logprobs_required = policy_loss_requires_rollout_logprobs(self.cfg.trainer.algorithm.policy_loss_type)
         if behavior_logprobs_required and rollout_logprobs_tensor is None:
-            raise ValueError("rollout_logprobs are required for behavior_clip policy loss")
+            raise ValueError(
+                f"rollout_logprobs are required for {self.cfg.trainer.algorithm.policy_loss_type} policy loss"
+            )
 
         # sanity check for tis
         #

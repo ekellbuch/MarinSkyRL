@@ -91,11 +91,12 @@ class PolicyLossType(StrEnum):
     CLIP_COV = "clip_cov"
     KL_COV = "kl_cov"
     SAPO = "sapo"
+    DPPO = "dppo"
 
 
 def policy_loss_requires_rollout_logprobs(policy_loss_type: str) -> bool:
     """Return whether a policy objective requires behavior-policy logprobs."""
-    return policy_loss_type == PolicyLossType.BEHAVIOR_CLIP
+    return policy_loss_type in (PolicyLossType.BEHAVIOR_CLIP, PolicyLossType.DPPO)
 
 
 def rollout_logprobs_enabled(algorithm_config: DictConfig) -> bool:

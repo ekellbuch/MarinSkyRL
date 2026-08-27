@@ -4,17 +4,20 @@ uv run --isolated --group dev --extra vllm --extra deepspeed pytest tests/gpu/gp
 
 """
 
-import pytest
 import asyncio
+import os
+
 import ray
 import hydra
+import pytest
 from omegaconf import DictConfig
 
 from tests.gpu.utils import init_worker_with_type, get_test_prompts, init_inference_engines, run_inference
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
 from skyrl_train.entrypoints.main_base import config_dir
 
-MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL = os.environ.get("SKYRL_GPU_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+LM_HEAD_COMPUTE_DTYPE = os.environ.get("SKYRL_GPU_TEST_LM_HEAD_COMPUTE_DTYPE")
 
 
 def get_test_actor_config() -> DictConfig:
@@ -24,6 +27,7 @@ def get_test_actor_config() -> DictConfig:
 
         # Override specific parameters
         cfg.trainer.policy.model.path = MODEL
+        cfg.trainer.policy.model.lm_head_compute_dtype = LM_HEAD_COMPUTE_DTYPE
         cfg.trainer.critic.model.path = ""
         cfg.trainer.placement.policy_num_gpus_per_node = 2
         cfg.generator.async_engine = True
@@ -106,6 +110,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
         outputs = asyncio.run(run_inference(client, get_test_prompts(MODEL), sampling_params))
 
+        assert len(outputs["responses"]) == len(outputs["response_ids"])
         print(f"Example output: {outputs['responses'][0]}, {outputs['stop_reasons'][0]}")
     finally:
         ray.shutdown()

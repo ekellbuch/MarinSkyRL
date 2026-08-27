@@ -375,6 +375,7 @@ def init_inference_engines(
         tensor_parallel_size=tp_size,
         model_dtype="bfloat16",
         pretrain=model,
+        lm_head_compute_dtype=cfg.trainer.policy.model.lm_head_compute_dtype,
         seed=42,
         vllm_v1_disable_multiproc=True,
         enable_prefix_caching=True,

@@ -118,8 +118,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
 
         if VERIFY_PARITY:
             weight_names = [
-                "model.embed_tokens.weight",
-                "model.layers.0.input_layernorm.weight",
+                "model.language_model.embed_tokens.weight",
+                "model.language_model.layers.0.input_layernorm.weight",
                 "lm_head.weight",
             ]
             policy_weights = {}
@@ -141,7 +141,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 assert entry["found"], (name, entry)
                 actual = entry["tensor"]
                 expected = policy_weights[name].to(actual.dtype)
-                if name in {"model.embed_tokens.weight", "lm_head.weight"}:
+                if name in {"model.language_model.embed_tokens.weight", "lm_head.weight"}:
                     assert actual.shape[0] >= expected.shape[0], (name, actual.shape, expected.shape)
                     actual = actual[: expected.shape[0]]
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -709,6 +709,10 @@ class WorkerWrap:
             hf_names: list of HF parameter names to read back.
             dump_inventory: if True, also returns the full ``named_parameters()``
                 name->shape inventory under key ``__inventory__`` (first run aid).
+
+        The Qwen3.5 multimodal shell accepts the sender-side broadcast namespace
+        ``model.language_model.*``. It is resolved to vLLM's internal
+        ``language_model.model.*`` namespace before direct lookup.
         """
         import re
         import torch as _torch
@@ -747,7 +751,9 @@ class WorkerWrap:
                 # 1. Direct (replicated) match: router gate, norms, etc.
                 direct_name = name
                 if direct_name not in all_params:
-                    if name.startswith("model."):
+                    if name.startswith("model.language_model."):
+                        direct_name = "language_model.model." + name.removeprefix("model.language_model.")
+                    elif name.startswith("model."):
                         direct_name = "language_model.model." + name.removeprefix("model.")
                     elif name.startswith("lm_head."):
                         direct_name = "language_model.lm_head." + name.removeprefix("lm_head.")

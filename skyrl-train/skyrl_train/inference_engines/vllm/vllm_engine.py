@@ -1103,12 +1103,13 @@ class WorkerWrap:
         language_model = getattr(model, "language_model", None)
         text_model = getattr(language_model, "model", None)
         layers = getattr(text_model, "layers", ())
+        diagnostic_gdn_layer = 2
         for layer_index, layer in enumerate(layers):
             mixer_name = "linear_attn" if layer.layer_type == "linear_attention" else "self_attn"
             mixer = getattr(layer, mixer_name)
             entry = {"layer": layer_index, "mixer": mixer_name}
             layer_captures.append(entry)
-            if layer_index == 0 and mixer_name == "linear_attn":
+            if layer_index == diagnostic_gdn_layer and mixer_name == "linear_attn":
                 qkv_size = (mixer.key_dim * 2 + mixer.value_dim) // mixer.tp_size
                 z_size = mixer.value_dim // mixer.tp_size
                 ba_size = mixer.in_proj_ba.weight.shape[0] // 2
@@ -1441,7 +1442,7 @@ class WorkerWrap:
                         raise RuntimeError("Expected per-layer GDN attention metadata")
                     attn_metadata = attn_metadata_raw[layer_mixer.prefix]
                     if not isinstance(attn_metadata, GDNAttentionMetadata):
-                        raise RuntimeError("Expected GDN attention metadata for the layer-zero diagnostic")
+                        raise RuntimeError(f"Expected GDN attention metadata for layer {diagnostic_gdn_layer}")
                     num_actual_tokens = attn_metadata.num_actual_tokens
                     query_start_loc = attn_metadata.non_spec_query_start_loc.detach().clone()
                     has_initial_state = attn_metadata.has_initial_state.detach().clone()

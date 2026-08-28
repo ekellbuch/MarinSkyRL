@@ -226,13 +226,14 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
             )
 
             text_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
+            diagnostic_gdn_layer = 2
             for layer_index, layer in enumerate(text_model.layers):
                 mixer_name = "linear_attn" if layer.layer_type == "linear_attention" else "self_attn"
                 mixer = getattr(layer, mixer_name)
                 entry = {"layer": layer_index, "mixer": mixer_name}
                 layer_captures.append(entry)
 
-                if layer_index == 0 and mixer_name == "linear_attn":
+                if layer_index == diagnostic_gdn_layer and mixer_name == "linear_attn":
                     projections = {}
                     entry["projections"] = projections
                     entry["mixer_stages"] = {}
@@ -866,7 +867,7 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                         payload["token_fingerprints"] = _token_fingerprints(hidden_states)
                     destination.setdefault(key, []).append(payload)
 
-                if layer_index == 0 and mixer_name == "linear_attn":
+                if layer_index == diagnostic_gdn_layer and mixer_name == "linear_attn":
                     stages = entry["mixer_stages"]
                     num_heads = mixer.num_v_heads
 

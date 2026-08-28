@@ -54,6 +54,39 @@ def test_vllm_lm_head_float32_compute_casts_parameters_and_activations():
     assert model.lm_head.weight.dtype == torch.float32
     assert output.dtype == torch.float32
     assert inspect.signature(TinyVLLMModel.__init__) == original_signature
+    patch_vllm_model_class_lm_head_compute_dtype(TinyVLLMModel, None)
+
+
+@pytest.mark.parametrize("first_dtype,second_dtype", [("float32", None), (None, "float32")])
+def test_vllm_class_precision_configuration_is_independent_of_construction_order(first_dtype, second_dtype):
+    class TinyVLLMModel:
+        def __init__(self) -> None:
+            self.lm_head = nn.Linear(3, 2, bias=False, dtype=torch.bfloat16)
+
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return self.lm_head(hidden_states)
+
+    original_init = TinyVLLMModel.__init__
+    original_compute_logits = TinyVLLMModel.compute_logits
+
+    models = []
+    for dtype_name in (first_dtype, second_dtype):
+        patch_vllm_model_class_lm_head_compute_dtype(TinyVLLMModel, dtype_name)
+        model = TinyVLLMModel()
+        models.append((model, dtype_name))
+        output = model.compute_logits(torch.ones((1, 3), dtype=torch.bfloat16))
+        expected_dtype = torch.float32 if dtype_name == "float32" else torch.bfloat16
+        assert model.lm_head.weight.dtype == expected_dtype
+        assert output.dtype == expected_dtype
+
+    if second_dtype is None:
+        assert TinyVLLMModel.__init__ is original_init
+        assert TinyVLLMModel.compute_logits is original_compute_logits
+    for model, dtype_name in models:
+        output = model.compute_logits(torch.ones((1, 3), dtype=torch.bfloat16))
+        expected_dtype = torch.float32 if dtype_name == "float32" else torch.bfloat16
+        assert output.dtype == expected_dtype
+    patch_vllm_model_class_lm_head_compute_dtype(TinyVLLMModel, None)
 
 
 def test_vllm_tied_lm_head_survives_two_complete_loads_without_stale_storage():

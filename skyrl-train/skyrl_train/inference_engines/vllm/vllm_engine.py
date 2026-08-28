@@ -67,6 +67,7 @@ from skyrl_train.models.lm_head_precision import (
     configure_vllm_model_instance_lm_head_compute_dtype,
     configure_vllm_qwen3_5_lm_head_compute_dtype,
 )
+from skyrl_train.models.qwen3_5_vlm import qwen3_5_vllm_internal_weight_candidates
 from skyrl_train.inference_engines.vllm.utils import (
     pop_openai_kwargs,
     ensure_token_ids_in_sse_chunk,
@@ -797,18 +798,13 @@ class WorkerWrap:
             entry = {"found": False}
             try:
                 # 1. Direct (replicated) match: router gate, norms, etc.
-                direct_name = name
-                if direct_name not in all_params:
-                    if name.startswith("model.language_model."):
-                        direct_name = "language_model.model." + name.removeprefix("model.language_model.")
-                    elif name.startswith("model."):
-                        direct_name = "language_model.model." + name.removeprefix("model.")
-                    elif name.startswith("lm_head."):
-                        direct_name = "language_model.lm_head." + name.removeprefix("lm_head.")
-                        language_model = getattr(model, "language_model", None)
-                        language_config = getattr(language_model, "config", None)
-                        if direct_name not in all_params and getattr(language_config, "tie_word_embeddings", False):
-                            direct_name = "language_model.model.embed_tokens.weight"
+                language_model = getattr(model, "language_model", None)
+                language_config = getattr(language_model, "config", None)
+                candidates = qwen3_5_vllm_internal_weight_candidates(
+                    name,
+                    tied_word_embeddings=bool(getattr(language_config, "tie_word_embeddings", False)),
+                )
+                direct_name = next((candidate for candidate in candidates if candidate in all_params), name)
                 if direct_name in all_params:
                     tensor = all_params[direct_name]
                     entry = {
@@ -985,9 +981,10 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
             os.environ.pop(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV, None)
         else:
             os.environ[VLLM_LM_HEAD_COMPUTE_DTYPE_ENV] = lm_head_compute_dtype
-        patched_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(lm_head_compute_dtype)
-        if patched_model_classes:
-            logger.info(f"Configured {', '.join(patched_model_classes)} with {lm_head_compute_dtype} lm_head compute")
+        configured_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(lm_head_compute_dtype)
+        if configured_model_classes:
+            action = "enabled" if lm_head_compute_dtype is not None else "restored"
+            logger.info(f"{action.capitalize()} lm_head compute for {', '.join(configured_model_classes)}")
         vllm_v1_disable_multiproc = kwargs.pop("vllm_v1_disable_multiproc", False)
         logger.info(
             f"BaseVLLMInferenceEngine: vllm_v1_disable_multiproc={vllm_v1_disable_multiproc}, "
@@ -1008,7 +1005,13 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         if "rope_scaling" in kwargs:
             kwargs.pop("rope_scaling")
         # Let subclass create the appropriate engine
-        self.llm = self._create_engine(*args, **kwargs)
+        try:
+            self.llm = self._create_engine(*args, **kwargs)
+        finally:
+            if lm_head_compute_dtype is not None:
+                restored_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(None)
+                if restored_model_classes:
+                    logger.info(f"Restored lm_head compute for {', '.join(restored_model_classes)}")
 
         # Set NUMA affinity for TP>1 workers via collective_rpc
         if self._tp_size > 1 or self._pp_size > 1:

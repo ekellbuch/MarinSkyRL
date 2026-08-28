@@ -66,7 +66,6 @@ def create_ray_wrapped_inference_engines_from_config(cfg: DictConfig, colocate_p
         "async_engine": cfg.generator.async_engine,
         "max_num_batched_tokens": cfg.generator.max_num_batched_tokens,
         "max_num_seqs": cfg.generator.max_num_seqs,
-        "max_logprobs": cfg.generator.max_logprobs,
         "tokenizer": tokenizer,
         "backend": cfg.generator.backend,
         "vllm_attention_backend": cfg.generator.get("vllm_attention_backend", None),
@@ -79,6 +78,8 @@ def create_ray_wrapped_inference_engines_from_config(cfg: DictConfig, colocate_p
         "mp_backend": cfg.generator.get("inference_engine_mp_backend", False),
         "placement_group_timeout_seconds": int(cfg.trainer.distributed.placement_group_timeout_seconds),
     }
+    if (max_logprobs := cfg.generator.get("max_logprobs")) is not None:
+        engine_kwargs["max_logprobs"] = int(max_logprobs)
 
     # Conditionally add LoRA parameters if LoRA is enabled
     if cfg.trainer.policy.model.lora.rank > 0:

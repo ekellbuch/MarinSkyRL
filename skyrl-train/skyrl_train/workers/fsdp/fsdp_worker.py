@@ -45,7 +45,6 @@ from skyrl_train.weight_sync.weight_extractor import (
 )
 from skyrl_train.weight_sync.weight_extractor_utils import yield_module_grouped_chunks
 from skyrl_train.utils.fd_monitor import start_fd_monitor
-from skyrl_train.utils.tensor_fingerprint import canonical_tensor_fingerprint
 
 
 def _fsdp_moe_model_kwargs(fsdp_config) -> dict[str, bool]:
@@ -507,92 +506,6 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 if is_rank0 and name in wanted:
                     collected[name] = tensor.detach().to("cpu", dtype=torch.float32).contiguous()
         return collected
-
-    def fingerprint_post_step_weights(self, names):
-        """TEST-ONLY: fingerprint broadcast-form weights without returning tensors."""
-        wanted = set(names)
-        fingerprints = {}
-        generator_dtype = str_to_torch_dtype(self.cfg.generator.model_dtype)
-        is_rank0 = torch.distributed.get_rank() == 0
-        # Every rank must drive the extractor because full_tensor() is collective.
-        for chunk in self.weight_extractor.extract_weights(generator_dtype):
-            for name, tensor in zip(chunk.names, chunk.tensors):
-                if is_rank0 and name in wanted:
-                    fingerprints[name] = canonical_tensor_fingerprint(tensor)
-        return fingerprints
-
-    def perturb_weight_for_sync_test(self, name: str, delta: float):
-        """TEST-ONLY: change one local parameter element before a repeat sync."""
-        matches = []
-        for parameter_name, parameter in self.model.model.named_parameters():
-            normalized_name = parameter_name.replace(FSDPWeightExtractor._FSDP_SEG, ".")
-            if normalized_name == name:
-                matches.append((parameter_name, parameter))
-        if len(matches) != 1:
-            raise KeyError(f"Expected one live parameter named {name!r}, found {[entry[0] for entry in matches]}")
-
-        parameter_name, parameter = matches[0]
-        local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
-        flat_parameter = local_parameter.reshape(-1)
-        if flat_parameter.numel() == 0:
-            return {"name": parameter_name, "changed": False, "rank": torch.distributed.get_rank()}
-
-        with torch.no_grad():
-            before = flat_parameter[0].float().item()
-            flat_parameter[0].copy_((flat_parameter[0].float() + delta).to(dtype=flat_parameter.dtype))
-            after = flat_parameter[0].float().item()
-        return {
-            "name": parameter_name,
-            "changed": before != after,
-            "before": before,
-            "after": after,
-            "rank": torch.distributed.get_rank(),
-        }
-
-    def direct_next_token_parity_for_sync_test(self, prompt_token_ids, selected_token: int):
-        """TEST-ONLY: score one rollout token with the live learner's FP32 head."""
-        from transformers.models.qwen3_5.modeling_qwen3_5 import is_fast_path_available
-
-        if not is_fast_path_available:
-            raise RuntimeError("Qwen3.5 learner parity requires the flash-linear-attention and causal-conv1d fast path")
-        device = torch.cuda.current_device()
-        input_ids = torch.tensor([prompt_token_ids], dtype=torch.long, device=device)
-        attention_mask = torch.ones_like(input_ids)
-        model = self.model.model
-        was_training = model.training
-        model.eval()
-        try:
-            with torch.no_grad():
-                logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits[0, -1]
-                if logits.dtype != torch.float32:
-                    raise TypeError(f"Expected learner FP32 final-token logits, got {logits.dtype}")
-                logsumexp = logits.logsumexp(dim=-1)
-                selected_logit = logits[selected_token]
-                top_logits, top_tokens = logits.topk(k=2)
-                top_logprobs = top_logits - logsumexp
-                result = {
-                    "rank": torch.distributed.get_rank(),
-                    "top1": int(logits.argmax(dim=-1).item()),
-                    "top_candidates": [
-                        {
-                            "token": int(token.item()),
-                            "logit": float(logit.item()),
-                            "logprob": float(logprob.item()),
-                        }
-                        for token, logit, logprob in zip(top_tokens, top_logits, top_logprobs, strict=True)
-                    ],
-                    "top1_margin": float((top_logits[0] - top_logits[1]).item()),
-                    "selected_token": selected_token,
-                    "selected_logit": float(selected_logit.item()),
-                    "logsumexp": float(logsumexp.item()),
-                    "selected_logprob": float((selected_logit - logsumexp).item()),
-                    "logits_dtype": str(logits.dtype),
-                    "gdn_fast_path": True,
-                }
-        finally:
-            if was_training:
-                model.train()
-        return result
 
     def grug_validation_snapshot(self, names=()):
         """Return the calling rank and requested Grug weights gathered on rank 0.

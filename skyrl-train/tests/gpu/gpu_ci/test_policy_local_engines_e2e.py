@@ -14,7 +14,7 @@ from types import MappingProxyType
 import hydra
 import pytest
 import ray
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 from skyrl_train.entrypoints.main_base import config_dir
 from skyrl_train.inference_engines.base import InferenceEngineInput
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
@@ -23,6 +23,7 @@ from skyrl_train.trainer import RayPPOTrainer
 from skyrl_train.trajectory_runners.base import TrajectoryRunner
 from skyrl_train.utils.tracking import Tracking
 
+from tests.gpu.dppo_diagnostics import PolicyWorker as DPPOPolicyWorker
 from tests.gpu.utils import get_test_prompts, init_inference_engines, init_worker_with_type, run_inference
 
 MODEL = os.environ.get("SKYRL_GPU_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
@@ -43,6 +44,12 @@ CALIBRATION_PROMPTS = (
     "Name four common animals.",
 )
 CALIBRATION_TOKENS_PER_PROMPT = 4
+DPPO_DIVERGENCE_THRESHOLD = 0.1
+# A logprob error epsilon changes one sampled-token probability by at most
+# exp(epsilon) - 1. Keep the worst pair below 80% of the DPPO TV threshold and
+# the p95 pair below 50%.
+MAX_SELECTED_LOGPROB_ERROR = math.log1p(0.8 * DPPO_DIVERGENCE_THRESHOLD)
+P95_SELECTED_LOGPROB_ERROR = math.log1p(0.5 * DPPO_DIVERGENCE_THRESHOLD)
 
 
 class _OnePromptDataset:
@@ -147,6 +154,22 @@ def _error_summary(values: list[dict]) -> dict:
     }
 
 
+def _logprob_error_gate(summary: dict) -> dict:
+    absolute_error = summary["absolute_error"]
+    return {
+        "max": {
+            "value": absolute_error["max"],
+            "threshold": MAX_SELECTED_LOGPROB_ERROR,
+            "passed": absolute_error["max"] <= MAX_SELECTED_LOGPROB_ERROR,
+        },
+        "p95": {
+            "value": absolute_error["p95"],
+            "threshold": P95_SELECTED_LOGPROB_ERROR,
+            "passed": absolute_error["p95"] <= P95_SELECTED_LOGPROB_ERROR,
+        },
+    }
+
+
 def get_test_actor_config() -> DictConfig:
     """Get base config with test-specific overrides."""
     with hydra.initialize_config_dir(config_dir=config_dir):
@@ -216,7 +239,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         cfg.generator.backend = backend
         cfg.generator.inference_engine_tensor_parallel_size = tp_size
         if VERIFY_PARITY:
-            cfg.generator.max_logprobs = 2
+            with open_dict(cfg.generator):
+                cfg.generator.max_logprobs = 2
         if VERIFY_DPPO_UPDATE:
             assert VERIFY_PARITY, "The DPPO update gate includes both pre- and post-update parity checks"
             assert DPPO_UPDATE_OUTPUT, "SKYRL_GPU_TEST_DPPO_UPDATE_OUTPUT is required for the DPPO update gate"
@@ -258,6 +282,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             colocate_all=cfg.trainer.placement.colocate_all,
             num_gpus_per_node=cfg.generator.inference_engine_tensor_parallel_size,
             cfg=cfg,
+            worker_cls=DPPOPolicyWorker,
         )
         ray.get(policy.async_run_ray_method("pass_through", "init_weight_sync_state", client))
         asyncio.run(client.reset_prefix_cache())
@@ -267,6 +292,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         def write_parity_checkpoint():
             assert PARITY_OUTPUT, "SKYRL_GPU_TEST_PARITY_OUTPUT is required for the parity calibration"
             expected_per_load = len(CALIBRATION_PROMPTS) * CALIBRATION_TOKENS_PER_PROMPT
+            overall_summary = _error_summary(parity_values)
             completed_loads = [
                 update_index
                 for update_index in (1, 2)
@@ -281,6 +307,11 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                     "temperature": 0.0,
                     "ignore_eos": True,
                 },
+                "thresholds": {
+                    "dppo_divergence": DPPO_DIVERGENCE_THRESHOLD,
+                    "max_selected_logprob_absolute_error": MAX_SELECTED_LOGPROB_ERROR,
+                    "p95_selected_logprob_absolute_error": P95_SELECTED_LOGPROB_ERROR,
+                },
                 "status": {
                     "completed_loads": completed_loads,
                     "comparisons": len(parity_values),
@@ -293,7 +324,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                     )
                     for update_index in completed_loads
                 },
-                "overall": _error_summary(parity_values),
+                "overall": overall_summary,
+                "error_gate": _logprob_error_gate(overall_summary),
                 "pairs": parity_values,
             }
             output_path = Path(PARITY_OUTPUT)
@@ -309,7 +341,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             ]
             policy_fingerprints = {}
             per_rank = ray.get(
-                policy.async_run_ray_method("pass_through", "fingerprint_post_step_weights", weight_names)
+                policy.async_run_ray_method("pass_through", "fingerprint_broadcast_weights", weight_names)
             )
             for rank_fingerprints in per_rank:
                 if isinstance(rank_fingerprints, dict):
@@ -410,7 +442,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                         learner_results = ray.get(
                             policy.async_run_ray_method(
                                 "pass_through",
-                                "direct_next_token_parity_for_sync_test",
+                                "score_next_token",
                                 prompt_ids + response_ids[:token_index],
                                 selected_token,
                             )
@@ -460,6 +492,9 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                     f"{json.dumps({'summary': _error_summary(load_values), 'pairs': load_values}, sort_keys=True)}"
                 )
                 write_parity_checkpoint()
+                load_gate = _logprob_error_gate(_error_summary(load_values))
+                assert load_gate["max"]["passed"], load_gate
+                assert load_gate["p95"]["passed"], load_gate
             print(
                 f"Verified rollout logprobs after complete load {update_index} "
                 f"for {sum(map(len, response_logprobs))} tokens"
@@ -541,7 +576,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                         # The learner is the unwrapped text tower (``model.*``); the
                         # extractor adds ``model.language_model.*`` for vLLM.
                         "pass_through",
-                        "perturb_weight_for_sync_test",
+                        "perturb_weight",
                         "model.embed_tokens.weight",
                         0.5,
                     )
@@ -578,6 +613,9 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 temporary_path.replace(output_path)
             assert len(parity_values) == 2 * len(CALIBRATION_PROMPTS) * CALIBRATION_TOKENS_PER_PROMPT
             assert all(value["top1_match"] for value in parity_values), parity_values
+            overall_gate = _logprob_error_gate(_error_summary(parity_values))
+            assert overall_gate["max"]["passed"], overall_gate
+            assert overall_gate["p95"]["passed"], overall_gate
             outputs = second_outputs
         else:
             sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)

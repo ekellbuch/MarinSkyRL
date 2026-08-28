@@ -408,7 +408,7 @@ def compute_dppo_mask(
     policy_logprobs: torch.Tensor,
     behavior_logprobs: torch.Tensor,
     advantages: torch.Tensor,
-    ratio: torch.Tensor,
+    log_ratio: torch.Tensor,
     response_mask: Optional[torch.Tensor],
     divergence_type: str,
     divergence_threshold: float,
@@ -427,8 +427,8 @@ def compute_dppo_mask(
         )
         divergence = torch.where(response_mask, divergence, torch.zeros_like(divergence))
         outside_region = divergence > divergence_threshold
-        bad_high = (advantages > 0) & (ratio > 1.0) & outside_region
-        bad_low = (advantages < 0) & (ratio < 1.0) & outside_region
+        bad_high = (advantages > 0) & (log_ratio > 0.0) & outside_region
+        bad_low = (advantages < 0) & (log_ratio < 0.0) & outside_region
         keep = (~(bad_high | bad_low) & response_mask).to(policy_logprobs.dtype)
     return keep, divergence
 
@@ -452,20 +452,27 @@ def dppo_policy_loss(
     if config.loss_reduction not in SUPPORTED_LOSS_REDUCTIONS:
         raise ValueError(f"loss_reduction must be one of {list(SUPPORTED_LOSS_REDUCTIONS)}")
 
-    # Match the pinned TMax DPPO oracle exactly. Unlike the generic PPO paths,
-    # TMax does not truncate the behavior importance ratio before applying its
-    # directional trust-region mask.
-    ratio = torch.exp((log_probs - rollout_logprobs).float()).to(log_probs.dtype)
+    log_ratio = log_probs - rollout_logprobs
     keep, divergence = compute_dppo_mask(
         policy_logprobs=log_probs,
         behavior_logprobs=rollout_logprobs,
         advantages=advantages,
-        ratio=ratio,
+        log_ratio=log_ratio,
         response_mask=loss_mask,
         divergence_type=config.dppo_divergence_type,
         divergence_threshold=config.dppo_divergence_threshold,
     )
 
+    selected = keep.bool()
+    selected_ratio = torch.exp(log_ratio[selected].float()).to(log_probs.dtype)
+    if not torch.isfinite(selected_ratio).all():
+        selected_log_ratio = log_ratio[selected].detach().float()
+        raise FloatingPointError(
+            "DPPO importance ratio is not finite for retained tokens "
+            f"(count={selected_ratio.numel()}, min_log_ratio={selected_log_ratio.min().item()}, "
+            f"max_log_ratio={selected_log_ratio.max().item()})"
+        )
+    ratio = torch.zeros_like(log_probs).masked_scatter(selected, selected_ratio)
     loss = -advantages * ratio * keep
     loss = reduce_loss(
         loss,

@@ -118,7 +118,13 @@ def import_worker(strategy: str, worker_type: str):
 
 
 def init_worker_with_type(
-    worker_type: str, shared_pg=None, colocate_all=False, num_gpus_per_node=1, num_nodes=1, cfg=None
+    worker_type: str,
+    shared_pg=None,
+    colocate_all=False,
+    num_gpus_per_node=1,
+    num_nodes=1,
+    cfg=None,
+    worker_cls=None,
 ) -> PPORayActorGroup:
     if cfg is None:
         cfg = get_test_actor_config()
@@ -132,7 +138,7 @@ def init_worker_with_type(
         get_ray_pg_ready_with_timeout(pg, timeout=30)
         num_gpus_per_actor = 0.75
 
-    worker_cls = import_worker(cfg.trainer.strategy, worker_type)
+    worker_cls = worker_cls or import_worker(cfg.trainer.strategy, worker_type)
     model = PPORayActorGroup(
         cfg,
         num_nodes=num_nodes,
@@ -387,7 +393,7 @@ def init_inference_engines(
         async_engine=async_engine,
         max_num_batched_tokens=8192,
         max_num_seqs=max_num_seqs,
-        max_logprobs=cfg.generator.max_logprobs,
+        max_logprobs=cfg.generator.get("max_logprobs", 1),
         tokenizer=tokenizer,
         backend=backend,
         sleep_level=sleep_level,

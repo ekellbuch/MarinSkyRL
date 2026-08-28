@@ -104,7 +104,6 @@ ADDITIVE_GENERATOR_FIELDS = {
     "r3_dispatch_put_timeout_seconds": 600,
     "coordinator_executor_workers": 256,
     "gdn_backend": "torch",
-    "max_logprobs": 1,
 }
 ADDITIVE_TEACHER_FIELDS = {
     "engine_init_timeout_seconds": "${generator.engine_init_timeout_seconds}",

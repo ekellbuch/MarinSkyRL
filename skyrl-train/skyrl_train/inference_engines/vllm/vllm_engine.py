@@ -1397,7 +1397,7 @@ class WorkerWrap:
                 instance_forward_core = mixer.__dict__.get("_forward_core")
                 original_forward_core = mixer._forward_core
 
-                def capture_forward_core(*args, original=original_forward_core, **kwargs):
+                def capture_forward_core(*args, original=original_forward_core, layer_mixer=mixer, **kwargs):
                     mixed_qkv = kwargs.get("mixed_qkv")
                     if mixed_qkv is None:
                         mixed_qkv = args[0]
@@ -1417,7 +1417,7 @@ class WorkerWrap:
                     attn_metadata_raw = forward_context.attn_metadata
                     if not isinstance(attn_metadata_raw, dict):
                         raise RuntimeError("Expected per-layer GDN attention metadata")
-                    attn_metadata = attn_metadata_raw[mixer.prefix]
+                    attn_metadata = attn_metadata_raw[layer_mixer.prefix]
                     if not isinstance(attn_metadata, GDNAttentionMetadata):
                         raise RuntimeError("Expected GDN attention metadata for the layer-zero diagnostic")
                     num_actual_tokens = attn_metadata.num_actual_tokens
@@ -1439,14 +1439,18 @@ class WorkerWrap:
                         raise RuntimeError("Expected one non-speculative prefill and no decodes")
 
                     conv_weight = (
-                        mixer.conv1d.weight.view(mixer.conv1d.weight.shape[0], mixer.conv1d.weight.shape[2])
+                        layer_mixer.conv1d.weight.view(
+                            layer_mixer.conv1d.weight.shape[0], layer_mixer.conv1d.weight.shape[2]
+                        )
                         .detach()
                         .clone()
                     )
-                    conv_bias = mixer.conv1d.bias
+                    conv_bias = layer_mixer.conv1d.bias
                     conv_bias = conv_bias.detach().clone() if conv_bias is not None else None
                     live_conv_state = (
-                        mixer.kv_cache[0] if is_conv_state_dim_first() else mixer.kv_cache[0].transpose(-1, -2)
+                        layer_mixer.kv_cache[0]
+                        if is_conv_state_dim_first()
+                        else layer_mixer.kv_cache[0].transpose(-1, -2)
                     )
 
                     result = original(*args, **kwargs)
@@ -1493,12 +1497,12 @@ class WorkerWrap:
                             activation=activation,
                         ).transpose(1, 2)
 
-                    scratch_output, scratch_state = run_vllm_conv(captured_x, activation=mixer.activation)
+                    scratch_output, scratch_state = run_vllm_conv(captured_x, activation=layer_mixer.activation)
                     scratch_raw_output, _ = run_vllm_conv(captured_x, activation=None)
-                    dirty_output, _ = run_vllm_conv(captured_x, activation=mixer.activation, dirty_state=True)
-                    released_output = run_released_conv(captured_x, activation=mixer.activation)
+                    dirty_output, _ = run_vllm_conv(captured_x, activation=layer_mixer.activation, dirty_state=True)
+                    released_output = run_released_conv(captured_x, activation=layer_mixer.activation)
                     released_raw_output = run_released_conv(captured_x, activation=None)
-                    scratch_q, scratch_k, scratch_v = mixer.rearrange_mixed_qkv(scratch_output.squeeze(0))
+                    scratch_q, scratch_k, scratch_v = layer_mixer.rearrange_mixed_qkv(scratch_output.squeeze(0))
                     del scratch_q, scratch_k
                     scratch_v = scratch_v.unsqueeze(0)
                     expected_state = torch.nn.functional.pad(
@@ -1585,7 +1589,7 @@ class WorkerWrap:
                                 "spec_sequence_masks": None,
                                 "state_indices": state_indices.cpu().tolist(),
                             },
-                            "options": {"activation": mixer.activation, "state_layout": "N,C,K-1"},
+                            "options": {"activation": layer_mixer.activation, "state_layout": "N,C,K-1"},
                         }
                     )
                     if (

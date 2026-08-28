@@ -94,6 +94,11 @@ class PolicyLossType(StrEnum):
     DPPO = "dppo"
 
 
+class DPPODivergenceType(StrEnum):
+    TV = "tv"
+    KL = "kl"
+
+
 def policy_loss_requires_rollout_logprobs(policy_loss_type: str) -> bool:
     """Return whether a policy objective requires behavior-policy logprobs."""
     return policy_loss_type in (PolicyLossType.BEHAVIOR_CLIP, PolicyLossType.DPPO)

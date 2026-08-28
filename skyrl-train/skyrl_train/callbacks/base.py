@@ -346,6 +346,31 @@ class TrainerCallback(ABC):
         """
         pass
 
+    def on_generation_selected(
+        self,
+        state: TrainerState,
+        control: TrainerControl,
+        *,
+        attempt: Any,
+        prompts: List[dict],
+        **kwargs,
+    ) -> Optional[TrainerControl]:
+        """Called after one prompt group is selected and before rollout submission."""
+        pass
+
+    def on_generation_outcome(
+        self,
+        state: TrainerState,
+        control: TrainerControl,
+        *,
+        attempt: Any,
+        optimizer_step: int,
+        outcome: str,
+        **kwargs,
+    ) -> Optional[TrainerControl]:
+        """Called when one selected generation attempt reaches an admission outcome."""
+        pass
+
     # Async variants (override for I/O-bound operations)
     async def on_train_begin_async(
         self,
@@ -429,6 +454,38 @@ class TrainerCallback(ABC):
     ) -> Optional[TrainerControl]:
         """Async version of on_log. Defaults to calling sync version."""
         return self.on_log(state, control, logs, **kwargs)
+
+    async def on_generation_selected_async(
+        self,
+        state: TrainerState,
+        control: TrainerControl,
+        *,
+        attempt: Any,
+        prompts: List[dict],
+        **kwargs,
+    ) -> Optional[TrainerControl]:
+        """Async version of on_generation_selected."""
+        return self.on_generation_selected(state, control, attempt=attempt, prompts=prompts, **kwargs)
+
+    async def on_generation_outcome_async(
+        self,
+        state: TrainerState,
+        control: TrainerControl,
+        *,
+        attempt: Any,
+        optimizer_step: int,
+        outcome: str,
+        **kwargs,
+    ) -> Optional[TrainerControl]:
+        """Async version of on_generation_outcome."""
+        return self.on_generation_outcome(
+            state,
+            control,
+            attempt=attempt,
+            optimizer_step=optimizer_step,
+            outcome=outcome,
+            **kwargs,
+        )
 
 
 class CallbackHandler:

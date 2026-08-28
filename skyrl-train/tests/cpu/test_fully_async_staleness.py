@@ -4,6 +4,8 @@ import collections
 import pytest
 import torch
 
+from skyrl_train.async_rollout_state import GenerationAttempt
+from skyrl_train.callbacks import CallbackHandler, TrainerControl
 from skyrl_train.fully_async_trainer import (
     FullyAsyncRayPPOTrainer,
     GenerationStalledError,
@@ -49,6 +51,11 @@ def _generated_group(
         uid=uid,
         earliest_model_step=earliest_model_step,
         source_prompts=[{"uid": uid}],
+        generation_attempt=GenerationAttempt(
+            task_id=uid,
+            selection_source="dataset",
+            optimizer_step_at_selection=earliest_model_step,
+        ),
     )
 
 
@@ -62,9 +69,14 @@ def _batch_assembly_state(
 ):
     trainer = object.__new__(FullyAsyncRayPPOTrainer)
     trainer.global_step = 10
+    trainer.num_steps_per_epoch = 10
+    trainer.total_training_steps = 20
     trainer.max_staleness_steps = 2
     trainer.mini_batch_size = mini_batch_size
     trainer.all_metrics = {}
+    trainer.all_timings = {}
+    trainer._control = TrainerControl()
+    trainer.callback_handler = CallbackHandler()
     trainer._groups_rejected_since_step = 0
     trainer._rejection_reasons_since_step = collections.Counter()
     trainer._groups_inspected_since_step = 0
@@ -363,6 +375,12 @@ async def test_resume_skips_uids_owned_by_restored_completed_groups_and_retries(
                 "uid": "completed",
                 "earliest_model_step": 10,
                 "source_prompts": [{"uid": "completed"}],
+                "generation_attempt": {
+                    "task_id": "completed",
+                    "selection_source": "dataset",
+                    "optimizer_step_at_selection": 10,
+                    "callback_metadata": {},
+                },
             }
         ],
         "retry_prompts": [[{"uid": "retry"}]],

@@ -26,6 +26,7 @@ Run:
 import sys
 import types
 import pytest
+from omegaconf import open_dict
 
 from skyrl_train.config.utils import get_default_config
 
@@ -62,6 +63,7 @@ def test_from_config_forwards_vllm_engine_options(monkeypatch):
     main_base.create_ray_wrapped_inference_engines_from_config(cfg, colocate_pg=None, tokenizer=None)
     assert captured["decode_context_parallel_size"] == 1
     assert captured["vllm_attention_backend"] is None
+    assert "max_logprobs" not in captured
 
     # dcp=2 with admissible TP: forwarded as 2.
     captured.clear()
@@ -69,9 +71,12 @@ def test_from_config_forwards_vllm_engine_options(monkeypatch):
     cfg2.generator.inference_engine_tensor_parallel_size = 8
     cfg2.generator[DCP_KEY] = 2
     cfg2.generator.vllm_attention_backend = "FLASH_ATTN"
+    with open_dict(cfg2.generator):
+        cfg2.generator.max_logprobs = 2
     main_base.create_ray_wrapped_inference_engines_from_config(cfg2, colocate_pg=None, tokenizer=None)
     assert captured["decode_context_parallel_size"] == 2
     assert captured["vllm_attention_backend"] == "FLASH_ATTN"
+    assert captured["max_logprobs"] == 2
 
 
 # ===================================================== remote forwarding G1 + G4

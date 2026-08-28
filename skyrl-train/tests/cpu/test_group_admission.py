@@ -1,5 +1,6 @@
 import pytest
 
+from skyrl_train.async_rollout_state import GenerationAttempt
 from skyrl_train.fully_async_trainer import GeneratedOutputGroup
 from skyrl_train.dynamic_sampling import (
     GroupSelectionPolicy,
@@ -39,6 +40,11 @@ def _group(
         uid="group",
         earliest_model_step=earliest_model_step,
         source_prompts=[{"uid": "group"}],
+        generation_attempt=GenerationAttempt(
+            task_id="group",
+            selection_source="dataset",
+            optimizer_step_at_selection=earliest_model_step,
+        ),
     )
 
 

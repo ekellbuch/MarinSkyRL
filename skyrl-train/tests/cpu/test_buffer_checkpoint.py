@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from skyrl_train.callbacks.builtin import BufferCheckpointCallback
-from skyrl_train.async_rollout_state import GeneratedOutputGroup
+from skyrl_train.async_rollout_state import GeneratedOutputGroup, GenerationAttempt
 from skyrl_train.fully_async_trainer import _GenerationQueues
 from skyrl_train.trajectory_runners.base import TrajectoryID
 from skyrl_train.utils.io import io
@@ -40,6 +40,11 @@ def _make_item(uid: str, step: int) -> GeneratedOutputGroup:
         uid=uid,
         earliest_model_step=step,
         source_prompts=[{"uid": uid}],
+        generation_attempt=GenerationAttempt(
+            task_id=uid,
+            selection_source="dataset",
+            optimizer_step_at_selection=step,
+        ),
     )
 
 

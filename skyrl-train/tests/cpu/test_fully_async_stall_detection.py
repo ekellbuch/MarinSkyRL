@@ -16,7 +16,8 @@ from skyrl_train.fully_async_trainer import (
     GenerationStalledError,
     _GenerationQueues,
 )
-from skyrl_train.async_rollout_state import GeneratedOutputGroup
+from skyrl_train.async_rollout_state import GeneratedOutputGroup, GenerationAttempt
+from skyrl_train.callbacks import CallbackHandler, TrainerControl
 from skyrl_train.dynamic_sampling import GroupSelectionPolicy
 from skyrl_train.group_admission import GroupAdmissionPolicy, GroupAdvantageInvariant
 
@@ -42,7 +43,12 @@ def _bare_trainer(
     trainer.admission_stall_timeout = admission_stall_timeout
     trainer._active_trajectory_tasks = tasks or []
     trainer.global_step = 0
+    trainer.num_steps_per_epoch = 1
+    trainer.total_training_steps = 1
     trainer.all_metrics = {}
+    trainer.all_timings = {}
+    trainer._control = TrainerControl()
+    trainer.callback_handler = CallbackHandler()
     trainer._groups_rejected_since_step = 0
     trainer._rejection_reasons_since_step = collections.Counter()
     trainer._groups_inspected_since_step = 0
@@ -146,6 +152,11 @@ async def test_get_admitted_batch_returns_complete_group_set():
                 uid=f"u{i}",
                 earliest_model_step=0,
                 source_prompts=[{}],
+                generation_attempt=GenerationAttempt(
+                    task_id=f"u{i}",
+                    selection_source="dataset",
+                    optimizer_step_at_selection=0,
+                ),
             )
         )
 

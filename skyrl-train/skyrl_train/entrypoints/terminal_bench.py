@@ -86,6 +86,7 @@ class TerminalBenchExp(BasePPOExp):
             inference_engine_client=inference_engine_client,
             trajectory_runner=trajectory_runner,
             colocate_pg=colocate_pg,
+            callbacks=self.get_callbacks(),
         )
 
 

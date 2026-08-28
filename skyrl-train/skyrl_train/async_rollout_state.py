@@ -1,9 +1,19 @@
 """Shared state records for fully asynchronous rollout generation."""
 
-from dataclasses import dataclass
-from typing import List, Protocol
+from dataclasses import dataclass, field
+from typing import Any, List, Protocol
 
 from skyrl_train.trajectory_runners.base import TrajectoryBatch
+
+
+@dataclass
+class GenerationAttempt:
+    """Stable identity and callback-owned state for one rollout submission."""
+
+    task_id: str
+    selection_source: str
+    optimizer_step_at_selection: int
+    callback_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -14,6 +24,7 @@ class GeneratedOutputGroup:
     uid: str
     earliest_model_step: int
     source_prompts: List[dict]
+    generation_attempt: GenerationAttempt
 
 
 @dataclass

@@ -78,6 +78,8 @@ RUNTIME_CONFIG_TRAINER_FIELDS = {
 }
 ADDITIVE_ALGORITHM_FIELDS = {
     "batch_invariant": False,
+    "dppo_divergence_threshold": 0.1,
+    "dppo_divergence_type": "tv",
 }
 ADDITIVE_DYNAMIC_SAMPLING_FIELDS = {
     "informative_on": "shaped",
@@ -101,6 +103,7 @@ ADDITIVE_TEACHER_FIELDS = {
     "engine_init_timeout_seconds": "${generator.engine_init_timeout_seconds}",
 }
 ADDITIVE_POLICY_MODEL_FIELDS = {
+    "lm_head_compute_dtype": None,
     "source_uri": None,
     "source_identity": None,
 }

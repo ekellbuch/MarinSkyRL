@@ -11,6 +11,7 @@ from torch.nn import functional
 
 FP32_DTYPE_NAME = "float32"
 VLLM_LM_HEAD_COMPUTE_DTYPE_ENV = "SKYRL_VLLM_LM_HEAD_COMPUTE_DTYPE"
+_VLLM_CLASS_PATCHES: dict[type, Callable[..., None]] = {}
 
 
 def _record_vllm_reload_metadata(module: nn.Module) -> None:
@@ -23,7 +24,7 @@ def _record_vllm_reload_metadata(module: nn.Module) -> None:
 
 
 def configure_hf_lm_head_compute_dtype(model: nn.Module, dtype_name: str | None) -> bool:
-    """Run a Hugging Face causal LM's final projection in the requested dtype."""
+    """Configure the final projection and report whether it changed."""
     if dtype_name is None:
         return False
     if dtype_name != FP32_DTYPE_NAME:
@@ -44,19 +45,14 @@ def configure_hf_lm_head_compute_dtype(model: nn.Module, dtype_name: str | None)
     return True
 
 
-def restore_vllm_lm_head_compute_dtype(model: Any, dtype_name: str | None = None) -> bool:
-    """Restore the configured vLLM projection dtype after a weight update."""
-    if dtype_name is not None and dtype_name != FP32_DTYPE_NAME:
+def ensure_vllm_lm_head_compute_dtype(model: Any, dtype_name: str) -> bool:
+    """Configure or refresh a vLLM projection and report whether one qualified."""
+    if dtype_name != FP32_DTYPE_NAME:
         raise ValueError(f"Unsupported lm_head_compute_dtype: {dtype_name}")
     candidates = (model, getattr(model, "language_model", None))
     for candidate in candidates:
         if candidate is None:
             continue
-        candidate_dtype = dtype_name or getattr(type(candidate), "_marinskyrl_lm_head_compute_dtype", None)
-        if candidate_dtype is None:
-            continue
-        if candidate_dtype != FP32_DTYPE_NAME:
-            raise ValueError(f"Unsupported lm_head_compute_dtype: {candidate_dtype}")
         lm_head = getattr(candidate, "lm_head", None)
         if lm_head is not None and hasattr(lm_head, "float"):
             model_body = getattr(candidate, "model", None)
@@ -81,32 +77,32 @@ def restore_vllm_lm_head_compute_dtype(model: Any, dtype_name: str | None = None
     return False
 
 
-def patch_vllm_model_class_lm_head_compute_dtype(model_class: type, dtype_name: str) -> bool:
-    """Run a vLLM model class's final projection in the requested dtype."""
+def patch_vllm_model_class_lm_head_compute_dtype(model_class: type, dtype_name: str | None) -> bool:
+    """Configure a vLLM model class for one engine-construction lifecycle."""
+    if dtype_name is None:
+        original_init = _VLLM_CLASS_PATCHES.pop(model_class, None)
+        if original_init is None:
+            return False
+        model_class.__init__ = original_init
+        if "_marinskyrl_lm_head_compute_dtype" in model_class.__dict__:
+            delattr(model_class, "_marinskyrl_lm_head_compute_dtype")
+        return True
     if dtype_name != FP32_DTYPE_NAME:
         raise ValueError(f"Unsupported lm_head_compute_dtype: {dtype_name}")
-    if getattr(model_class, "_marinskyrl_lm_head_compute_dtype", None) == dtype_name:
+    if model_class in _VLLM_CLASS_PATCHES:
         return False
     if not hasattr(model_class, "compute_logits"):
         return False
 
     original_init: Callable[..., None] = model_class.__init__
-    original_compute_logits: Callable[..., Any] = model_class.compute_logits
+    _VLLM_CLASS_PATCHES[model_class] = original_init
 
     @functools.wraps(original_init)
     def fp32_init(self, *args, **kwargs) -> None:
         original_init(self, *args, **kwargs)
-        if not restore_vllm_lm_head_compute_dtype(self):
-            raise TypeError("lm_head_compute_dtype requires a vLLM model with a floating-point lm_head")
-
-    @functools.wraps(original_compute_logits)
-    def fp32_compute_logits(self, hidden_states, *args, **kwargs):
-        if isinstance(hidden_states, torch.Tensor):
-            hidden_states = hidden_states.float()
-        return original_compute_logits(self, hidden_states, *args, **kwargs)
+        configure_vllm_model_instance_lm_head_compute_dtype(self, dtype_name)
 
     model_class.__init__ = fp32_init
-    model_class.compute_logits = fp32_compute_logits
     model_class._marinskyrl_lm_head_compute_dtype = dtype_name
     return True
 
@@ -114,19 +110,28 @@ def patch_vllm_model_class_lm_head_compute_dtype(model_class: type, dtype_name: 
 def configure_vllm_model_instance_lm_head_compute_dtype(model: Any, dtype_name: str) -> None:
     """Configure an already-created vLLM model inside its EngineCore process."""
     candidate = getattr(model, "language_model", None) or model
-    patch_vllm_model_class_lm_head_compute_dtype(type(candidate), dtype_name)
-    if not restore_vllm_lm_head_compute_dtype(model, dtype_name):
+    if not ensure_vllm_lm_head_compute_dtype(model, dtype_name):
         raise TypeError("lm_head_compute_dtype requires a vLLM model with a floating-point lm_head")
+    if getattr(candidate, "_marinskyrl_compute_dtype", None) == dtype_name:
+        return
+    original_compute_logits = candidate.compute_logits
+
+    @functools.wraps(original_compute_logits)
+    def fp32_compute_logits(hidden_states, *args, **kwargs):
+        if isinstance(hidden_states, torch.Tensor):
+            hidden_states = hidden_states.float()
+        return original_compute_logits(hidden_states, *args, **kwargs)
+
+    candidate.compute_logits = fp32_compute_logits
+    candidate._marinskyrl_compute_dtype = dtype_name
 
 
 def configure_vllm_qwen3_5_lm_head_compute_dtype(dtype_name: str | None) -> tuple[str, ...]:
     """Configure the Qwen3.5 vLLM implementations before engine construction."""
-    if dtype_name is None:
-        return ()
-    if dtype_name != FP32_DTYPE_NAME:
+    if dtype_name not in (None, FP32_DTYPE_NAME):
         raise ValueError(f"Unsupported lm_head_compute_dtype: {dtype_name}")
 
-    patched_classes = []
+    configured_classes = []
     for module_name in ("vllm.model_executor.models.qwen3_5", "vllm.model_executor.models.qwen3_5_mtp"):
         try:
             module = __import__(module_name, fromlist=[""])
@@ -137,7 +142,7 @@ def configure_vllm_qwen3_5_lm_head_compute_dtype(dtype_name: str | None) -> tupl
                 continue
             model_class = getattr(module, attribute_name)
             if isinstance(model_class, type) and patch_vllm_model_class_lm_head_compute_dtype(model_class, dtype_name):
-                patched_classes.append(f"{module_name}.{attribute_name}")
-    if not patched_classes:
+                configured_classes.append(f"{module_name}.{attribute_name}")
+    if dtype_name is not None and not configured_classes:
         raise RuntimeError("No Qwen3.5 vLLM model class accepted lm_head_compute_dtype=float32")
-    return tuple(sorted(patched_classes))
+    return tuple(sorted(configured_classes))

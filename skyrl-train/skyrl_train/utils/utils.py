@@ -33,7 +33,14 @@ from skyrl_train.dynamic_sampling import resolve_dynamic_sampling_criteria
 from marinskyrl.runtime_options import GDNBackend, R3Transport
 
 from .constants import DEFAULT_RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS
-from .algorithm_registry import AdvantageEstimatorRegistry, PolicyLossRegistry, PolicyLossType, sync_registries
+from .algorithm_registry import (
+    AdvantageEstimatorRegistry,
+    DPPODivergenceType,
+    PolicyLossRegistry,
+    PolicyLossType,
+    policy_loss_requires_rollout_logprobs,
+    sync_registries,
+)
 from .logging_utils import format_exception_text
 from .loss_reduction import SEQUENCE_MEAN_LOSS_REDUCTION, SUPPORTED_LOSS_REDUCTIONS
 from .nccl_environment import worker_nccl_environment
@@ -710,16 +717,16 @@ def validate_cfg(cfg: DictConfig):
             "`offload_after_step=False` is not supported for DeepSpeed, please set `offload_after_step` to `true` for both policy and critic"
         )
 
-    behavior_clip = cfg.trainer.algorithm.policy_loss_type == "behavior_clip"
-    dppo = cfg.trainer.algorithm.policy_loss_type == "dppo"
-    if (behavior_clip or dppo) and cfg.trainer.algorithm.use_tis:
+    policy_loss_type = cfg.trainer.algorithm.policy_loss_type
+    dppo = policy_loss_type == PolicyLossType.DPPO
+    if policy_loss_requires_rollout_logprobs(policy_loss_type) and cfg.trainer.algorithm.use_tis:
         raise ValueError(
             f"trainer.algorithm.policy_loss_type={cfg.trainer.algorithm.policy_loss_type} cannot be combined with "
             "use_tis=true; the selected loss already uses the full rollout importance ratio"
         )
 
     if dppo:
-        if cfg.trainer.algorithm.dppo_divergence_type not in ("tv", "kl"):
+        if cfg.trainer.algorithm.dppo_divergence_type not in DPPODivergenceType:
             raise ValueError("trainer.algorithm.dppo_divergence_type must be 'tv' or 'kl'")
         if cfg.trainer.algorithm.dppo_divergence_threshold <= 0:
             raise ValueError("trainer.algorithm.dppo_divergence_threshold must be positive")
@@ -749,7 +756,7 @@ def validate_cfg(cfg: DictConfig):
             "dual_clip",
         ], "TIS is only implemented for regular and dual_clip policy loss types"
 
-    if behavior_clip or dppo:
+    if policy_loss_requires_rollout_logprobs(policy_loss_type):
         if cfg.generator.sampling_params.logprobs is None:
             logger.warning(
                 f"`generator.sampling_params.logprobs` is `None` but {cfg.trainer.algorithm.policy_loss_type} "

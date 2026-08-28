@@ -255,6 +255,39 @@ def test_dppo_matches_tmax_directional_tv_mask_value_and_gradient():
     assert metrics["dppo/divergence_mean"] == pytest.approx(0.35)
 
 
+def test_dppo_does_not_exponentiate_masked_extreme_ratio():
+    log_probs = torch.tensor([[0.0]], requires_grad=True)
+    rollout_logprobs = torch.tensor([[-100.0]])
+
+    loss, metrics = PolicyLossRegistry.get("dppo")(
+        log_probs,
+        torch.zeros_like(log_probs),
+        torch.ones_like(log_probs),
+        _dppo_config(),
+        rollout_logprobs=rollout_logprobs,
+    )
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+    torch.testing.assert_close(log_probs.grad, torch.tensor([[0.0]]))
+    assert torch.isfinite(loss)
+    assert torch.isfinite(log_probs.grad).all()
+    assert metrics["dppo/masked_fraction"] == pytest.approx(1.0)
+
+
+def test_dppo_retained_ratio_preserves_raw_tmax_overflow_semantics():
+    loss, metrics = PolicyLossRegistry.get("dppo")(
+        torch.tensor([[100.0]]),
+        torch.zeros((1, 1)),
+        -torch.ones((1, 1)),
+        _dppo_config(),
+        rollout_logprobs=torch.zeros((1, 1)),
+    )
+
+    assert torch.isinf(loss)
+    assert metrics["dppo/max_retained_log_ratio"] == 100.0
+
+
 def test_dppo_keeps_updates_at_the_tv_threshold():
     rollout_logprobs = torch.tensor([[0.1]]).log()
     log_probs = torch.tensor([[0.2]]).log()
@@ -305,7 +338,7 @@ def test_dppo_mask_matches_pinned_tmax_oracle_across_boundary_cases():
         policy_logprobs=policy_logprobs,
         behavior_logprobs=behavior_logprobs,
         advantages=advantages,
-        ratio=ratio,
+        log_ratio=policy_logprobs - behavior_logprobs,
         response_mask=response_mask,
         divergence_type="tv",
         divergence_threshold=0.1,

@@ -23,7 +23,12 @@ from skyrl_train.utils.loss_reduction import (
     build_think_weighted_loss_mask,
     reduce_loss,
 )
-from skyrl_train.utils.algorithm_registry import PolicyLossType, register_policy_loss
+from skyrl_train.utils.algorithm_registry import (
+    DPPODivergenceType,
+    PolicyLossType,
+    policy_loss_requires_rollout_logprobs,
+    register_policy_loss,
+)
 from skyrl_train.utils.policy_math import LOG_PROB_DELTA_CLIP, compute_approx_kl, masked_mean, safe_exp_delta
 
 
@@ -50,11 +55,6 @@ class LossScaling(StrEnum):
 
     CALLER = "caller"
     MEGATRON_PIPELINE = "megatron_pipeline"
-
-
-class DPPODivergenceType(StrEnum):
-    TV = "tv"
-    KL = "kl"
 
 
 @dataclass(frozen=True)
@@ -195,7 +195,7 @@ def _policy_objective_metrics(
     config: DictConfig,
 ) -> dict[str, float]:
     metrics = complete_clip_metrics(policy_loss_metrics)
-    if config.use_tis or config.get("policy_loss_type") in (PolicyLossType.BEHAVIOR_CLIP, PolicyLossType.DPPO):
+    if config.use_tis or policy_loss_requires_rollout_logprobs(config.get("policy_loss_type")):
         metrics.update(
             compute_tis_diagnostics(
                 old_action_log_probs,
@@ -408,12 +408,12 @@ def compute_dppo_mask(
     policy_logprobs: torch.Tensor,
     behavior_logprobs: torch.Tensor,
     advantages: torch.Tensor,
-    ratio: torch.Tensor,
+    log_ratio: torch.Tensor,
     response_mask: Optional[torch.Tensor],
     divergence_type: str,
     divergence_threshold: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute the directional DPPO mask from the pinned TMax implementation."""
+    """Return the directional keep mask and response-masked token divergence."""
     if response_mask is None:
         response_mask = torch.ones_like(policy_logprobs, dtype=torch.bool)
     else:
@@ -427,8 +427,8 @@ def compute_dppo_mask(
         )
         divergence = torch.where(response_mask, divergence, torch.zeros_like(divergence))
         outside_region = divergence > divergence_threshold
-        bad_high = (advantages > 0) & (ratio > 1.0) & outside_region
-        bad_low = (advantages < 0) & (ratio < 1.0) & outside_region
+        bad_high = (advantages > 0) & (log_ratio > 0.0) & outside_region
+        bad_low = (advantages < 0) & (log_ratio < 0.0) & outside_region
         keep = (~(bad_high | bad_low) & response_mask).to(policy_logprobs.dtype)
     return keep, divergence
 
@@ -452,20 +452,21 @@ def dppo_policy_loss(
     if config.loss_reduction not in SUPPORTED_LOSS_REDUCTIONS:
         raise ValueError(f"loss_reduction must be one of {list(SUPPORTED_LOSS_REDUCTIONS)}")
 
-    # Match the pinned TMax DPPO oracle exactly. Unlike the generic PPO paths,
-    # TMax does not truncate the behavior importance ratio before applying its
-    # directional trust-region mask.
-    ratio = torch.exp((log_probs - rollout_logprobs).float()).to(log_probs.dtype)
+    log_ratio = log_probs - rollout_logprobs
     keep, divergence = compute_dppo_mask(
         policy_logprobs=log_probs,
         behavior_logprobs=rollout_logprobs,
         advantages=advantages,
-        ratio=ratio,
+        log_ratio=log_ratio,
         response_mask=loss_mask,
         divergence_type=config.dppo_divergence_type,
         divergence_threshold=config.dppo_divergence_threshold,
     )
 
+    selected = keep.bool()
+    selected_log_ratio = log_ratio[selected].float()
+    selected_ratio = torch.exp(selected_log_ratio).to(log_probs.dtype)
+    ratio = torch.zeros_like(log_probs).masked_scatter(selected, selected_ratio)
     loss = -advantages * ratio * keep
     loss = reduce_loss(
         loss,
@@ -474,11 +475,13 @@ def dppo_policy_loss(
         config.max_seq_len,
         global_denom=global_loss_denom,
     )
-    masked_divergence = divergence if loss_mask is None else divergence.masked_fill(loss_mask == 0, 0)
     metrics = {
         "dppo/masked_fraction": 1.0 - _masked_fraction(keep, loss_mask),
         "dppo/divergence_mean": masked_mean(divergence, loss_mask).mean().detach().item(),
-        "dppo/divergence_max": masked_divergence.max().detach().item(),
+        "dppo/divergence_max": divergence.max().detach().item(),
+        "dppo/max_retained_log_ratio": (
+            selected_log_ratio.detach().max().item() if selected_log_ratio.numel() else 0.0
+        ),
     }
     return loss, metrics
 

@@ -8,25 +8,29 @@ import asyncio
 import json
 import math
 import os
-from pathlib import Path
+from types import MappingProxyType
 
 import hydra
 import pytest
 import ray
-import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 from skyrl_train.entrypoints.main_base import config_dir
 from skyrl_train.inference_engines.base import InferenceEngineInput
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
+from skyrl_train.callbacks import TrainerCallback
+from skyrl_train.trainer import RayPPOTrainer
+from skyrl_train.trajectory_runners.base import TrajectoryRunner
+from skyrl_train.utils.tracking import Tracking
 
+from tests.gpu.dppo_diagnostics import PolicyWorker as DPPOPolicyWorker
 from tests.gpu.utils import get_test_prompts, init_inference_engines, init_worker_with_type, run_inference
 
 MODEL = os.environ.get("SKYRL_GPU_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 LM_HEAD_COMPUTE_DTYPE = os.environ.get("SKYRL_GPU_TEST_LM_HEAD_COMPUTE_DTYPE")
 FLASH_ATTN = os.environ.get("SKYRL_GPU_TEST_FLASH_ATTN", "0") == "1"
 VERIFY_PARITY = os.environ.get("SKYRL_GPU_TEST_VERIFY_PARITY", "0") == "1"
-PARITY_OUTPUT = os.environ.get("SKYRL_GPU_TEST_PARITY_OUTPUT")
-CALIBRATION_PROMPTS = (
+VERIFY_DPPO_UPDATE = os.environ.get("SKYRL_GPU_TEST_VERIFY_DPPO_UPDATE", "0") == "1"
+PARITY_PROMPTS = (
     "Reply with four words about the sky.",
     "Name four common kitchen items.",
     "Give four words associated with winter.",
@@ -36,7 +40,86 @@ CALIBRATION_PROMPTS = (
     "Reply with four words about a library.",
     "Name four common animals.",
 )
-CALIBRATION_TOKENS_PER_PROMPT = 4
+PARITY_TOKENS_PER_PROMPT = 4
+DPPO_DIVERGENCE_THRESHOLD = 0.1
+# A logprob error epsilon changes one sampled-token probability by at most
+# exp(epsilon) - 1. Keep the worst pair below 80% of the DPPO TV threshold and
+# the p95 pair below 50%.
+MAX_SELECTED_LOGPROB_ERROR = math.log1p(0.8 * DPPO_DIVERGENCE_THRESHOLD)
+P95_SELECTED_LOGPROB_ERROR = math.log1p(0.5 * DPPO_DIVERGENCE_THRESHOLD)
+
+
+class _OnePromptDataset:
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, index):
+        assert index == 0
+        return (
+            [{"role": "user", "content": PARITY_PROMPTS[0]}],
+            None,
+            {},
+            "dppo-update",
+        )
+
+    @staticmethod
+    def collate_fn(entries):
+        return [
+            {"prompt": prompt, "env_class": env_class, "env_extras": env_extras, "uid": uid}
+            for prompt, env_class, env_extras, uid in entries
+        ]
+
+
+class _InferenceTrajectoryRunner(TrajectoryRunner):
+    trajectory_runner_cfg = MappingProxyType({})
+
+    def __init__(self, client):
+        self.client = client
+        self.last_batch = None
+
+    async def _run(self, input_batch, disable_tqdm=False):
+        del disable_tqdm
+        prompt_token_ids = self.client.tokenizer.apply_chat_template(
+            input_batch["prompts"],
+            add_generation_prompt=True,
+            add_special_tokens=False,
+            return_dict=True,
+            tokenize=True,
+        )["input_ids"]
+        outputs = await self.client.generate(
+            InferenceEngineInput(
+                prompt_token_ids=prompt_token_ids,
+                sampling_params=input_batch["sampling_params"],
+            )
+        )
+        response_ids = outputs["response_ids"]
+        rollout_logprobs = outputs["response_logprobs"]
+        assert rollout_logprobs is not None
+        assert len(response_ids) == 2
+        assert all(len(ids) == len(logprobs) for ids, logprobs in zip(response_ids, rollout_logprobs, strict=True))
+        assert all(math.isfinite(value) for row in rollout_logprobs for value in row)
+        batch = {
+            "prompt_token_ids": prompt_token_ids,
+            "response_ids": response_ids,
+            "rewards": [0.0, 1.0],
+            "loss_masks": [[1] * len(ids) for ids in response_ids],
+            "stop_reasons": outputs["stop_reasons"],
+            "rollout_metrics": {},
+            "rollout_logprobs": rollout_logprobs,
+        }
+        self.last_batch = batch
+        return batch
+
+
+class _StepMetrics(TrainerCallback):
+    error_behavior = "raise"
+
+    def __init__(self):
+        self.metrics = None
+
+    def on_step_end(self, state, control, **kwargs):
+        del control, kwargs
+        self.metrics = dict(state.metrics)
 
 
 def _percentile(values: list[float], quantile: float) -> float:
@@ -64,6 +147,22 @@ def _error_summary(values: list[dict]) -> dict:
             "max": max(relative_errors),
             "p50": _percentile(relative_errors, 0.50),
             "p95": _percentile(relative_errors, 0.95),
+        },
+    }
+
+
+def _logprob_error_gate(summary: dict) -> dict:
+    absolute_error = summary["absolute_error"]
+    return {
+        "max": {
+            "value": absolute_error["max"],
+            "threshold": MAX_SELECTED_LOGPROB_ERROR,
+            "passed": absolute_error["max"] <= MAX_SELECTED_LOGPROB_ERROR,
+        },
+        "p95": {
+            "value": absolute_error["p95"],
+            "threshold": P95_SELECTED_LOGPROB_ERROR,
+            "passed": absolute_error["p95"] <= P95_SELECTED_LOGPROB_ERROR,
         },
     }
 
@@ -137,7 +236,29 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         cfg.generator.backend = backend
         cfg.generator.inference_engine_tensor_parallel_size = tp_size
         if VERIFY_PARITY:
-            cfg.generator.max_logprobs = 2
+            with open_dict(cfg.generator):
+                cfg.generator.max_logprobs = 2
+        if VERIFY_DPPO_UPDATE:
+            assert VERIFY_PARITY, "The DPPO update gate includes both pre- and post-update parity checks"
+            cfg.generator.n_samples_per_prompt = 2
+            cfg.generator.sampling_params.max_generate_length = PARITY_TOKENS_PER_PROMPT
+            cfg.generator.sampling_params.logprobs = 1
+            cfg.trainer.algorithm.policy_loss_type = "dppo"
+            cfg.trainer.algorithm.dppo_divergence_type = "tv"
+            cfg.trainer.algorithm.dppo_divergence_threshold = 0.1
+            cfg.trainer.algorithm.use_kl_loss = False
+            cfg.trainer.algorithm.use_kl_in_reward = False
+            cfg.trainer.algorithm.use_tis = False
+            cfg.trainer.train_batch_size = 1
+            cfg.trainer.policy_mini_batch_size = 1
+            cfg.trainer.micro_forward_batch_size_per_gpu = 1
+            cfg.trainer.micro_train_batch_size_per_gpu = 1
+            cfg.trainer.update_epochs_per_batch = 1
+            cfg.trainer.epochs = 1
+            cfg.trainer.max_steps = 1
+            cfg.trainer.eval_before_train = False
+            cfg.trainer.resume_mode = "none"
+            cfg.trainer.logger = "console"
 
         # If colocate is True, this will load the engine, sleep, and wake up the engine
         client, pg = init_inference_engines(
@@ -157,15 +278,16 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             colocate_all=cfg.trainer.placement.colocate_all,
             num_gpus_per_node=cfg.generator.inference_engine_tensor_parallel_size,
             cfg=cfg,
+            worker_cls=DPPOPolicyWorker,
         )
         ray.get(policy.async_run_ray_method("pass_through", "init_weight_sync_state", client))
         asyncio.run(client.reset_prefix_cache())
         ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
         parity_values = []
 
-        def write_parity_checkpoint():
-            assert PARITY_OUTPUT, "SKYRL_GPU_TEST_PARITY_OUTPUT is required for the parity calibration"
-            expected_per_load = len(CALIBRATION_PROMPTS) * CALIBRATION_TOKENS_PER_PROMPT
+        def emit_parity_result():
+            expected_per_load = len(PARITY_PROMPTS) * PARITY_TOKENS_PER_PROMPT
+            overall_summary = _error_summary(parity_values)
             completed_loads = [
                 update_index
                 for update_index in (1, 2)
@@ -174,11 +296,16 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             payload = {
                 "schema_version": 1,
                 "design": {
-                    "prompts": list(CALIBRATION_PROMPTS),
-                    "tokens_per_prompt": CALIBRATION_TOKENS_PER_PROMPT,
+                    "prompts": list(PARITY_PROMPTS),
+                    "tokens_per_prompt": PARITY_TOKENS_PER_PROMPT,
                     "loads": 2,
                     "temperature": 0.0,
                     "ignore_eos": True,
+                },
+                "thresholds": {
+                    "dppo_divergence": DPPO_DIVERGENCE_THRESHOLD,
+                    "max_selected_logprob_absolute_error": MAX_SELECTED_LOGPROB_ERROR,
+                    "p95_selected_logprob_absolute_error": P95_SELECTED_LOGPROB_ERROR,
                 },
                 "status": {
                     "completed_loads": completed_loads,
@@ -192,13 +319,11 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                     )
                     for update_index in completed_loads
                 },
-                "overall": _error_summary(parity_values),
+                "overall": overall_summary,
+                "error_gate": _logprob_error_gate(overall_summary),
                 "pairs": parity_values,
             }
-            output_path = Path(PARITY_OUTPUT)
-            temporary_path = output_path.with_name(f".{output_path.name}.tmp")
-            temporary_path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
-            temporary_path.replace(output_path)
+            print(f"SKYRL_DPPO_PARITY_RESULT {json.dumps(payload, sort_keys=True, allow_nan=False)}")
 
         def verify_synced_weights(update_index: int):
             weight_names = [
@@ -206,29 +331,27 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 "model.language_model.layers.0.input_layernorm.weight",
                 "lm_head.weight",
             ]
-            policy_weights = {}
-            per_rank = ray.get(policy.async_run_ray_method("pass_through", "read_post_step_weights", weight_names))
-            for rank_weights in per_rank:
-                if isinstance(rank_weights, dict):
-                    policy_weights.update(
-                        {name: tensor for name, tensor in rank_weights.items() if isinstance(tensor, torch.Tensor)}
-                    )
-            assert set(policy_weights) == set(weight_names), policy_weights.keys()
+            policy_fingerprints = {}
+            per_rank = ray.get(
+                policy.async_run_ray_method("pass_through", "fingerprint_broadcast_weights", weight_names)
+            )
+            for rank_fingerprints in per_rank:
+                if isinstance(rank_fingerprints, dict):
+                    policy_fingerprints.update(rank_fingerprints)
+            assert set(policy_fingerprints) == set(weight_names), policy_fingerprints.keys()
 
             engine_actor = client.engines[0].inference_engine_actor
-            engine_per_rank = ray.get(engine_actor.read_engine_weights.remote(weight_names, False))
+            expected_shapes = {name: value["shape"] for name, value in policy_fingerprints.items()}
+            engine_per_rank = ray.get(engine_actor.fingerprint_engine_weights.remote(weight_names, expected_shapes))
             if isinstance(engine_per_rank, dict):
                 engine_per_rank = [engine_per_rank]
             assert len(engine_per_rank) == 1, len(engine_per_rank)
             for name in weight_names:
                 entry = engine_per_rank[0][name]
                 assert entry["found"], (name, entry)
-                actual = entry["tensor"]
-                expected = policy_weights[name].to(actual.dtype)
-                if name in {"model.language_model.embed_tokens.weight", "lm_head.weight"}:
-                    assert actual.shape[0] >= expected.shape[0], (name, actual.shape, expected.shape)
-                    actual = actual[: expected.shape[0]]
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                assert "tensor" not in entry, (name, entry.keys())
+                assert not entry["shape_mismatch"], (name, entry)
+                assert entry["fingerprint"] == policy_fingerprints[name], (name, entry, policy_fingerprints[name])
             assert engine_per_rank[0]["model.language_model.embed_tokens.weight"]["dtype"] == "bfloat16"
             assert engine_per_rank[0]["lm_head.weight"]["dtype"] == "float32"
             assert (
@@ -242,8 +365,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
             sampling_params["logprobs"] = 1
             if VERIFY_PARITY:
-                prompts = [[{"role": "user", "content": content}] for content in CALIBRATION_PROMPTS]
-                sampling_params["max_tokens"] = CALIBRATION_TOKENS_PER_PROMPT
+                prompts = [[{"role": "user", "content": content}] for content in PARITY_PROMPTS]
+                sampling_params["max_tokens"] = PARITY_TOKENS_PER_PROMPT
                 sampling_params["temperature"] = 0.0
                 sampling_params["ignore_eos"] = True
                 prompt_token_ids = client.tokenizer.apply_chat_template(
@@ -269,8 +392,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             assert all(len(ids) == len(logprobs) for ids, logprobs in zip(outputs["response_ids"], response_logprobs))
             assert all(math.isfinite(logprob) for logprobs in response_logprobs for logprob in logprobs)
             if VERIFY_PARITY:
-                assert len(outputs["response_ids"]) == len(CALIBRATION_PROMPTS)
-                assert all(len(tokens) == CALIBRATION_TOKENS_PER_PROMPT for tokens in outputs["response_ids"])
+                assert len(outputs["response_ids"]) == len(PARITY_PROMPTS)
+                assert all(len(tokens) == PARITY_TOKENS_PER_PROMPT for tokens in outputs["response_ids"])
                 scoring_params = dict(sampling_params)
                 scoring_params.update({"max_tokens": 1, "logprobs": 0, "prompt_logprobs": 2})
                 scored_outputs = asyncio.run(
@@ -309,23 +432,16 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                         learner_results = ray.get(
                             policy.async_run_ray_method(
                                 "pass_through",
-                                "direct_next_token_parity_for_sync_test",
+                                "score_next_token",
                                 prompt_ids + response_ids[:token_index],
                                 selected_token,
                             )
                         )
                         assert len(learner_results) == 1, learner_results
                         result = learner_results[0]
-                        assert result["gdn_fast_path"], result
                         assert math.isfinite(result["selected_logprob"]), result
                         assert math.isfinite(result["selected_logit"]), result
                         assert math.isfinite(result["logsumexp"]), result
-                        assert math.isclose(
-                            result["selected_logprob"],
-                            result["selected_logit"] - result["logsumexp"],
-                            rel_tol=0.0,
-                            abs_tol=1e-6,
-                        ), result
                         assert len(result["top_candidates"]) == 2, result
                         absolute_error = abs(result["selected_logprob"] - rollout_logprob)
                         relative_error = absolute_error / max(abs(rollout_logprob), 1e-12)
@@ -353,12 +469,15 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                             }
                         )
                 load_values = [value for value in parity_values if value["load"] == update_index]
-                assert len(load_values) == len(CALIBRATION_PROMPTS) * CALIBRATION_TOKENS_PER_PROMPT
+                assert len(load_values) == len(PARITY_PROMPTS) * PARITY_TOKENS_PER_PROMPT
                 print(
                     f"Measured learner/vLLM selected-token logprobs after complete load {update_index}: "
                     f"{json.dumps({'summary': _error_summary(load_values), 'pairs': load_values}, sort_keys=True)}"
                 )
-                write_parity_checkpoint()
+                emit_parity_result()
+                load_gate = _logprob_error_gate(_error_summary(load_values))
+                assert load_gate["max"]["passed"], load_gate
+                assert load_gate["p95"]["passed"], load_gate
             print(
                 f"Verified rollout logprobs after complete load {update_index} "
                 f"for {sum(map(len, response_logprobs))} tokens"
@@ -368,28 +487,95 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         if VERIFY_PARITY:
             first_engine_weights = verify_synced_weights(1)
             generate_with_logprob_checks(1)
-
-            mutation_results = ray.get(
-                policy.async_run_ray_method(
-                    # The learner is the unwrapped text tower (``model.*``); the
-                    # extractor adds ``model.language_model.*`` for vLLM.
-                    "pass_through",
-                    "perturb_weight_for_sync_test",
-                    "model.embed_tokens.weight",
-                    0.5,
+            dppo_update_evidence = None
+            if VERIFY_DPPO_UPDATE:
+                trajectory_runner = _InferenceTrajectoryRunner(client)
+                step_metrics = _StepMetrics()
+                trainer = RayPPOTrainer(
+                    cfg=cfg,
+                    tracker=Tracking("gpu-ci", "dppo-one-update", backends="console", config=cfg),
+                    tokenizer=client.tokenizer,
+                    train_dataset=_OnePromptDataset(),
+                    inference_engine_client=client,
+                    trajectory_runner=trajectory_runner,
+                    colocate_pg=pg,
+                    callbacks=[step_metrics],
                 )
-            )
-            assert mutation_results and all(result["changed"] for result in mutation_results), mutation_results
-            print(f"Changed learner state before complete load 2: {mutation_results}")
+                trainer.policy_model = policy
+                asyncio.run(trainer._train_loop())
+                assert trainer.global_step == 1
+                assert step_metrics.metrics is not None
+                assert trajectory_runner.last_batch is not None
 
-            asyncio.run(client.reset_prefix_cache())
-            ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
+                required_metrics = (
+                    "policy/final_loss",
+                    "policy/policy_loss",
+                    "policy/raw_grad_norm",
+                    "policy/policy_update_steps",
+                    "policy/dppo/masked_fraction",
+                    "policy/dppo/divergence_mean",
+                    "policy/dppo/divergence_max",
+                    "policy/dppo/max_retained_log_ratio",
+                )
+                update_metrics = {name: float(step_metrics.metrics[name]) for name in required_metrics}
+                assert all(math.isfinite(value) for value in update_metrics.values()), update_metrics
+                assert update_metrics["policy/raw_grad_norm"] > 0.0, update_metrics
+                assert update_metrics["policy/policy_update_steps"] == 1.0, update_metrics
+                assert update_metrics["policy/dppo/masked_fraction"] == 0.0, update_metrics
+
+                batch = trajectory_runner.last_batch
+                active_tokens = sum(sum(mask) for mask in batch["loss_masks"])
+                rollout_tokens = sum(len(row) for row in batch["rollout_logprobs"])
+                assert active_tokens > 0
+                assert active_tokens == rollout_tokens
+                assert all(
+                    len(ids) == len(mask) == len(logprobs)
+                    for ids, mask, logprobs in zip(
+                        batch["response_ids"], batch["loss_masks"], batch["rollout_logprobs"], strict=True
+                    )
+                )
+                dppo_update_evidence = {
+                    "schema_version": 1,
+                    "config": {
+                        "policy_loss_type": cfg.trainer.algorithm.policy_loss_type,
+                        "dppo_divergence_type": cfg.trainer.algorithm.dppo_divergence_type,
+                        "dppo_divergence_threshold": cfg.trainer.algorithm.dppo_divergence_threshold,
+                        "samples_per_prompt": cfg.generator.n_samples_per_prompt,
+                        "optimizer_updates": 1,
+                    },
+                    "rollout": {
+                        "trajectories": len(batch["response_ids"]),
+                        "rollout_logprob_tokens": rollout_tokens,
+                        "active_loss_mask_tokens": active_tokens,
+                        "finite_rollout_logprobs": True,
+                    },
+                    "metrics": update_metrics,
+                }
+                if colocate_all:
+                    asyncio.run(trainer._sync_policy_for_rollouts())
+                print(f"Completed one real DPPO optimizer update: {json.dumps(dppo_update_evidence, sort_keys=True)}")
+            else:
+                mutation_results = ray.get(
+                    policy.async_run_ray_method(
+                        # The learner is the unwrapped text tower (``model.*``); the
+                        # extractor adds ``model.language_model.*`` for vLLM.
+                        "pass_through",
+                        "perturb_weight",
+                        "model.embed_tokens.weight",
+                        0.5,
+                    )
+                )
+                assert mutation_results and all(result["changed"] for result in mutation_results), mutation_results
+                print(f"Changed learner state before complete load 2: {mutation_results}")
+
+                asyncio.run(client.reset_prefix_cache())
+                ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
             second_engine_weights = verify_synced_weights(2)
             second_outputs = generate_with_logprob_checks(2)
 
-            assert not torch.equal(
-                first_engine_weights["lm_head.weight"]["tensor"],
-                second_engine_weights["lm_head.weight"]["tensor"],
+            assert (
+                first_engine_weights["lm_head.weight"]["fingerprint"]["sha256"]
+                != second_engine_weights["lm_head.weight"]["fingerprint"]["sha256"]
             )
             for identity_key in ("internal_name", "parameter_id", "data_ptr"):
                 assert (
@@ -397,8 +583,18 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                     == second_engine_weights["lm_head.weight"][identity_key]
                 )
             print("Verified stable FP32 projection storage across two complete loads")
-            assert len(parity_values) == 2 * len(CALIBRATION_PROMPTS) * CALIBRATION_TOKENS_PER_PROMPT
+            if dppo_update_evidence is not None:
+                dppo_update_evidence["weight_sync"] = {
+                    "updated_lm_head": True,
+                    "exact_learner_engine_match": True,
+                    "post_update_inference": True,
+                }
+                print(f"SKYRL_DPPO_UPDATE_RESULT {json.dumps(dppo_update_evidence, sort_keys=True, allow_nan=False)}")
+            assert len(parity_values) == 2 * len(PARITY_PROMPTS) * PARITY_TOKENS_PER_PROMPT
             assert all(value["top1_match"] for value in parity_values), parity_values
+            overall_gate = _logprob_error_gate(_error_summary(parity_values))
+            assert overall_gate["max"]["passed"], overall_gate
+            assert overall_gate["p95"]["passed"], overall_gate
             outputs = second_outputs
         else:
             sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)

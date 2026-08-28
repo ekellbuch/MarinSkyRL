@@ -67,12 +67,14 @@ from skyrl_train.models.lm_head_precision import (
     configure_vllm_model_instance_lm_head_compute_dtype,
     configure_vllm_qwen3_5_lm_head_compute_dtype,
 )
+from skyrl_train.models.qwen3_5_vlm import qwen3_5_vllm_internal_weight_candidates
 from skyrl_train.inference_engines.vllm.utils import (
     pop_openai_kwargs,
     ensure_token_ids_in_sse_chunk,
     PrefixCacheHitRateAccumulator,
 )
 from skyrl_train.utils import get_tcp_url, str_to_torch_dtype, torch_dtype_to_str
+from skyrl_train.utils.tensor_fingerprint import canonical_tensor_fingerprint
 import time
 from packaging import version
 
@@ -261,6 +263,12 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
                         set_numa_affinity_for_gpu(gpu_ids[0])
         except Exception as e:
             logger.warning(f"setup_envvars_for_vllm: NUMA affinity setup failed: {e}")
+
+
+def _refresh_vllm_lm_head_compute_dtype(model) -> None:
+    dtype_name = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
+    if dtype_name is not None:
+        configure_vllm_model_instance_lm_head_compute_dtype(model, dtype_name)
 
 
 class WorkerWrap:
@@ -470,9 +478,7 @@ class WorkerWrap:
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             finalize_layerwise_reload(model, self.model_config)
         self._skyrl_weight_update_active = False
-        lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
-        if lm_head_compute_dtype is not None:
-            configure_vllm_model_instance_lm_head_compute_dtype(model, lm_head_compute_dtype)
+        _refresh_vllm_lm_head_compute_dtype(model)
 
     def begin_weight_update(self) -> None:
         """Start accumulating weights for batched load_weights call.
@@ -651,9 +657,8 @@ class WorkerWrap:
                 torch.cuda.empty_cache()
             else:
                 model.load_weights(weights=iter(self._accumulated_weights))
-            lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
-            if lm_head_compute_dtype is not None and not getattr(self, "_skyrl_weight_update_active", False):
-                configure_vllm_model_instance_lm_head_compute_dtype(model, lm_head_compute_dtype)
+            if not getattr(self, "_skyrl_weight_update_active", False):
+                _refresh_vllm_lm_head_compute_dtype(model)
             self._accumulated_weights.clear()
             del self._accumulated_weights
             gc.collect()
@@ -687,11 +692,7 @@ class WorkerWrap:
             if not getattr(self, "_skyrl_weight_update_active", False) and any(
                 name == "lm_head.weight" or name.endswith("embed_tokens.weight") for name, _ in weight_list
             ):
-                lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
-                if lm_head_compute_dtype is not None:
-                    configure_vllm_model_instance_lm_head_compute_dtype(
-                        self.model_runner.model, lm_head_compute_dtype
-                    )
+                _refresh_vllm_lm_head_compute_dtype(self.model_runner.model)
             for weight in weight_list:
                 del weight
 
@@ -702,18 +703,20 @@ class WorkerWrap:
             return
         destroy_process_group(self._model_update_group)
 
-    def read_named_weights(self, hf_names, dump_inventory: bool = False):
-        """TEST-ONLY (Stage 6 weight-equality gate): read engine-side weights back
+    def read_named_weights(
+        self,
+        hf_names,
+        dump_inventory: bool = False,
+    ):
+        """Read engine-side weights back
         from the live vLLM model, reconstructed under the HF parameter names the
         trainer broadcasts.
 
         This is the symmetric inverse of ``load_weights`` (vLLM consumes HF-named
         tensors in ``model.load_weights`` and maps them into its internal
         fused/sharded params; here we read those internal params back and rebuild
-        the HF view so the trainer's post-step HF tensors can be compared
-        tensor-by-tensor). Returns, per requested HF name, this worker's
-        contribution as a CPU fp32 tensor plus the live engine dtype and rank
-        coordinates so the caller can assemble across TP/EP shards.
+        the HF view). It returns CPU fp32 tensors for the established MoE
+        diagnostics.
 
         Supported HF name forms (Qwen1.5-MoE / Qwen2MoE vLLM layout):
           * ``model.embed_tokens.weight``                       -> VocabParallelEmbedding (TP vocab-sharded)
@@ -727,7 +730,6 @@ class WorkerWrap:
             hf_names: list of HF parameter names to read back.
             dump_inventory: if True, also returns the full ``named_parameters()``
                 name->shape inventory under key ``__inventory__`` (first run aid).
-
         The Qwen3.5 multimodal shell accepts the sender-side broadcast namespace
         ``model.language_model.*``. It is resolved to vLLM's internal
         ``language_model.model.*`` namespace before direct lookup.
@@ -753,8 +755,8 @@ class WorkerWrap:
         except Exception:
             ep_rank, ep_size = 0, 1
 
-        def _cpu(t):
-            return t.detach().to("cpu", dtype=_torch.float32).contiguous()
+        def _payload(tensor):
+            return {"tensor": tensor.detach().to("cpu", dtype=_torch.float32).contiguous()}
 
         out = {}
         if dump_inventory:
@@ -767,20 +769,13 @@ class WorkerWrap:
             entry = {"found": False}
             try:
                 # 1. Direct (replicated) match: router gate, norms, etc.
-                direct_name = name
-                if direct_name not in all_params:
-                    if name.startswith("model.language_model."):
-                        direct_name = "language_model.model." + name.removeprefix("model.language_model.")
-                    elif name.startswith("model."):
-                        direct_name = "language_model.model." + name.removeprefix("model.")
-                    elif name.startswith("lm_head."):
-                        direct_name = "language_model.lm_head." + name.removeprefix("lm_head.")
-                        language_model = getattr(model, "language_model", None)
-                        language_config = getattr(language_model, "config", None)
-                        if direct_name not in all_params and getattr(
-                            language_config, "tie_word_embeddings", False
-                        ):
-                            direct_name = "language_model.model.embed_tokens.weight"
+                language_model = getattr(model, "language_model", None)
+                language_config = getattr(language_model, "config", None)
+                candidates = qwen3_5_vllm_internal_weight_candidates(
+                    name,
+                    tied_word_embeddings=bool(getattr(language_config, "tie_word_embeddings", False)),
+                )
+                direct_name = next((candidate for candidate in candidates if candidate in all_params), name)
                 if direct_name in all_params:
                     tensor = all_params[direct_name]
                     entry = {
@@ -790,7 +785,7 @@ class WorkerWrap:
                         "mode": "direct",
                         "internal_name": direct_name,
                         "dtype": torch_dtype_to_str(tensor.dtype),
-                        "tensor": _cpu(tensor),
+                        **_payload(tensor),
                     }
                     out[name] = entry
                     continue
@@ -832,7 +827,7 @@ class WorkerWrap:
                         "owner_ep": owner_ep,
                         "local_e": local_e,
                         "dtype": torch_dtype_to_str(t.dtype),
-                        "tensor": _cpu(t),
+                        **_payload(t),
                     }
                     out[name] = entry
                     continue
@@ -843,6 +838,47 @@ class WorkerWrap:
             except Exception as e:  # never crash the collective_rpc
                 out[name] = {"found": False, "error": repr(e)}
         return out
+
+    def fingerprint_named_weights(self, hf_names, expected_shapes):
+        """Return compact exact fingerprints for requested engine weights."""
+        weights = self.read_named_weights(hf_names)
+        fingerprints = {"__ranks__": weights["__ranks__"]}
+        for name in hf_names:
+            entry = dict(weights[name])
+            tensor = entry.pop("tensor", None)
+            if tensor is None:
+                fingerprints[name] = entry
+                continue
+
+            actual_shape = list(tensor.shape)
+            expected_shape = expected_shapes.get(name)
+            compared_tensor = tensor
+            if expected_shape is not None and actual_shape != expected_shape:
+                can_trim_vocab_padding = (
+                    len(actual_shape) == len(expected_shape)
+                    and actual_shape[1:] == expected_shape[1:]
+                    and actual_shape[0] >= expected_shape[0]
+                )
+                if not can_trim_vocab_padding:
+                    entry.update(
+                        {
+                            "actual_shape": actual_shape,
+                            "expected_shape": expected_shape,
+                            "shape_mismatch": True,
+                        }
+                    )
+                    fingerprints[name] = entry
+                    continue
+                compared_tensor = tensor[: expected_shape[0]]
+            entry.update(
+                {
+                    "actual_shape": actual_shape,
+                    "shape_mismatch": False,
+                    "fingerprint": canonical_tensor_fingerprint(compared_tensor),
+                }
+            )
+            fingerprints[name] = entry
+        return fingerprints
 
     def read_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 disaggregated-receive diag): return THIS engine worker's
@@ -953,13 +989,16 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
     def __init__(self, *args, bundle_indices: list = None, **kwargs):
         setup_envvars_for_vllm(kwargs, bundle_indices)
         lm_head_compute_dtype = kwargs.pop("lm_head_compute_dtype", None)
+        # vLLM may construct the model in a separate EngineCore process, so the
+        # explicit constructor setting crosses that process boundary via env.
         if lm_head_compute_dtype is None:
             os.environ.pop(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV, None)
         else:
             os.environ[VLLM_LM_HEAD_COMPUTE_DTYPE_ENV] = lm_head_compute_dtype
-        patched_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(lm_head_compute_dtype)
-        if patched_model_classes:
-            logger.info(f"Configured {', '.join(patched_model_classes)} with {lm_head_compute_dtype} lm_head compute")
+        configured_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(lm_head_compute_dtype)
+        if configured_model_classes:
+            action = "enabled" if lm_head_compute_dtype is not None else "restored"
+            logger.info(f"{action.capitalize()} lm_head compute for {', '.join(configured_model_classes)}")
         vllm_v1_disable_multiproc = kwargs.pop("vllm_v1_disable_multiproc", False)
         logger.info(
             f"BaseVLLMInferenceEngine: vllm_v1_disable_multiproc={vllm_v1_disable_multiproc}, "
@@ -980,7 +1019,13 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         if "rope_scaling" in kwargs:
             kwargs.pop("rope_scaling")
         # Let subclass create the appropriate engine
-        self.llm = self._create_engine(*args, **kwargs)
+        try:
+            self.llm = self._create_engine(*args, **kwargs)
+        finally:
+            if lm_head_compute_dtype is not None:
+                restored_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(None)
+                if restored_model_classes:
+                    logger.info(f"Restored lm_head compute for {', '.join(restored_model_classes)}")
 
         # Set NUMA affinity for TP>1 workers via collective_rpc
         if self._tp_size > 1 or self._pp_size > 1:
@@ -1962,17 +2007,27 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         engine = self._get_engine()
         return await engine.collective_rpc("end_weight_update")
 
-    async def read_engine_weights(self, hf_names, dump_inventory: bool = False):
-        """TEST-ONLY (Stage 6 weight-equality gate): read engine-side weights back
+    async def read_engine_weights(
+        self,
+        hf_names,
+        dump_inventory: bool = False,
+    ):
+        """Read engine-side weights back
         under the trainer's HF parameter names, gathered across all TP/EP workers.
 
         Returns ``List[Dict]`` (one dict per worker rank), each as produced by
-        ``WorkerWrap.read_named_weights``. The caller assembles the per-rank
-        contributions (TP/EP shards) into the full HF tensors to compare against
-        the trainer's post-step weights.
+        ``WorkerWrap.read_named_weights``.
         """
         engine = self._get_engine()
         return await engine.collective_rpc("read_named_weights", args=(list(hf_names), dump_inventory))
+
+    async def fingerprint_engine_weights(self, hf_names, expected_shapes):
+        """Return compact in-actor fingerprints for engine weights."""
+        engine = self._get_engine()
+        return await engine.collective_rpc(
+            "fingerprint_named_weights",
+            args=(list(hf_names), dict(expected_shapes)),
+        )
 
     async def read_engine_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 diag): per-engine-worker RAW FusedMoE local-slot weights +

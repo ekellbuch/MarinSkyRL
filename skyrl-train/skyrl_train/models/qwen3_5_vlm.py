@@ -129,6 +129,20 @@ def map_text_name_to_vlm_engine(name: str) -> str:
     return name
 
 
+def qwen3_5_vllm_internal_weight_candidates(name: str, *, tied_word_embeddings: bool) -> tuple[str, ...]:
+    """Map a synchronized HF name to the Qwen3.5 vLLM shell namespace."""
+    if name.startswith("model.language_model."):
+        return ("language_model.model." + name.removeprefix("model.language_model."),)
+    if name.startswith("model."):
+        return ("language_model.model." + name.removeprefix("model."),)
+    if name.startswith("lm_head."):
+        candidates = ["language_model.lm_head." + name.removeprefix("lm_head.")]
+        if tied_word_embeddings and name == "lm_head.weight":
+            candidates.append("language_model.model.embed_tokens.weight")
+        return tuple(candidates)
+    return (name,)
+
+
 def remove_vision_no_split_modules(model) -> None:
     """Keep the Qwen3.5 text policy's FSDP wrap classes text-only.
 

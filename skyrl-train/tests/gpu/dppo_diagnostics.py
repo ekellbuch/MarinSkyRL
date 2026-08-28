@@ -830,18 +830,41 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                         )
                     )
 
-                def capture_input(_module, args, kwargs, *, destination=entry, key="mixer_input"):
+                def capture_input(
+                    _module,
+                    args,
+                    kwargs,
+                    *,
+                    destination=entry,
+                    key="mixer_input",
+                    trace_tokens=False,
+                ):
                     hidden_states = kwargs.get("hidden_states")
                     if hidden_states is None:
                         hidden_states = args[0]
-                    destination.setdefault(key, []).append(tensor_payload(hidden_states))
+                    payload = tensor_payload(hidden_states)
+                    if trace_tokens:
+                        payload["token_fingerprints"] = _token_fingerprints(hidden_states)
+                    destination.setdefault(key, []).append(payload)
 
-                def capture_output(_module, args, kwargs, output, *, destination=entry, key="mixer_output"):
+                def capture_output(
+                    _module,
+                    args,
+                    kwargs,
+                    output,
+                    *,
+                    destination=entry,
+                    key="mixer_output",
+                    trace_tokens=False,
+                ):
                     del args
                     hidden_states = kwargs.get("output")
                     if hidden_states is None:
                         hidden_states = output[0] if isinstance(output, tuple) else output
-                    destination.setdefault(key, []).append(tensor_payload(hidden_states))
+                    payload = tensor_payload(hidden_states)
+                    if trace_tokens:
+                        payload["token_fingerprints"] = _token_fingerprints(hidden_states)
+                    destination.setdefault(key, []).append(payload)
 
                 if layer_index == 0 and mixer_name == "linear_attn":
                     stages = entry["mixer_stages"]
@@ -951,17 +974,30 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                             with_kwargs=True,
                         )
                     )
-                hook_registrations.append(partial(mixer.register_forward_pre_hook, capture_input, with_kwargs=True))
-                hook_registrations.append(partial(mixer.register_forward_hook, capture_output, with_kwargs=True))
+                hook_registrations.append(
+                    partial(
+                        mixer.register_forward_pre_hook,
+                        partial(capture_input, trace_tokens=layer_index < 4),
+                        with_kwargs=True,
+                    )
+                )
+                hook_registrations.append(
+                    partial(
+                        mixer.register_forward_hook,
+                        partial(capture_output, trace_tokens=layer_index < 4),
+                        with_kwargs=True,
+                    )
+                )
                 hook_registrations.append(
                     partial(
                         layer.mlp.register_forward_pre_hook,
-                        lambda module, args, kwargs, destination=entry: capture_input(
+                        lambda module, args, kwargs, destination=entry, trace_tokens=layer_index < 4: capture_input(
                             module,
                             args,
                             kwargs,
                             destination=destination,
                             key="mlp_input",
+                            trace_tokens=trace_tokens,
                         ),
                         with_kwargs=True,
                     )
@@ -969,13 +1005,16 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                 hook_registrations.append(
                     partial(
                         layer.mlp.register_forward_hook,
-                        lambda module, args, kwargs, output, destination=entry: capture_output(
-                            module,
-                            args,
-                            kwargs,
-                            output,
-                            destination=destination,
-                            key="mlp_output",
+                        lambda module, args, kwargs, output, destination=entry, trace_tokens=layer_index < 4: (
+                            capture_output(
+                                module,
+                                args,
+                                kwargs,
+                                output,
+                                destination=destination,
+                                key="mlp_output",
+                                trace_tokens=trace_tokens,
+                            )
                         ),
                         with_kwargs=True,
                     )

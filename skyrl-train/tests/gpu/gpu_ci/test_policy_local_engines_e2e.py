@@ -1157,18 +1157,25 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                 learner_boundary = learner_layer[boundary]
                                 engine_boundary = engine_layer[boundary]
                                 assert learner_boundary["shape"] == engine_boundary["shape"]
-                                boundary_diagnostics.append(
-                                    {
-                                        "boundary": boundary,
-                                        "learner_dtype": learner_boundary["dtype"],
-                                        "engine_dtype": engine_boundary["dtype"],
-                                        "shape": learner_boundary["shape"],
-                                        "error": _head_input_error_summary(
-                                            learner_boundary.pop("values"),
-                                            engine_boundary.pop("values"),
-                                        ),
-                                    }
-                                )
+                                boundary_diagnostic = {
+                                    "boundary": boundary,
+                                    "learner_dtype": learner_boundary["dtype"],
+                                    "engine_dtype": engine_boundary["dtype"],
+                                    "shape": learner_boundary["shape"],
+                                    "error": _head_input_error_summary(
+                                        learner_boundary.pop("values"),
+                                        engine_boundary.pop("values"),
+                                    ),
+                                }
+                                learner_tokens = learner_boundary.pop("token_fingerprints", None)
+                                engine_tokens = engine_boundary.pop("token_fingerprints", None)
+                                assert (learner_tokens is None) == (engine_tokens is None)
+                                if learner_tokens is not None:
+                                    boundary_diagnostic["token_fingerprints"] = _token_fingerprint_summary(
+                                        learner_tokens,
+                                        engine_tokens,
+                                    )
+                                boundary_diagnostics.append(boundary_diagnostic)
                             layer_diagnostics.append(
                                 {
                                     "layer": learner_layer["layer"],

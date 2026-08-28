@@ -1037,18 +1037,24 @@ class WorkerWrap:
                 ],
             }
 
-        def capture_input(_module, args, kwargs, *, destination, key):
+        def capture_input(_module, args, kwargs, *, destination, key, trace_tokens=False):
             hidden_states = kwargs.get("hidden_states")
             if hidden_states is None:
                 hidden_states = args[0]
-            destination.setdefault(key, []).append(tensor_payload(hidden_states))
+            payload = tensor_payload(hidden_states)
+            if trace_tokens:
+                payload["token_fingerprints"] = token_fingerprints(hidden_states)
+            destination.setdefault(key, []).append(payload)
 
-        def capture_output(_module, args, kwargs, output, *, destination, key):
+        def capture_output(_module, args, kwargs, output, *, destination, key, trace_tokens=False):
             del args
             hidden_states = kwargs.get("output")
             if hidden_states is None:
                 hidden_states = output[0] if isinstance(output, tuple) else output
-            destination.setdefault(key, []).append(tensor_payload(hidden_states))
+            payload = tensor_payload(hidden_states)
+            if trace_tokens:
+                payload["token_fingerprints"] = token_fingerprints(hidden_states)
+            destination.setdefault(key, []).append(payload)
 
         def capture_projection_output(_module, _args, output, *, destination, keys, sizes):
             projected = output[0] if isinstance(output, tuple) else output
@@ -2016,50 +2022,58 @@ class WorkerWrap:
                 )
             layer_hooks.append(
                 mixer.register_forward_pre_hook(
-                    lambda module, args, kwargs, destination=entry: capture_input(
+                    lambda module, args, kwargs, destination=entry, trace_tokens=layer_index < 4: capture_input(
                         module,
                         args,
                         kwargs,
                         destination=destination,
                         key="mixer_input",
+                        trace_tokens=trace_tokens,
                     ),
                     with_kwargs=True,
                 )
             )
             layer_hooks.append(
                 mixer.register_forward_hook(
-                    lambda module, args, kwargs, output, destination=entry: capture_output(
-                        module,
-                        args,
-                        kwargs,
-                        output,
-                        destination=destination,
-                        key="mixer_output",
+                    lambda module, args, kwargs, output, destination=entry, trace_tokens=layer_index < 4: (
+                        capture_output(
+                            module,
+                            args,
+                            kwargs,
+                            output,
+                            destination=destination,
+                            key="mixer_output",
+                            trace_tokens=trace_tokens,
+                        )
                     ),
                     with_kwargs=True,
                 )
             )
             layer_hooks.append(
                 layer.mlp.register_forward_pre_hook(
-                    lambda module, args, kwargs, destination=entry: capture_input(
+                    lambda module, args, kwargs, destination=entry, trace_tokens=layer_index < 4: capture_input(
                         module,
                         args,
                         kwargs,
                         destination=destination,
                         key="mlp_input",
+                        trace_tokens=trace_tokens,
                     ),
                     with_kwargs=True,
                 )
             )
             layer_hooks.append(
                 layer.mlp.register_forward_hook(
-                    lambda module, args, kwargs, output, destination=entry: capture_output(
-                        module,
-                        args,
-                        kwargs,
-                        output,
-                        destination=destination,
-                        key="mlp_output",
+                    lambda module, args, kwargs, output, destination=entry, trace_tokens=layer_index < 4: (
+                        capture_output(
+                            module,
+                            args,
+                            kwargs,
+                            output,
+                            destination=destination,
+                            key="mlp_output",
+                            trace_tokens=trace_tokens,
+                        )
                     ),
                     with_kwargs=True,
                 )

@@ -775,7 +775,49 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                             ),
                                         }
                                     )
-                            fla_core = engine_layer.pop("fla_core", None)
+                            learner_fla_core = learner_layer.pop("fla_core", None)
+                            engine_fla_core = engine_layer.pop("fla_core", None)
+                            assert (learner_fla_core is None) == (engine_fla_core is None)
+                            fla_core = None
+                            if learner_fla_core is not None:
+                                assert engine_fla_core is not None
+                                input_comparisons = {}
+                                for name in ("q", "k", "v", "g", "beta"):
+                                    learner_input = learner_fla_core["inputs"][name]
+                                    engine_input = engine_fla_core["inputs"][name]
+                                    input_comparisons[name] = {
+                                        "fingerprint_exact": (
+                                            learner_input["fingerprint"] == engine_input["fingerprint"]
+                                        ),
+                                        "layout_exact": learner_input["layout"] == engine_input["layout"],
+                                        "learner": learner_input,
+                                        "engine": engine_input,
+                                    }
+                                learner_zero_state = learner_fla_core["zero_initial_state"]
+                                engine_initial_state = engine_fla_core["inputs"]["initial_state"]
+                                fla_core = {
+                                    "cross_engine": {
+                                        "inputs": input_comparisons,
+                                        "live_output_fingerprint_exact": (
+                                            learner_fla_core["live"]["output"]["fingerprint"]
+                                            == engine_fla_core["live"]["output_fingerprint"]
+                                        ),
+                                        "zero_initial_state": {
+                                            "fingerprint_exact": (
+                                                learner_zero_state["fingerprint"] == engine_initial_state["fingerprint"]
+                                            ),
+                                            "layout_exact": (
+                                                learner_zero_state["layout"] == engine_initial_state["layout"]
+                                            ),
+                                            "learner_layout_semantics": "N,H,K,V",
+                                            "engine_layout_semantics": "N,H,V,K",
+                                            "learner": learner_zero_state,
+                                            "engine": engine_initial_state,
+                                        },
+                                    },
+                                    "learner": learner_fla_core,
+                                    "engine": engine_fla_core,
+                                }
                             boundary_diagnostics = []
                             for boundary in ("mixer_input", "mixer_output", "mlp_input", "mlp_output"):
                                 learner_boundary = learner_layer[boundary]

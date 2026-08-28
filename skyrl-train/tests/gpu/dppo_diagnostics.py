@@ -1,15 +1,53 @@
 """Ray worker diagnostics used by the DPPO GPU integration test."""
 
+import hashlib
+import importlib
+import importlib.metadata
 import sys
+from pathlib import Path
 
 import ray
 import torch
 from torch.distributed.tensor import DTensor
-from transformers.models.qwen3_5.modeling_qwen3_5 import is_fast_path_available
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    chunk_gated_delta_rule as transformers_chunk_gated_delta_rule,
+    is_fast_path_available,
+    torch_chunk_gated_delta_rule,
+)
 
 from skyrl_train.utils import str_to_torch_dtype
 from skyrl_train.utils.tensor_fingerprint import canonical_tensor_fingerprint
 from skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase, FSDPWeightExtractor
+
+
+def _tensor_layout(tensor: torch.Tensor) -> dict:
+    return {
+        "contiguous": tensor.is_contiguous(),
+        "device": str(tensor.device),
+        "dtype": str(tensor.dtype),
+        "shape": list(tensor.shape),
+        "storage_nbytes": tensor.untyped_storage().nbytes(),
+        "storage_offset": tensor.storage_offset(),
+        "stride": list(tensor.stride()),
+    }
+
+
+def _exact_error_summary(actual: torch.Tensor, expected: torch.Tensor) -> dict:
+    difference = (actual.float() - expected.float()).abs().reshape(-1)
+    mismatch_indices = torch.nonzero(difference, as_tuple=False).reshape(-1)
+    first_mismatch = int(mismatch_indices[0].item()) if mismatch_indices.numel() else None
+    return {
+        "exact": bool(torch.equal(actual, expected)),
+        "first_mismatch": first_mismatch,
+        "l2": float(torch.linalg.vector_norm(difference).item()),
+        "max": float(difference.max().item()),
+        "mismatch_count": int(torch.count_nonzero(difference).item()),
+        "nonfinite_count": int(
+            torch.count_nonzero(~torch.isfinite(actual)).item() + torch.count_nonzero(~torch.isfinite(expected)).item()
+        ),
+        "p95": float(torch.quantile(difference, 0.95).item()),
+        "shape": list(actual.shape),
+    }
 
 
 class DPPOPolicyWorker(FSDPPolicyWorkerBase):
@@ -68,6 +106,8 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
         captured_head_inputs = []
         layer_captures = []
         hooks = []
+        learner_fla_restore = None
+        finalize_fla_capture = None
         if capture_head_input:
 
             def tensor_payload(tensor):
@@ -123,6 +163,205 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                     projections = {}
                     entry["projections"] = projections
                     entry["mixer_stages"] = {}
+                    fla_captures = []
+                    entry["fla_core"] = fla_captures
+
+                    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as released_chunk_gated_delta_rule
+
+                    live_chunk_gated_delta_rule = mixer.chunk_gated_delta_rule
+                    learner_fla_restore = (mixer, live_chunk_gated_delta_rule)
+                    backend_module = importlib.import_module(live_chunk_gated_delta_rule.__module__)
+                    backend_source = Path(backend_module.__file__)
+                    backend_source_sha256 = hashlib.sha256(backend_source.read_bytes()).hexdigest()
+
+                    def capture_fla_core(
+                        q,
+                        k,
+                        v,
+                        *,
+                        g,
+                        beta,
+                        scale=None,
+                        initial_state=None,
+                        output_final_state=False,
+                        use_qk_l2norm_in_kernel=False,
+                        cu_seqlens=None,
+                        **kwargs,
+                    ):
+                        if initial_state is not None or output_final_state or cu_seqlens is not None:
+                            raise RuntimeError(
+                                "Expected an uncached fixed-length learner prefill for the bounded FLA diagnostic"
+                            )
+                        if kwargs:
+                            raise RuntimeError(f"Unexpected learner FLA options: {sorted(kwargs)}")
+                        captured_inputs = {
+                            name: tensor.detach().clone() if tensor is not None else None
+                            for name, tensor in {
+                                "q": q,
+                                "k": k,
+                                "v": v,
+                                "g": g,
+                                "beta": beta,
+                                "initial_state": initial_state,
+                            }.items()
+                        }
+                        live_output, live_final_state = live_chunk_gated_delta_rule(
+                            q,
+                            k,
+                            v,
+                            g=g,
+                            beta=beta,
+                            scale=scale,
+                            initial_state=initial_state,
+                            output_final_state=output_final_state,
+                            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                            cu_seqlens=cu_seqlens,
+                            **kwargs,
+                        )
+                        post_live_inputs = {
+                            name: tensor
+                            for name, tensor in {
+                                "q": q,
+                                "k": k,
+                                "v": v,
+                                "g": g,
+                                "beta": beta,
+                                "initial_state": initial_state,
+                            }.items()
+                            if tensor is not None
+                        }
+                        fla_captures.append(
+                            {
+                                "captured_inputs": captured_inputs,
+                                "grad_enabled": torch.is_grad_enabled(),
+                                "live_final_state": (
+                                    live_final_state.detach().clone() if live_final_state is not None else None
+                                ),
+                                "live_output": live_output.detach().clone(),
+                                "post_live_input_errors": {
+                                    name: _exact_error_summary(tensor, captured_inputs[name])
+                                    for name, tensor in post_live_inputs.items()
+                                },
+                                "options": {
+                                    "cu_seqlens": None,
+                                    "output_final_state": output_final_state,
+                                    "scale": scale,
+                                    "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+                                },
+                            }
+                        )
+                        return live_output, live_final_state
+
+                    mixer.chunk_gated_delta_rule = capture_fla_core
+
+                    def finalize_fla_capture(capture):
+                        captured_inputs = capture["captured_inputs"]
+                        options = capture["options"]
+                        replay_output, replay_final_state = released_chunk_gated_delta_rule(
+                            captured_inputs["q"].clone(),
+                            captured_inputs["k"].clone(),
+                            captured_inputs["v"].clone(),
+                            g=captured_inputs["g"].clone(),
+                            beta=captured_inputs["beta"].clone(),
+                            scale=options["scale"],
+                            initial_state=None,
+                            output_final_state=options["output_final_state"],
+                            use_qk_l2norm_in_kernel=options["use_qk_l2norm_in_kernel"],
+                            cu_seqlens=None,
+                        )
+                        zero_state = torch.zeros(
+                            captured_inputs["q"].shape[0],
+                            captured_inputs["q"].shape[2],
+                            captured_inputs["k"].shape[-1],
+                            captured_inputs["v"].shape[-1],
+                            dtype=torch.float32,
+                            device=captured_inputs["q"].device,
+                        )
+                        zero_state_output, _ = released_chunk_gated_delta_rule(
+                            captured_inputs["q"].clone(),
+                            captured_inputs["k"].clone(),
+                            captured_inputs["v"].clone(),
+                            g=captured_inputs["g"].clone(),
+                            beta=captured_inputs["beta"].clone(),
+                            scale=options["scale"],
+                            initial_state=zero_state,
+                            output_final_state=False,
+                            use_qk_l2norm_in_kernel=options["use_qk_l2norm_in_kernel"],
+                            cu_seqlens=None,
+                        )
+                        live_output = capture["live_output"]
+                        live_final_state = capture["live_final_state"]
+                        return {
+                            "backend": {
+                                "live_callable_is_released": (
+                                    live_chunk_gated_delta_rule is released_chunk_gated_delta_rule
+                                ),
+                                "live_callable_is_torch_fallback": (
+                                    live_chunk_gated_delta_rule is torch_chunk_gated_delta_rule
+                                ),
+                                "live_callable_is_transformers_global": (
+                                    live_chunk_gated_delta_rule is transformers_chunk_gated_delta_rule
+                                ),
+                                "method": getattr(
+                                    live_chunk_gated_delta_rule,
+                                    "__qualname__",
+                                    type(live_chunk_gated_delta_rule).__qualname__,
+                                ),
+                                "method_module": getattr(
+                                    live_chunk_gated_delta_rule,
+                                    "__module__",
+                                    type(live_chunk_gated_delta_rule).__module__,
+                                ),
+                                "package_version": importlib.metadata.version("flash-linear-attention"),
+                                "source_sha256": backend_source_sha256,
+                            },
+                            "context": {
+                                "configured_use_sample_packing": bool(self.cfg.trainer.use_sample_packing),
+                                "grad_enabled": capture["grad_enabled"],
+                                "scored_batch_size": input_ids.shape[0],
+                                "scored_sequence_count": input_ids.shape[0],
+                            },
+                            "inputs": {
+                                name: (
+                                    {
+                                        "fingerprint": canonical_tensor_fingerprint(tensor),
+                                        "layout": _tensor_layout(tensor),
+                                    }
+                                    if tensor is not None
+                                    else None
+                                )
+                                for name, tensor in captured_inputs.items()
+                            },
+                            "zero_initial_state": {
+                                "fingerprint": canonical_tensor_fingerprint(zero_state),
+                                "layout": _tensor_layout(zero_state),
+                            },
+                            "live": {
+                                "final_state": (
+                                    {
+                                        "fingerprint": canonical_tensor_fingerprint(live_final_state),
+                                        "layout": _tensor_layout(live_final_state),
+                                    }
+                                    if live_final_state is not None
+                                    else None
+                                ),
+                                "output": {
+                                    "fingerprint": canonical_tensor_fingerprint(live_output),
+                                    "layout": _tensor_layout(live_output),
+                                },
+                            },
+                            "live_vs_released_replay": {
+                                "final_state": (
+                                    _exact_error_summary(live_final_state, replay_final_state)
+                                    if live_final_state is not None and replay_final_state is not None
+                                    else None
+                                ),
+                                "output": _exact_error_summary(live_output, replay_output),
+                            },
+                            "inputs_unchanged_by_live_call": capture["post_live_input_errors"],
+                            "none_vs_zero_initial_state": _exact_error_summary(live_output, zero_state_output),
+                            "options": options,
+                        }
 
                     def capture_projection(_module, _args, output, *, destination, key):
                         destination.setdefault(key, []).append(tensor_payload(output))
@@ -242,7 +481,25 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
         model.eval()
         try:
             with torch.no_grad():
-                logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits[0, -1]
+                model_output = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                if learner_fla_restore is not None:
+                    fla_mixer, live_chunk_gated_delta_rule = learner_fla_restore
+                    fla_mixer.chunk_gated_delta_rule = live_chunk_gated_delta_rule
+                    learner_fla_restore = None
+                if capture_head_input:
+                    if finalize_fla_capture is None:
+                        raise RuntimeError("Missing learner FLA capture finalizer")
+                    for layer_entry in layer_captures:
+                        fla_core = layer_entry.get("fla_core")
+                        if fla_core is None:
+                            continue
+                        if len(fla_core) != 1:
+                            raise RuntimeError(
+                                f"Expected one learner FLA core capture in layer "
+                                f"{layer_entry['layer']}, got {len(fla_core)}"
+                            )
+                        fla_core[0] = finalize_fla_capture(fla_core[0])
+                logits = model_output.logits[0, -1]
                 if logits.dtype != torch.float32:
                     raise TypeError(f"Expected learner FP32 final-token logits, got {logits.dtype}")
                 logsumexp = logits.logsumexp(dim=-1)
@@ -298,8 +555,19 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                     f"{layer_entry['layer']}, got {len(values)}"
                                 )
                             layer_entry["mixer_stages"][key] = values[0]
+                        fla_core = layer_entry.get("fla_core")
+                        if fla_core is not None:
+                            if len(fla_core) != 1:
+                                raise RuntimeError(
+                                    f"Expected one learner FLA core capture in layer "
+                                    f"{layer_entry['layer']}, got {len(fla_core)}"
+                                )
+                            layer_entry["fla_core"] = fla_core[0]
                     result["layer_trace"] = layer_captures
         finally:
+            if learner_fla_restore is not None:
+                mixer, live_chunk_gated_delta_rule = learner_fla_restore
+                mixer.chunk_gated_delta_rule = live_chunk_gated_delta_rule
             for hook in hooks:
                 hook.remove()
             if was_training:

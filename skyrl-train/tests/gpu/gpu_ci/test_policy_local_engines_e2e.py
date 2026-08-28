@@ -5,6 +5,7 @@ uv run --isolated --group dev --extra vllm --extra deepspeed pytest tests/gpu/gp
 """
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -310,6 +311,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
         asyncio.run(client.reset_prefix_cache())
         ray.get(policy.async_run_ray_method("pass_through", "broadcast_to_inference_engines", client))
         parity_values = []
+        verified_engine_weights = {}
 
         def emit_parity_result():
             expected_per_load = len(PARITY_PROMPTS) * PARITY_TOKENS_PER_PROMPT
@@ -385,6 +387,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 != engine_per_rank[0]["model.language_model.embed_tokens.weight"]["internal_name"]
             )
             print(f"Verified exact learner/vLLM weights after complete load {update_index}: {weight_names}")
+            verified_engine_weights[update_index] = engine_per_rank[0]
             return engine_per_rank[0]
 
         def generate_with_logprob_checks(update_index: int):
@@ -502,6 +505,125 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 )
                 emit_parity_result()
                 load_gate = _logprob_error_gate(_error_summary(load_values))
+
+                if not all(entry["passed"] for entry in load_gate.values()):
+                    max_error_pair = max(load_values, key=lambda value: value["absolute_error"])
+                    diagnostic_pairs = [value for value in load_values if not value["top1_match"]]
+                    if max_error_pair not in diagnostic_pairs:
+                        diagnostic_pairs.append(max_error_pair)
+                    diagnostic_pairs = diagnostic_pairs[:4]
+
+                    async def collect_fast_path_diagnostics():
+                        diagnostics = []
+                        diagnostic_generation_params = dict(sampling_params)
+                        diagnostic_generation_params["logprobs"] = 2
+                        for prompt_index in dict.fromkeys(value["prompt_index"] for value in diagnostic_pairs):
+                            prompt_pair_indices = [
+                                value["token_index"]
+                                for value in diagnostic_pairs
+                                if value["prompt_index"] == prompt_index
+                            ]
+                            prompt_ids = prompt_token_ids[prompt_index]
+                            original_response_ids = outputs["response_ids"][prompt_index]
+                            repeats = []
+                            for _ in range(2):
+                                await client.reset_prefix_cache()
+                                generated = await client.generate(
+                                    InferenceEngineInput(
+                                        prompt_token_ids=[prompt_ids],
+                                        sampling_params=diagnostic_generation_params,
+                                    )
+                                )
+                                await client.reset_prefix_cache()
+                                rescored = await client.generate(
+                                    InferenceEngineInput(
+                                        prompt_token_ids=[prompt_ids + original_response_ids],
+                                        sampling_params=scoring_params,
+                                    )
+                                )
+                                repeated_prompt_logprobs = rescored["prompt_logprobs"]
+                                assert repeated_prompt_logprobs is not None
+                                selected_rescores = []
+                                for token_index in prompt_pair_indices:
+                                    selected_token = original_response_ids[token_index]
+                                    candidates = repeated_prompt_logprobs[0][len(prompt_ids) + token_index]
+                                    assert candidates is not None
+                                    assert selected_token in candidates
+                                    selected_rescores.append(
+                                        {
+                                            "token_index": token_index,
+                                            "selected_token": selected_token,
+                                            "selected_logprob": float(candidates[selected_token]),
+                                            "top_candidates": [
+                                                {"token": int(token), "logprob": float(logprob)}
+                                                for token, logprob in sorted(
+                                                    candidates.items(), key=lambda item: item[1], reverse=True
+                                                )[:2]
+                                            ],
+                                        }
+                                    )
+                                repeats.append(
+                                    {
+                                        "generated_response_ids": generated["response_ids"][0],
+                                        "generated_response_logprobs": generated["response_logprobs"][0],
+                                        "selected_rescores": selected_rescores,
+                                    }
+                                )
+                            await client.reset_prefix_cache()
+                            duplicate_batch = await client.generate(
+                                InferenceEngineInput(
+                                    prompt_token_ids=[prompt_ids, prompt_ids],
+                                    sampling_params=diagnostic_generation_params,
+                                )
+                            )
+                            first_singleton_ids = repeats[0]["generated_response_ids"]
+                            shared_prefix_length = 0
+                            for original_token, repeated_token in zip(
+                                original_response_ids, first_singleton_ids, strict=False
+                            ):
+                                if original_token != repeated_token:
+                                    break
+                                shared_prefix_length += 1
+                            diagnostics.append(
+                                {
+                                    "prompt_index": prompt_index,
+                                    "prompt_token_count": len(prompt_ids),
+                                    "prompt_token_sha256": hashlib.sha256(
+                                        json.dumps(prompt_ids, separators=(",", ":")).encode()
+                                    ).hexdigest(),
+                                    "original_response_ids": original_response_ids,
+                                    "original_response_token_sha256": hashlib.sha256(
+                                        json.dumps(original_response_ids, separators=(",", ":")).encode()
+                                    ).hexdigest(),
+                                    "original_response_logprobs": response_logprobs[prompt_index],
+                                    "original_singleton_shared_prefix_length": shared_prefix_length,
+                                    "singleton_repeats_identical": repeats[0] == repeats[1],
+                                    "duplicate_batch": {
+                                        "response_ids": duplicate_batch["response_ids"],
+                                        "response_logprobs": duplicate_batch["response_logprobs"],
+                                        "identical": (
+                                            duplicate_batch["response_ids"][0] == duplicate_batch["response_ids"][1]
+                                            and duplicate_batch["response_logprobs"][0]
+                                            == duplicate_batch["response_logprobs"][1]
+                                        ),
+                                    },
+                                    "repeats": repeats,
+                                }
+                            )
+                        return diagnostics
+
+                    weights_before_diagnostics = verified_engine_weights[update_index]
+                    diagnostics = asyncio.run(collect_fast_path_diagnostics())
+                    weights_after_diagnostics = verify_synced_weights(update_index)
+                    fingerprint_names = (
+                        "model.language_model.embed_tokens.weight",
+                        "model.language_model.layers.0.input_layernorm.weight",
+                        "lm_head.weight",
+                    )
+                    print(
+                        "SKYRL_DPPO_FAST_PATH_DIAGNOSTIC "
+                        f"{json.dumps({'load': update_index, 'resolved_sampling_params': {name: sampling_params.get(name) for name in ('temperature', 'top_p', 'top_k', 'min_p', 'repetition_penalty', 'presence_penalty', 'frequency_penalty', 'seed')}, 'max_num_batched_tokens': cfg.generator.get('max_num_batched_tokens'), 'weights_unchanged': all(weights_before_diagnostics[name]['fingerprint'] == weights_after_diagnostics[name]['fingerprint'] for name in fingerprint_names), 'prompts': diagnostics}, sort_keys=True, allow_nan=False)}"
+                    )
                 assert load_gate["max"]["passed"], load_gate
                 assert load_gate["p95"]["passed"], load_gate
             print(

@@ -1037,7 +1037,9 @@ class WorkerWrap:
         def capture_projection_output(_module, _args, output, *, destination, keys, sizes):
             projected = output[0] if isinstance(output, tuple) else output
             for key, tensor in zip(keys, projected.split(sizes, dim=-1), strict=True):
-                destination.setdefault(key, []).append(tensor_payload(tensor))
+                payload = tensor_payload(tensor)
+                payload["token_fingerprints"] = token_fingerprints(tensor)
+                destination.setdefault(key, []).append(payload)
 
         def exact_error_summary(actual, expected):
             difference = (actual.float() - expected.float()).abs().reshape(-1)
@@ -1059,6 +1061,15 @@ class WorkerWrap:
                 "storage_offset": tensor.storage_offset(),
                 "stride": list(tensor.stride()),
             }
+
+        def token_fingerprints(tensor):
+            if tensor.ndim < 2:
+                raise ValueError(f"Expected a token dimension, got {tensor.shape}")
+            if tensor.ndim >= 3:
+                if tensor.shape[0] != 1:
+                    raise ValueError(f"Expected batch size one, got {tensor.shape}")
+                return [canonical_tensor_fingerprint(tensor[:, index]) for index in range(tensor.shape[1])]
+            return [canonical_tensor_fingerprint(tensor[index : index + 1]) for index in range(tensor.shape[0])]
 
         def alias_summary(tensor, destination):
             return {
@@ -1289,6 +1300,11 @@ class WorkerWrap:
                                 name: {
                                     "fingerprint": canonical_tensor_fingerprint(values[name]),
                                     "layout": values["input_layouts"][name],
+                                    **(
+                                        {"token_fingerprints": token_fingerprints(values[name])}
+                                        if name != "initial_state"
+                                        else {}
+                                    ),
                                 }
                                 for name in ("q", "k", "v", "g", "beta", "initial_state")
                             },

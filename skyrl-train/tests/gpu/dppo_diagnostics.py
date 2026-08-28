@@ -9,6 +9,7 @@ from pathlib import Path
 
 import ray
 import torch
+from fla.modules.l2norm import l2norm_fwd
 from torch.distributed.tensor import DTensor
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     chunk_gated_delta_rule as transformers_chunk_gated_delta_rule,
@@ -49,6 +50,16 @@ def _exact_error_summary(actual: torch.Tensor, expected: torch.Tensor) -> dict:
         "p95": float(torch.quantile(difference, 0.95).item()),
         "shape": list(actual.shape),
     }
+
+
+def _token_fingerprints(tensor: torch.Tensor) -> list[dict]:
+    if tensor.ndim < 2:
+        raise ValueError(f"Expected a token dimension, got {tensor.shape}")
+    if tensor.ndim >= 3:
+        if tensor.shape[0] != 1:
+            raise ValueError(f"Expected batch size one, got {tensor.shape}")
+        return [canonical_tensor_fingerprint(tensor[:, index]) for index in range(tensor.shape[1])]
+    return [canonical_tensor_fingerprint(tensor[index : index + 1]) for index in range(tensor.shape[0])]
 
 
 class DPPOPolicyWorker(FSDPPolicyWorkerBase):
@@ -360,6 +371,22 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                             use_qk_l2norm_in_kernel=options["use_qk_l2norm_in_kernel"],
                             cu_seqlens=None,
                         )
+                        input_payloads = {}
+                        for name, tensor in captured_inputs.items():
+                            if tensor is None:
+                                input_payloads[name] = None
+                                continue
+                            payload = {
+                                "fingerprint": canonical_tensor_fingerprint(tensor),
+                                "layout": _tensor_layout(tensor),
+                            }
+                            if name != "initial_state":
+                                payload["token_fingerprints"] = _token_fingerprints(tensor)
+                            if name in {"q", "k"}:
+                                normalized, _ = l2norm_fwd(tensor.clone())
+                                payload["normalized_fingerprint"] = canonical_tensor_fingerprint(normalized)
+                                payload["normalized_token_fingerprints"] = _token_fingerprints(normalized)
+                            input_payloads[name] = payload
                         live_output = capture["live_output"]
                         live_final_state = capture["live_final_state"]
                         return {
@@ -396,17 +423,7 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                 "scored_sequence_count": input_ids.shape[0],
                                 "segment_boundaries": [list(boundary) for boundary in segment_boundaries],
                             },
-                            "inputs": {
-                                name: (
-                                    {
-                                        "fingerprint": canonical_tensor_fingerprint(tensor),
-                                        "layout": _tensor_layout(tensor),
-                                    }
-                                    if tensor is not None
-                                    else None
-                                )
-                                for name, tensor in captured_inputs.items()
-                            },
+                            "inputs": input_payloads,
                             "zero_initial_state": {
                                 "fingerprint": canonical_tensor_fingerprint(zero_state),
                                 "layout": _tensor_layout(zero_state),
@@ -448,7 +465,9 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                         }
 
                     def capture_projection(_module, _args, output, *, destination, key):
-                        destination.setdefault(key, []).append(tensor_payload(output))
+                        payload = tensor_payload(output)
+                        payload["token_fingerprints"] = _token_fingerprints(output)
+                        destination.setdefault(key, []).append(payload)
 
                     for projection_name, key in (
                         ("in_proj_qkv", "qkv"),

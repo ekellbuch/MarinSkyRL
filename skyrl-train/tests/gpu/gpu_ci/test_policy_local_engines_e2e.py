@@ -190,6 +190,17 @@ def _head_input_error_summary(learner_values: list[float], engine_values: list[f
     }
 
 
+def _token_fingerprint_summary(learner_fingerprints: list[dict], engine_fingerprints: list[dict]) -> dict:
+    assert len(learner_fingerprints) == len(engine_fingerprints)
+    per_token_exact = [
+        learner == engine for learner, engine in zip(learner_fingerprints, engine_fingerprints, strict=True)
+    ]
+    return {
+        "per_token_exact": per_token_exact,
+        "first_mismatch_token": next((index for index, exact in enumerate(per_token_exact) if not exact), None),
+    }
+
+
 def _logprob_error_gate(summary: dict) -> dict:
     absolute_error = summary["absolute_error"]
     return {
@@ -752,6 +763,10 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                                     learner_projection["values"],
                                                     engine_projection.pop("values"),
                                                 ),
+                                                "token_fingerprints": _token_fingerprint_summary(
+                                                    learner_projection["token_fingerprints"],
+                                                    engine_projection["token_fingerprints"],
+                                                ),
                                             }
                                         )
                                     projection_diagnostics[mode] = mode_diagnostics
@@ -789,6 +804,16 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                 for name in ("q", "k", "v", "g", "beta"):
                                     learner_input = learner_fla_core["inputs"][name]
                                     engine_input = engine_fla_core["inputs"][name]
+                                    learner_effective_fingerprint = (
+                                        learner_input["normalized_fingerprint"]
+                                        if name in {"q", "k"}
+                                        else learner_input["fingerprint"]
+                                    )
+                                    learner_effective_token_fingerprints = (
+                                        learner_input["normalized_token_fingerprints"]
+                                        if name in {"q", "k"}
+                                        else learner_input["token_fingerprints"]
+                                    )
                                     input_comparisons[name] = {
                                         "directly_comparable": name not in {"q", "k"},
                                         "fingerprint_exact": (
@@ -802,6 +827,21 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                         "engine_semantics": (
                                             "normalized before FLA" if name in {"q", "k"} else "FLA input"
                                         ),
+                                        "effective_comparison": {
+                                            "learner_semantics": (
+                                                "normalized with released FLA l2norm_fwd"
+                                                if name in {"q", "k"}
+                                                else "live FLA input"
+                                            ),
+                                            "engine_semantics": "live FLA input",
+                                            "fingerprint_exact": (
+                                                learner_effective_fingerprint == engine_input["fingerprint"]
+                                            ),
+                                            "token_fingerprints": _token_fingerprint_summary(
+                                                learner_effective_token_fingerprints,
+                                                engine_input["token_fingerprints"],
+                                            ),
+                                        },
                                         "learner": learner_input,
                                         "engine": engine_input,
                                     }

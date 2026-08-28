@@ -231,7 +231,7 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
             )
 
             text_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
-            diagnostic_gdn_layer = 2
+            diagnostic_gdn_layer = 1
             for layer_index, layer in enumerate(text_model.layers):
                 mixer_name = "linear_attn" if layer.layer_type == "linear_attention" else "self_attn"
                 mixer = getattr(layer, mixer_name)

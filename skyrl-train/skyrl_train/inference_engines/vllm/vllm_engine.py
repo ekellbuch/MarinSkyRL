@@ -1108,7 +1108,7 @@ class WorkerWrap:
         language_model = getattr(model, "language_model", None)
         text_model = getattr(language_model, "model", None)
         layers = getattr(text_model, "layers", ())
-        diagnostic_gdn_layer = 2
+        diagnostic_gdn_layer = 1
         for layer_index, layer in enumerate(layers):
             mixer_name = "linear_attn" if layer.layer_type == "linear_attention" else "self_attn"
             mixer = getattr(layer, mixer_name)

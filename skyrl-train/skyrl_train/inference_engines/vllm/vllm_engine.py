@@ -1214,6 +1214,7 @@ class WorkerWrap:
                             output_final_state=values["output_final_state"],
                             cu_seqlens=values["cu_seqlens"],
                             chunk_indices=values["chunk_indices"],
+                            transpose_state_layout=True,  # Match vLLM's [N, H, V, K] cache layout.
                         )
                     )
                     vllm_arguments = {
@@ -1303,6 +1304,7 @@ class WorkerWrap:
                                     else None
                                 ),
                                 "chunk_destination_supplied": live_chunk_destination is not None,
+                                "final_state_fingerprint": canonical_tensor_fingerprint(live_final_state),
                                 "final_state_layout": tensor_layout(live_final_state),
                                 "output_fingerprint": canonical_tensor_fingerprint(live_output),
                                 "output_layout": tensor_layout(live_output),
@@ -1327,6 +1329,7 @@ class WorkerWrap:
                             },
                             "options": {
                                 "output_final_state": values["output_final_state"],
+                                "state_layout": "N,H,V,K",
                                 "use_qk_l2norm_in_kernel": values["use_qk_l2norm_in_kernel"],
                             },
                             "live_vs_vllm_replay": {
@@ -1354,6 +1357,10 @@ class WorkerWrap:
                                 "A": exact_error_summary(vllm_A, released_A),
                                 "output": exact_error_summary(contract_output, released_output),
                                 "final_state": exact_error_summary(contract_final_state, released_final_state),
+                                "released_final_state_fingerprint": canonical_tensor_fingerprint(released_final_state),
+                                "released_final_state_layout": tensor_layout(released_final_state),
+                                "vllm_final_state_fingerprint": canonical_tensor_fingerprint(contract_final_state),
+                                "vllm_final_state_layout": tensor_layout(contract_final_state),
                             },
                         }
                     )

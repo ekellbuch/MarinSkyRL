@@ -994,6 +994,7 @@ class WorkerWrap:
         captures = []
         layer_captures = []
         layer_hooks = []
+        forward_core_patches = []
 
         def tensor_payload(tensor):
             if tensor.ndim == 3:
@@ -1048,6 +1049,24 @@ class WorkerWrap:
                 "shape": list(actual.shape),
             }
 
+        def tensor_layout(tensor):
+            return {
+                "contiguous": tensor.is_contiguous(),
+                "device": str(tensor.device),
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+                "storage_nbytes": tensor.untyped_storage().nbytes(),
+                "storage_offset": tensor.storage_offset(),
+                "stride": list(tensor.stride()),
+            }
+
+        def alias_summary(tensor, destination):
+            return {
+                "same_data_pointer": tensor.data_ptr() == destination.data_ptr(),
+                "same_storage": (tensor.untyped_storage().data_ptr() == destination.untyped_storage().data_ptr()),
+                "same_storage_offset": tensor.storage_offset() == destination.storage_offset(),
+            }
+
         language_model = getattr(model, "language_model", None)
         text_model = getattr(language_model, "model", None)
         layers = getattr(text_model, "layers", ())
@@ -1065,6 +1084,7 @@ class WorkerWrap:
                 stages = {}
                 entry["mixer_stages"] = stages
                 fla_inputs = []
+                fla_outputs = []
                 fla_captures = []
                 entry["fla_core"] = fla_captures
                 if hasattr(mixer, "in_proj_qkv"):
@@ -1142,12 +1162,20 @@ class WorkerWrap:
                     }
                     if values["use_qk_l2norm_in_kernel"]:
                         raise RuntimeError("Expected pre-normalized Q/K in the Qwen3.5 prefill path")
-                    destination.append(
-                        {
-                            name: value.detach().clone() if isinstance(value, torch.Tensor) else value
-                            for name, value in values.items()
-                        }
+                    values["core_attn_out"] = kwargs.get(
+                        "core_attn_out",
+                        args[len(argument_names)] if len(args) > len(argument_names) else None,
                     )
+                    captured_values = {
+                        name: value.detach().clone() if isinstance(value, torch.Tensor) else value
+                        for name, value in values.items()
+                        if name != "core_attn_out"
+                    }
+                    captured_values["core_attn_out"] = values["core_attn_out"]
+                    captured_values["input_layouts"] = {
+                        name: tensor_layout(value) for name, value in values.items() if isinstance(value, torch.Tensor)
+                    }
+                    destination.append(captured_values)
 
                 def capture_fla_output(
                     _module,
@@ -1156,12 +1184,16 @@ class WorkerWrap:
                     output,
                     *,
                     source=fla_inputs,
+                    live_outputs=fla_outputs,
                     destination=fla_captures,
+                    backend=mixer.gdn_prefill_backend,
+                    backend_method=mixer.chunk_gated_delta_rule._forward_method,
                 ):
                     if len(source) != 1:
                         raise RuntimeError(f"Expected one pending FLA input capture, got {len(source)}")
                     values = source.pop()
                     live_output, live_final_state = output
+                    live_outputs.append(live_output.detach())
 
                     from fla.ops.gated_delta_rule.chunk import (
                         chunk_gated_delta_rule_fwd as released_chunk_gated_delta_rule_fwd,
@@ -1184,6 +1216,19 @@ class WorkerWrap:
                             chunk_indices=values["chunk_indices"],
                         )
                     )
+                    vllm_arguments = {
+                        "q": values["q"].clone(),
+                        "k": values["k"].clone(),
+                        "v": values["v"].clone(),
+                        "g": values["g"].clone(),
+                        "beta": values["beta"].clone(),
+                        "scale": values["k"].shape[-1] ** -0.5,
+                        "initial_state": values["initial_state"].clone(),
+                        "output_final_state": values["output_final_state"],
+                        "cu_seqlens": values["cu_seqlens"],
+                        "chunk_indices": values["chunk_indices"],
+                        "chunk_offsets": values["chunk_offsets"],
+                    }
                     (
                         vllm_g,
                         vllm_output,
@@ -1192,38 +1237,123 @@ class WorkerWrap:
                         _,
                         _,
                         _,
-                    ) = vllm_chunk_gated_delta_rule_fwd(
-                        q=values["q"].clone(),
-                        k=values["k"].clone(),
-                        v=values["v"].clone(),
-                        g=values["g"].clone(),
-                        beta=values["beta"].clone(),
-                        scale=values["k"].shape[-1] ** -0.5,
-                        initial_state=values["initial_state"].clone(),
-                        output_final_state=values["output_final_state"],
-                        cu_seqlens=values["cu_seqlens"],
-                        chunk_indices=values["chunk_indices"],
-                        chunk_offsets=values["chunk_offsets"],
+                    ) = vllm_chunk_gated_delta_rule_fwd(**vllm_arguments)
+
+                    live_chunk_destination = values["core_attn_out"]
+                    destination_template = live_chunk_destination
+                    if destination_template is None:
+                        destination_template = live_output.squeeze(0)
+                    replay_destination = torch.empty_strided(
+                        destination_template.shape,
+                        destination_template.stride(),
+                        dtype=destination_template.dtype,
+                        device=destination_template.device,
+                    )
+                    buffered_arguments = {
+                        **vllm_arguments,
+                        "q": values["q"].clone(),
+                        "k": values["k"].clone(),
+                        "v": values["v"].clone(),
+                        "g": values["g"].clone(),
+                        "beta": values["beta"].clone(),
+                        "initial_state": values["initial_state"].clone(),
+                        "core_attn_out": replay_destination,
+                    }
+                    (
+                        buffered_g,
+                        buffered_output,
+                        buffered_A,
+                        buffered_final_state,
+                        _,
+                        _,
+                        _,
+                    ) = vllm_chunk_gated_delta_rule_fwd(**buffered_arguments)
+                    replay_destination_view = replay_destination[: buffered_output.numel()].view_as(buffered_output)
+
+                    live_chunk_destination_view = None
+                    if live_chunk_destination is not None:
+                        live_chunk_destination_view = live_chunk_destination[: live_output.numel()].view_as(live_output)
+                    contract_output = buffered_output if live_chunk_destination is not None else vllm_output
+                    contract_final_state = (
+                        buffered_final_state if live_chunk_destination is not None else vllm_final_state
                     )
                     destination.append(
                         {
+                            "backend": {
+                                "method": backend_method.__name__,
+                                "method_module": backend_method.__module__,
+                                "selected": backend,
+                            },
                             "inputs": {
-                                name: canonical_tensor_fingerprint(values[name])
+                                name: {
+                                    "fingerprint": canonical_tensor_fingerprint(values[name]),
+                                    "layout": values["input_layouts"][name],
+                                }
                                 for name in ("q", "k", "v", "g", "beta", "initial_state")
                             },
+                            "live": {
+                                "chunk_destination_fingerprint": (
+                                    canonical_tensor_fingerprint(live_chunk_destination_view)
+                                    if live_chunk_destination_view is not None
+                                    else None
+                                ),
+                                "chunk_destination_layout": (
+                                    tensor_layout(live_chunk_destination)
+                                    if live_chunk_destination is not None
+                                    else None
+                                ),
+                                "chunk_destination_supplied": live_chunk_destination is not None,
+                                "final_state_layout": tensor_layout(live_final_state),
+                                "output_fingerprint": canonical_tensor_fingerprint(live_output),
+                                "output_layout": tensor_layout(live_output),
+                                "output_vs_chunk_destination": (
+                                    exact_error_summary(live_output, live_chunk_destination_view)
+                                    if live_chunk_destination_view is not None
+                                    else None
+                                ),
+                                "output_chunk_destination_aliasing": (
+                                    alias_summary(live_output, live_chunk_destination_view)
+                                    if live_chunk_destination_view is not None
+                                    else None
+                                ),
+                            },
                             "metadata": {
-                                name: values[name].detach().cpu().tolist()
+                                name: (values[name].detach().cpu().tolist() if values[name] is not None else None)
                                 for name in ("cu_seqlens", "chunk_indices", "chunk_offsets")
                             },
+                            "metadata_layouts": {
+                                name: values["input_layouts"].get(name)
+                                for name in ("cu_seqlens", "chunk_indices", "chunk_offsets")
+                            },
+                            "options": {
+                                "output_final_state": values["output_final_state"],
+                                "use_qk_l2norm_in_kernel": values["use_qk_l2norm_in_kernel"],
+                            },
                             "live_vs_vllm_replay": {
-                                "output": exact_error_summary(live_output, vllm_output),
-                                "final_state": exact_error_summary(live_final_state, vllm_final_state),
+                                "output": exact_error_summary(live_output, contract_output),
+                                "final_state": exact_error_summary(live_final_state, contract_final_state),
+                            },
+                            "vllm_buffer_contract": {
+                                "buffered_destination_fingerprint": canonical_tensor_fingerprint(
+                                    replay_destination_view
+                                ),
+                                "buffered_destination_layout": tensor_layout(replay_destination),
+                                "buffered_destination_vs_returned": exact_error_summary(
+                                    replay_destination_view, buffered_output
+                                ),
+                                "buffered_return_aliasing": alias_summary(buffered_output, replay_destination_view),
+                                "buffered_vs_unbuffered": {
+                                    "A": exact_error_summary(buffered_A, vllm_A),
+                                    "final_state": exact_error_summary(buffered_final_state, vllm_final_state),
+                                    "g": exact_error_summary(buffered_g, vllm_g),
+                                    "output": exact_error_summary(buffered_output, vllm_output),
+                                },
                             },
                             "vllm_vs_released": {
                                 "g": exact_error_summary(vllm_g, released_g),
                                 "A": exact_error_summary(vllm_A, released_A),
-                                "output": exact_error_summary(vllm_output, released_output),
-                                "final_state": exact_error_summary(vllm_final_state, released_final_state),
+                                "output": exact_error_summary(contract_output, released_output),
+                                "final_state": exact_error_summary(contract_final_state, released_final_state),
                             },
                         }
                     )
@@ -1234,6 +1364,43 @@ class WorkerWrap:
                 layer_hooks.append(
                     mixer.chunk_gated_delta_rule.register_forward_hook(capture_fla_output, with_kwargs=True)
                 )
+
+                had_instance_forward_core = "_forward_core" in mixer.__dict__
+                instance_forward_core = mixer.__dict__.get("_forward_core")
+                original_forward_core = mixer._forward_core
+
+                def capture_forward_core(*args, original=original_forward_core, **kwargs):
+                    model_destination = kwargs.get("core_attn_out")
+                    if model_destination is None:
+                        model_destination = args[3]
+                    result = original(*args, **kwargs)
+                    if len(fla_outputs) != 1 or len(fla_captures) != 1:
+                        raise RuntimeError("Expected one live FLA output before the model destination capture")
+                    live_output = fla_outputs.pop()
+                    if (
+                        model_destination.ndim == live_output.ndim - 1
+                        and model_destination.shape[1:] == live_output.shape[2:]
+                    ):
+                        token_offset = model_destination.shape[0] - live_output.shape[1]
+                        if token_offset < 0:
+                            raise RuntimeError("Model destination is shorter than the live FLA output")
+                        model_destination_view = model_destination[token_offset:].unsqueeze(0)
+                    else:
+                        token_offset = None
+                        model_destination_view = model_destination.reshape(-1)[: live_output.numel()].view_as(
+                            live_output
+                        )
+                    fla_captures[0]["model_destination"] = {
+                        "fingerprint": canonical_tensor_fingerprint(model_destination_view),
+                        "layout": tensor_layout(model_destination),
+                        "output_aliasing": alias_summary(live_output, model_destination_view),
+                        "output_error": exact_error_summary(live_output, model_destination_view),
+                        "token_offset": token_offset,
+                    }
+                    return result
+
+                mixer._forward_core = capture_forward_core
+                forward_core_patches.append((mixer, had_instance_forward_core, instance_forward_core))
 
                 def capture_norm_input(
                     _module,
@@ -1370,6 +1537,7 @@ class WorkerWrap:
         self._skyrl_head_input_captures = captures
         self._skyrl_layer_captures = layer_captures
         self._skyrl_layer_capture_hooks = layer_hooks
+        self._skyrl_forward_core_patches = forward_core_patches
         model.compute_logits = capture_compute_logits
         self._skyrl_head_input_capture_active = True
         return {"active": True}
@@ -1384,6 +1552,11 @@ class WorkerWrap:
             model.compute_logits = self._skyrl_instance_compute_logits
         else:
             del model.compute_logits
+        for mixer, had_instance_forward_core, instance_forward_core in self._skyrl_forward_core_patches:
+            if had_instance_forward_core:
+                mixer._forward_core = instance_forward_core
+            else:
+                del mixer._forward_core
         for hook in self._skyrl_layer_capture_hooks:
             hook.remove()
         captures = self._skyrl_head_input_captures
@@ -1416,6 +1589,8 @@ class WorkerWrap:
                         raise RuntimeError(
                             f"Expected one vLLM FLA core capture in layer {layer_entry['layer']}, got {len(fla_core)}"
                         )
+                    if "model_destination" not in fla_core[0]:
+                        raise RuntimeError(f"Missing vLLM model destination capture in layer {layer_entry['layer']}")
                     layer_entry["fla_core"] = fla_core[0]
             captures[0]["layer_trace"] = self._skyrl_layer_captures
         del self._skyrl_original_compute_logits
@@ -1424,6 +1599,7 @@ class WorkerWrap:
         del self._skyrl_head_input_captures
         del self._skyrl_layer_captures
         del self._skyrl_layer_capture_hooks
+        del self._skyrl_forward_core_patches
         self._skyrl_head_input_capture_active = False
         return captures
 

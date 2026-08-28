@@ -1675,28 +1675,35 @@ class WorkerWrap:
             if layer_index == 0:
                 mlp_stages = {}
                 mlp_replays = {}
+                mlp_inputs = []
                 entry["mlp_stages"] = mlp_stages
                 entry["mlp_replays"] = mlp_replays
 
-                def capture_gate_up_output(
+                def capture_mlp_input(module, args, *, inputs=mlp_inputs):
+                    inputs.append(args[0])
+
+                def capture_gate_up_input(
                     module,
                     args,
-                    output,
                     *,
+                    inputs=mlp_inputs,
                     destination=mlp_stages,
                     replays=mlp_replays,
                     activation=layer.mlp.act_fn,
                     down_projection=layer.mlp.down_proj,
+                    projection=layer.mlp.gate_up_proj,
                 ):
-                    hidden_states = args[0]
-                    projected = output[0] if isinstance(output, tuple) else output
+                    if len(inputs) != 1:
+                        raise RuntimeError(f"Expected one MLP input before activation, got {len(inputs)}")
+                    hidden_states = inputs[0]
+                    projected = args[0]
                     gate, up = projected.chunk(2, dim=-1)
                     destination.setdefault("gate", []).append(tensor_payload(gate))
                     destination.setdefault("up", []).append(tensor_payload(up))
 
                     split_size = gate.shape[-1]
-                    weight = module.weight
-                    bias = getattr(module, "bias", None)
+                    weight = projection.weight
+                    bias = getattr(projection, "bias", None)
                     gate_bias = None if bias is None else bias[:split_size]
                     up_bias = None if bias is None else bias[split_size:]
                     separate_gate = torch.nn.functional.linear(
@@ -1729,7 +1736,8 @@ class WorkerWrap:
                     replays.setdefault("fused_separate_product", []).append(tensor_payload(fused_separate_product))
                     replays.setdefault("fused_separate_down", []).append(tensor_payload(fused_separate_down))
 
-                layer_hooks.append(layer.mlp.gate_up_proj.register_forward_hook(capture_gate_up_output))
+                layer_hooks.append(layer.mlp.register_forward_pre_hook(capture_mlp_input))
+                layer_hooks.append(layer.mlp.act_fn.register_forward_pre_hook(capture_gate_up_input))
                 layer_hooks.append(
                     layer.mlp.act_fn.register_forward_hook(
                         lambda module, args, output, destination=mlp_stages: capture_output(

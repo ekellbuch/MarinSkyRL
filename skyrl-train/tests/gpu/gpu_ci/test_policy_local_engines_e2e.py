@@ -558,10 +558,13 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
 
                 if not all(entry["passed"] for entry in load_gate.values()):
                     max_error_pair = max(load_values, key=lambda value: value["absolute_error"])
-                    diagnostic_pairs = [value for value in load_values if not value["top1_match"]]
-                    if max_error_pair not in diagnostic_pairs:
-                        diagnostic_pairs.append(max_error_pair)
-                    diagnostic_pairs = diagnostic_pairs[:4]
+                    diagnostic_prompt_indices = {
+                        value["prompt_index"] for value in load_values if not value["top1_match"]
+                    }
+                    diagnostic_prompt_indices.add(max_error_pair["prompt_index"])
+                    diagnostic_pairs = [
+                        value for value in load_values if value["prompt_index"] in diagnostic_prompt_indices
+                    ]
 
                     async def collect_fast_path_diagnostics():
                         diagnostics = []
@@ -680,6 +683,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                 prefix_ids,
                                 selected_token,
                                 True,
+                                len(prompt_token_ids[prompt_index]),
                             )
                         )
                         assert len(learner_results) == 1, learner_results
@@ -786,32 +790,33 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                     learner_input = learner_fla_core["inputs"][name]
                                     engine_input = engine_fla_core["inputs"][name]
                                     input_comparisons[name] = {
+                                        "directly_comparable": name not in {"q", "k"},
                                         "fingerprint_exact": (
                                             learner_input["fingerprint"] == engine_input["fingerprint"]
+                                            if name not in {"q", "k"}
+                                            else None
                                         ),
-                                        "layout_exact": learner_input["layout"] == engine_input["layout"],
+                                        "learner_semantics": (
+                                            "raw; normalized inside FLA" if name in {"q", "k"} else "FLA input"
+                                        ),
+                                        "engine_semantics": (
+                                            "normalized before FLA" if name in {"q", "k"} else "FLA input"
+                                        ),
                                         "learner": learner_input,
                                         "engine": engine_input,
                                     }
-                                learner_zero_state = learner_fla_core["zero_initial_state"]
                                 engine_initial_state = engine_fla_core["inputs"]["initial_state"]
                                 fla_core = {
                                     "cross_engine": {
                                         "inputs": input_comparisons,
-                                        "live_output_fingerprint_exact": (
+                                        "output_fingerprint_exact": (
                                             learner_fla_core["live"]["output"]["fingerprint"]
                                             == engine_fla_core["live"]["output_fingerprint"]
                                         ),
-                                        "zero_initial_state": {
-                                            "fingerprint_exact": (
-                                                learner_zero_state["fingerprint"] == engine_initial_state["fingerprint"]
-                                            ),
-                                            "layout_exact": (
-                                                learner_zero_state["layout"] == engine_initial_state["layout"]
-                                            ),
-                                            "learner_layout_semantics": "N,H,K,V",
+                                        "initial_state": {
+                                            "directly_comparable": False,
+                                            "learner": "None; FLA initializes an implicit zero N,H,K,V state",
                                             "engine_layout_semantics": "N,H,V,K",
-                                            "learner": learner_zero_state,
                                             "engine": engine_initial_state,
                                         },
                                     },

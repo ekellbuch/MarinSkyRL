@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import importlib.metadata
 import sys
+from functools import partial
 from pathlib import Path
 
 import ray
@@ -95,7 +96,13 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
             "rank": torch.distributed.get_rank(),
         }
 
-    def score_next_token(self, prompt_token_ids, selected_token: int, capture_head_input: bool = False):
+    def score_next_token(
+        self,
+        prompt_token_ids,
+        selected_token: int,
+        capture_head_input: bool = False,
+        prefill_token_count: int | None = None,
+    ):
         if not is_fast_path_available:
             raise RuntimeError("Qwen3.5 learner parity requires the flash-linear-attention and causal-conv1d fast path")
         device = torch.cuda.current_device()
@@ -106,8 +113,23 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
         captured_head_inputs = []
         layer_captures = []
         hooks = []
+        hook_registrations = []
+        learner_fla_capture = None
         learner_fla_restore = None
         finalize_fla_capture = None
+
+        def restore_diagnostic_state():
+            nonlocal learner_fla_restore
+            if learner_fla_restore is not None:
+                mixer, live_chunk_gated_delta_rule = learner_fla_restore
+                mixer.chunk_gated_delta_rule = live_chunk_gated_delta_rule
+                learner_fla_restore = None
+            for hook in hooks:
+                hook.remove()
+            hooks.clear()
+            if was_training:
+                model.train()
+
         if capture_head_input:
 
             def tensor_payload(tensor):
@@ -150,7 +172,9 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                     }
                 )
 
-            hooks.append(output_embeddings.register_forward_pre_hook(capture_output_embedding_input))
+            hook_registrations.append(
+                partial(output_embeddings.register_forward_pre_hook, capture_output_embedding_input)
+            )
 
             text_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
             for layer_index, layer in enumerate(text_model.layers):
@@ -169,7 +193,6 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                     from fla.ops.gated_delta_rule import chunk_gated_delta_rule as released_chunk_gated_delta_rule
 
                     live_chunk_gated_delta_rule = mixer.chunk_gated_delta_rule
-                    learner_fla_restore = (mixer, live_chunk_gated_delta_rule)
                     backend_module = importlib.import_module(live_chunk_gated_delta_rule.__module__)
                     backend_source = Path(backend_module.__file__)
                     backend_source_sha256 = hashlib.sha256(backend_source.read_bytes()).hexdigest()
@@ -252,11 +275,16 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                         )
                         return live_output, live_final_state
 
-                    mixer.chunk_gated_delta_rule = capture_fla_core
+                    learner_fla_capture = (mixer, live_chunk_gated_delta_rule, capture_fla_core)
 
                     def finalize_fla_capture(capture):
                         captured_inputs = capture["captured_inputs"]
                         options = capture["options"]
+                        sequence_length = captured_inputs["q"].shape[1]
+                        if prefill_token_count is None or not 0 < prefill_token_count <= sequence_length:
+                            raise ValueError(
+                                f"Expected a prefill boundary in [1, {sequence_length}], got {prefill_token_count}"
+                            )
                         replay_output, replay_final_state = released_chunk_gated_delta_rule(
                             captured_inputs["q"].clone(),
                             captured_inputs["k"].clone(),
@@ -269,6 +297,49 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                             use_qk_l2norm_in_kernel=options["use_qk_l2norm_in_kernel"],
                             cu_seqlens=None,
                         )
+                        whole_state_output, whole_final_state = released_chunk_gated_delta_rule(
+                            captured_inputs["q"].clone(),
+                            captured_inputs["k"].clone(),
+                            captured_inputs["v"].clone(),
+                            g=captured_inputs["g"].clone(),
+                            beta=captured_inputs["beta"].clone(),
+                            scale=options["scale"],
+                            initial_state=None,
+                            output_final_state=True,
+                            use_qk_l2norm_in_kernel=options["use_qk_l2norm_in_kernel"],
+                            cu_seqlens=None,
+                        )
+                        segment_boundaries = [(0, prefill_token_count)] + [
+                            (token_index, token_index + 1)
+                            for token_index in range(prefill_token_count, sequence_length)
+                        ]
+                        segmented_outputs = []
+                        segmented_state = None
+                        for start, end in segment_boundaries:
+                            segmented_output, segmented_state = released_chunk_gated_delta_rule(
+                                captured_inputs["q"][:, start:end].clone(),
+                                captured_inputs["k"][:, start:end].clone(),
+                                captured_inputs["v"][:, start:end].clone(),
+                                g=captured_inputs["g"][:, start:end].clone(),
+                                beta=captured_inputs["beta"][:, start:end].clone(),
+                                scale=options["scale"],
+                                initial_state=segmented_state,
+                                output_final_state=True,
+                                use_qk_l2norm_in_kernel=options["use_qk_l2norm_in_kernel"],
+                                cu_seqlens=None,
+                            )
+                            segmented_outputs.append(segmented_output)
+                        segmented_output = torch.cat(segmented_outputs, dim=1)
+                        response_score_positions = [
+                            {
+                                "response_token_index": position - prefill_token_count + 1,
+                                "sequence_position": position,
+                                "error": _exact_error_summary(
+                                    whole_state_output[:, position], segmented_output[:, position]
+                                ),
+                            }
+                            for position in range(prefill_token_count - 1, sequence_length)
+                        ]
                         zero_state = torch.zeros(
                             captured_inputs["q"].shape[0],
                             captured_inputs["q"].shape[2],
@@ -318,8 +389,12 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                             "context": {
                                 "configured_use_sample_packing": bool(self.cfg.trainer.use_sample_packing),
                                 "grad_enabled": capture["grad_enabled"],
+                                "prefill_token_count": prefill_token_count,
+                                "production_sample_packing_exercised": False,
+                                "scored_response_token_index": sequence_length - prefill_token_count,
                                 "scored_batch_size": input_ids.shape[0],
                                 "scored_sequence_count": input_ids.shape[0],
+                                "segment_boundaries": [list(boundary) for boundary in segment_boundaries],
                             },
                             "inputs": {
                                 name: (
@@ -358,6 +433,15 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                 ),
                                 "output": _exact_error_summary(live_output, replay_output),
                             },
+                            "released_whole_vs_segmented": {
+                                "final_state": _exact_error_summary(whole_final_state, segmented_state),
+                                "live_options_vs_whole_state_output": _exact_error_summary(
+                                    replay_output, whole_state_output
+                                ),
+                                "output": _exact_error_summary(whole_state_output, segmented_output),
+                                "response_score_positions": response_score_positions,
+                                "scored_position": response_score_positions[-1],
+                            },
                             "inputs_unchanged_by_live_call": capture["post_live_input_errors"],
                             "none_vs_zero_initial_state": _exact_error_summary(live_output, zero_state_output),
                             "options": options,
@@ -373,15 +457,16 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                         ("in_proj_a", "a"),
                     ):
                         projection = getattr(mixer, projection_name)
-                        hooks.append(
-                            projection.register_forward_hook(
+                        hook_registrations.append(
+                            partial(
+                                projection.register_forward_hook,
                                 lambda module, args, output, destination=projections, key=key: capture_projection(
                                     module,
                                     args,
                                     output,
                                     destination=destination,
                                     key=key,
-                                )
+                                ),
                             )
                         )
 
@@ -423,10 +508,15 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                     ):
                         destination.setdefault("norm_output", []).append(token_heads_payload(output, heads))
 
-                    hooks.append(mixer.norm.register_forward_pre_hook(capture_norm_input, with_kwargs=True))
-                    hooks.append(mixer.norm.register_forward_hook(capture_norm_output, with_kwargs=True))
-                    hooks.append(
-                        mixer.out_proj.register_forward_pre_hook(
+                    hook_registrations.append(
+                        partial(mixer.norm.register_forward_pre_hook, capture_norm_input, with_kwargs=True)
+                    )
+                    hook_registrations.append(
+                        partial(mixer.norm.register_forward_hook, capture_norm_output, with_kwargs=True)
+                    )
+                    hook_registrations.append(
+                        partial(
+                            mixer.out_proj.register_forward_pre_hook,
                             lambda module, args, kwargs, destination=stages: capture_input(
                                 module,
                                 args,
@@ -437,8 +527,9 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                             with_kwargs=True,
                         )
                     )
-                    hooks.append(
-                        mixer.out_proj.register_forward_hook(
+                    hook_registrations.append(
+                        partial(
+                            mixer.out_proj.register_forward_hook,
                             lambda module, args, kwargs, output, destination=stages: capture_output(
                                 module,
                                 args,
@@ -451,10 +542,11 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                         )
                     )
 
-                hooks.append(mixer.register_forward_pre_hook(capture_input, with_kwargs=True))
-                hooks.append(mixer.register_forward_hook(capture_output, with_kwargs=True))
-                hooks.append(
-                    layer.mlp.register_forward_pre_hook(
+                hook_registrations.append(partial(mixer.register_forward_pre_hook, capture_input, with_kwargs=True))
+                hook_registrations.append(partial(mixer.register_forward_hook, capture_output, with_kwargs=True))
+                hook_registrations.append(
+                    partial(
+                        layer.mlp.register_forward_pre_hook,
                         lambda module, args, kwargs, destination=entry: capture_input(
                             module,
                             args,
@@ -465,8 +557,9 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                         with_kwargs=True,
                     )
                 )
-                hooks.append(
-                    layer.mlp.register_forward_hook(
+                hook_registrations.append(
+                    partial(
+                        layer.mlp.register_forward_hook,
                         lambda module, args, kwargs, output, destination=entry: capture_output(
                             module,
                             args,
@@ -478,7 +571,16 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                         with_kwargs=True,
                     )
                 )
-        model.eval()
+        try:
+            hooks.extend(register_hook() for register_hook in hook_registrations)
+            model.eval()
+            if learner_fla_capture is not None:
+                mixer, live_chunk_gated_delta_rule, capture_fla_core = learner_fla_capture
+                mixer.chunk_gated_delta_rule = capture_fla_core
+                learner_fla_restore = (mixer, live_chunk_gated_delta_rule)
+        except BaseException:
+            restore_diagnostic_state()
+            raise
         try:
             with torch.no_grad():
                 model_output = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
@@ -565,13 +667,7 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                             layer_entry["fla_core"] = fla_core[0]
                     result["layer_trace"] = layer_captures
         finally:
-            if learner_fla_restore is not None:
-                mixer, live_chunk_gated_delta_rule = learner_fla_restore
-                mixer.chunk_gated_delta_rule = live_chunk_gated_delta_rule
-            for hook in hooks:
-                hook.remove()
-            if was_training:
-                model.train()
+            restore_diagnostic_state()
         return result
 
 

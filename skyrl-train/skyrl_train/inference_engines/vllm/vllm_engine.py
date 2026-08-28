@@ -1912,9 +1912,15 @@ class WorkerWrap:
                     replays=attention_replays,
                     cores=attention_core_tensors,
                     gates=attention_gate_tensors,
+                    inputs=attention_inputs,
+                    layer_mixer=mixer,
                 ):
                     post_gate = args[0]
                     destination.setdefault("post_gate", []).append(tensor_payload(post_gate))
+                    if not gates and len(inputs) == 1:
+                        _, hidden_states = inputs[0]
+                        qkv = layer_mixer._project_qkv(hidden_states)
+                        capture_qkv(layer_mixer.qkv_proj, (hidden_states,), qkv)
                     if len(cores) != 1 or len(gates) != 1:
                         raise RuntimeError(f"Expected one attention core and gate, got {len(cores)} and {len(gates)}")
                     replays.setdefault("post_gate", []).append(tensor_payload(cores[0] * torch.sigmoid(gates[0])))

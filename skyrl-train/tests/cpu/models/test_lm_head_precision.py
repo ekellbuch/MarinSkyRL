@@ -1,9 +1,11 @@
+import builtins
 import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 from skyrl_train.models.lm_head_precision import (
+    _record_vllm_reload_metadata,
     configure_hf_lm_head_compute_dtype,
     configure_vllm_model_instance_lm_head_compute_dtype,
     patch_vllm_model_class_lm_head_compute_dtype,
@@ -89,7 +91,7 @@ def test_vllm_class_precision_configuration_is_independent_of_construction_order
     patch_vllm_model_class_lm_head_compute_dtype(TinyVLLMModel, None)
 
 
-def test_vllm_tied_lm_head_survives_two_complete_loads_without_stale_storage():
+def test_vllm_tied_lm_head_survives_two_complete_loads_without_stale_storage(monkeypatch):
     class TinyVLLMModel:
         def __init__(self) -> None:
             self.config = SimpleNamespace(tie_word_embeddings=True, vocab_size=3)
@@ -109,6 +111,10 @@ def test_vllm_tied_lm_head_survives_two_complete_loads_without_stale_storage():
 
     language_model = TinyVLLMModel()
     shell = type("TinyShell", (), {"language_model": language_model})()
+    monkeypatch.setattr(
+        "skyrl_train.models.lm_head_precision._record_vllm_reload_metadata",
+        lambda module: None,
+    )
     hidden_states = torch.tensor(
         [[0.5, -1.0, 1.5, 2.0], [1.0, 0.25, -0.5, 0.75]],
         dtype=torch.bfloat16,
@@ -158,6 +164,20 @@ def test_vllm_tied_lm_head_survives_two_complete_loads_without_stale_storage():
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+def test_vllm_tied_lm_head_rejects_missing_reload_metadata_support(monkeypatch):
+    original_import = builtins.__import__
+
+    def reject_reload_module(name, *args, **kwargs):
+        if name == "vllm.model_executor.model_loader.reload":
+            raise ImportError("reload module unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_reload_module)
+
+    with pytest.raises(RuntimeError, match="require vLLM layerwise reload metadata"):
+        _record_vllm_reload_metadata(nn.Linear(2, 2))
 
 
 def test_vllm_lm_head_restore_waits_for_layerwise_reload_to_materialize_weights():

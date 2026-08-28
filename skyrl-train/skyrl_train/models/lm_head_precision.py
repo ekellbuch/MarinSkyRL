@@ -18,8 +18,8 @@ def _record_vllm_reload_metadata(module: nn.Module) -> None:
     """Teach vLLM's layerwise reloader about a projection created after model init."""
     try:
         from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
-    except ImportError:
-        return
+    except ImportError as error:
+        raise RuntimeError("FP32 tied projections require vLLM layerwise reload metadata support") from error
     record_metadata_for_reloading(module)
 
 

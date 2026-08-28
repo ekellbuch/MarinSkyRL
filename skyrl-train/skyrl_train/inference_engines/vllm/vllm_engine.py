@@ -1685,6 +1685,8 @@ class WorkerWrap:
                     *,
                     destination=mlp_stages,
                     replays=mlp_replays,
+                    activation=layer.mlp.act_fn,
+                    down_projection=layer.mlp.down_proj,
                 ):
                     hidden_states = args[0]
                     projected = output[0] if isinstance(output, tuple) else output
@@ -1707,6 +1709,11 @@ class WorkerWrap:
                         weight[split_size:],
                         up_bias,
                     )
+                    separate_gate_up = torch.cat((separate_gate, separate_up), dim=-1)
+                    fused_separate_product = activation.forward_cuda(separate_gate_up)
+                    fused_separate_down = down_projection.forward(fused_separate_product)
+                    if isinstance(fused_separate_down, tuple):
+                        fused_separate_down = fused_separate_down[0]
                     native_activation = torch.nn.functional.silu(gate)
                     separate_native_activation = torch.nn.functional.silu(separate_gate)
                     replays.setdefault("separate_gate", []).append(tensor_payload(separate_gate))
@@ -1719,6 +1726,8 @@ class WorkerWrap:
                     replays.setdefault("separate_native_product", []).append(
                         tensor_payload(separate_native_activation * separate_up)
                     )
+                    replays.setdefault("fused_separate_product", []).append(tensor_payload(fused_separate_product))
+                    replays.setdefault("fused_separate_down", []).append(tensor_payload(fused_separate_down))
 
                 layer_hooks.append(layer.mlp.gate_up_proj.register_forward_hook(capture_gate_up_output))
                 layer_hooks.append(

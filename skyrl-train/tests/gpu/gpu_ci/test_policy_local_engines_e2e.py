@@ -857,6 +857,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                     "separate_native_activation": "activation",
                                     "native_product": "product",
                                     "separate_native_product": "product",
+                                    "fused_separate_product": "product",
+                                    "fused_separate_down": "down",
                                 }
                                 replays = []
                                 for replay_name, learner_stage_name in replay_targets.items():

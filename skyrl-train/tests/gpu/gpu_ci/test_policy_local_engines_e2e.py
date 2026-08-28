@@ -817,6 +817,71 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                             ),
                                         }
                                     )
+                            mlp_stage_diagnostics = None
+                            learner_mlp_stages = learner_layer.pop("mlp_stages", None)
+                            engine_mlp_stages = engine_layer.pop("mlp_stages", None)
+                            engine_mlp_replays = engine_layer.pop("mlp_replays", None)
+                            assert (learner_mlp_stages is None) == (engine_mlp_stages is None)
+                            assert (learner_mlp_stages is None) == (engine_mlp_replays is None)
+                            if learner_mlp_stages is not None:
+                                assert engine_mlp_stages is not None
+                                assert engine_mlp_replays is not None
+                                assert learner_mlp_stages.keys() == {
+                                    "activation",
+                                    "down",
+                                    "gate",
+                                    "product",
+                                    "up",
+                                }
+                                assert engine_mlp_stages.keys() == {"down", "gate", "product", "up"}
+                                runtime = []
+                                for stage_name, engine_stage in engine_mlp_stages.items():
+                                    learner_stage = learner_mlp_stages[stage_name]
+                                    assert learner_stage["shape"] == engine_stage["shape"]
+                                    runtime.append(
+                                        {
+                                            "stage": stage_name,
+                                            "learner_dtype": learner_stage["dtype"],
+                                            "engine_dtype": engine_stage["dtype"],
+                                            "shape": learner_stage["shape"],
+                                            "error": _head_input_error_summary(
+                                                learner_stage["values"],
+                                                engine_stage.pop("values"),
+                                            ),
+                                        }
+                                    )
+                                replay_targets = {
+                                    "separate_gate": "gate",
+                                    "separate_up": "up",
+                                    "native_activation": "activation",
+                                    "separate_native_activation": "activation",
+                                    "native_product": "product",
+                                    "separate_native_product": "product",
+                                }
+                                replays = []
+                                for replay_name, learner_stage_name in replay_targets.items():
+                                    replay = engine_mlp_replays[replay_name]
+                                    learner_stage = learner_mlp_stages[learner_stage_name]
+                                    assert learner_stage["shape"] == replay["shape"]
+                                    replays.append(
+                                        {
+                                            "replay": replay_name,
+                                            "learner_stage": learner_stage_name,
+                                            "learner_dtype": learner_stage["dtype"],
+                                            "engine_dtype": replay["dtype"],
+                                            "shape": learner_stage["shape"],
+                                            "error": _head_input_error_summary(
+                                                learner_stage["values"],
+                                                replay.pop("values"),
+                                            ),
+                                        }
+                                    )
+                                for learner_stage in learner_mlp_stages.values():
+                                    learner_stage.pop("values")
+                                mlp_stage_diagnostics = {
+                                    "runtime": runtime,
+                                    "engine_replays": replays,
+                                }
                             learner_fla_core = learner_layer.pop("fla_core", None)
                             engine_fla_core = engine_layer.pop("fla_core", None)
                             assert (learner_fla_core is None) == (engine_fla_core is None)
@@ -951,6 +1016,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                     "fla_core": fla_core,
                                     "projections": projection_diagnostics,
                                     "mixer_stages": stage_diagnostics,
+                                    "mlp_stages": mlp_stage_diagnostics,
                                 }
                             )
                         head_input_diagnostics.append(

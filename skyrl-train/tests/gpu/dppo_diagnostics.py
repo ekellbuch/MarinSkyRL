@@ -721,6 +721,55 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                         )
                     )
 
+                if layer_index == 0:
+                    mlp_stages = {}
+                    entry["mlp_stages"] = mlp_stages
+                    for module, key in (
+                        (layer.mlp.gate_proj, "gate"),
+                        (layer.mlp.up_proj, "up"),
+                        (layer.mlp.act_fn, "activation"),
+                    ):
+                        hook_registrations.append(
+                            partial(
+                                module.register_forward_hook,
+                                lambda module, args, kwargs, output, destination=mlp_stages, key=key: capture_output(
+                                    module,
+                                    args,
+                                    kwargs,
+                                    output,
+                                    destination=destination,
+                                    key=key,
+                                ),
+                                with_kwargs=True,
+                            )
+                        )
+                    hook_registrations.append(
+                        partial(
+                            layer.mlp.down_proj.register_forward_pre_hook,
+                            lambda module, args, kwargs, destination=mlp_stages: capture_input(
+                                module,
+                                args,
+                                kwargs,
+                                destination=destination,
+                                key="product",
+                            ),
+                            with_kwargs=True,
+                        )
+                    )
+                    hook_registrations.append(
+                        partial(
+                            layer.mlp.down_proj.register_forward_hook,
+                            lambda module, args, kwargs, output, destination=mlp_stages: capture_output(
+                                module,
+                                args,
+                                kwargs,
+                                output,
+                                destination=destination,
+                                key="down",
+                            ),
+                            with_kwargs=True,
+                        )
+                    )
                 hook_registrations.append(partial(mixer.register_forward_pre_hook, capture_input, with_kwargs=True))
                 hook_registrations.append(partial(mixer.register_forward_hook, capture_output, with_kwargs=True))
                 hook_registrations.append(
@@ -852,6 +901,13 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                     f"{layer_entry['layer']}, got {len(values)}"
                                 )
                             layer_entry["mixer_stages"][key] = values[0]
+                        for key, values in layer_entry.get("mlp_stages", {}).items():
+                            if len(values) != 1:
+                                raise RuntimeError(
+                                    f"Expected one learner {key} MLP stage capture in layer "
+                                    f"{layer_entry['layer']}, got {len(values)}"
+                                )
+                            layer_entry["mlp_stages"][key] = values[0]
                         compact_layer_capture(layer_entry, "fla_core", "FLA core")
                         compact_layer_capture(layer_entry, "causal_conv", "causal-convolution")
                     result["layer_trace"] = layer_captures

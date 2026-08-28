@@ -1672,6 +1672,79 @@ class WorkerWrap:
                         with_kwargs=True,
                     )
                 )
+            if layer_index == 0:
+                mlp_stages = {}
+                mlp_replays = {}
+                entry["mlp_stages"] = mlp_stages
+                entry["mlp_replays"] = mlp_replays
+
+                def capture_gate_up_output(
+                    module,
+                    args,
+                    output,
+                    *,
+                    destination=mlp_stages,
+                    replays=mlp_replays,
+                ):
+                    hidden_states = args[0]
+                    projected = output[0] if isinstance(output, tuple) else output
+                    gate, up = projected.chunk(2, dim=-1)
+                    destination.setdefault("gate", []).append(tensor_payload(gate))
+                    destination.setdefault("up", []).append(tensor_payload(up))
+
+                    split_size = gate.shape[-1]
+                    weight = module.weight
+                    bias = getattr(module, "bias", None)
+                    gate_bias = None if bias is None else bias[:split_size]
+                    up_bias = None if bias is None else bias[split_size:]
+                    separate_gate = torch.nn.functional.linear(
+                        hidden_states,
+                        weight[:split_size],
+                        gate_bias,
+                    )
+                    separate_up = torch.nn.functional.linear(
+                        hidden_states,
+                        weight[split_size:],
+                        up_bias,
+                    )
+                    native_activation = torch.nn.functional.silu(gate)
+                    separate_native_activation = torch.nn.functional.silu(separate_gate)
+                    replays.setdefault("separate_gate", []).append(tensor_payload(separate_gate))
+                    replays.setdefault("separate_up", []).append(tensor_payload(separate_up))
+                    replays.setdefault("native_activation", []).append(tensor_payload(native_activation))
+                    replays.setdefault("separate_native_activation", []).append(
+                        tensor_payload(separate_native_activation)
+                    )
+                    replays.setdefault("native_product", []).append(tensor_payload(native_activation * up))
+                    replays.setdefault("separate_native_product", []).append(
+                        tensor_payload(separate_native_activation * separate_up)
+                    )
+
+                layer_hooks.append(layer.mlp.gate_up_proj.register_forward_hook(capture_gate_up_output))
+                layer_hooks.append(
+                    layer.mlp.act_fn.register_forward_hook(
+                        lambda module, args, output, destination=mlp_stages: capture_output(
+                            module,
+                            args,
+                            {},
+                            output,
+                            destination=destination,
+                            key="product",
+                        )
+                    )
+                )
+                layer_hooks.append(
+                    layer.mlp.down_proj.register_forward_hook(
+                        lambda module, args, output, destination=mlp_stages: capture_output(
+                            module,
+                            args,
+                            {},
+                            output,
+                            destination=destination,
+                            key="down",
+                        )
+                    )
+                )
             layer_hooks.append(
                 mixer.register_forward_pre_hook(
                     lambda module, args, kwargs, destination=entry: capture_input(
@@ -1798,6 +1871,14 @@ class WorkerWrap:
                             f"Expected one vLLM {key} stage capture in layer {layer_entry['layer']}, got {len(values)}"
                         )
                     layer_entry["mixer_stages"][key] = values[0]
+                for capture_name in ("mlp_stages", "mlp_replays"):
+                    for key, values in layer_entry.get(capture_name, {}).items():
+                        if len(values) != 1:
+                            raise RuntimeError(
+                                f"Expected one vLLM {key} {capture_name} capture in layer "
+                                f"{layer_entry['layer']}, got {len(values)}"
+                            )
+                        layer_entry[capture_name][key] = values[0]
                 fla_core = layer_entry.get("fla_core")
                 if fla_core is not None:
                     if len(fla_core) != 1:

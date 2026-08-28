@@ -884,6 +884,165 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                     "runtime": runtime,
                                     "engine_replays": replays,
                                 }
+                            attention_diagnostics = None
+                            learner_attention_stages = learner_layer.pop("attention_stages", None)
+                            learner_attention_replays = learner_layer.pop("attention_replays", None)
+                            engine_attention_stages = engine_layer.pop("attention_stages", None)
+                            engine_attention_replays = engine_layer.pop("attention_replays", None)
+                            assert (learner_attention_stages is None) == (learner_attention_replays is None)
+                            assert (learner_attention_stages is None) == (engine_attention_stages is None)
+                            assert (learner_attention_stages is None) == (engine_attention_replays is None)
+                            if learner_attention_stages is not None:
+                                assert learner_attention_replays is not None
+                                assert engine_attention_stages is not None
+                                assert engine_attention_replays is not None
+
+                                def compare_attention_payload(label, learner_payload, engine_payload):
+                                    assert learner_payload["shape"] == engine_payload["shape"]
+                                    comparison = {
+                                        "comparison": label,
+                                        "learner_dtype": learner_payload["dtype"],
+                                        "engine_dtype": engine_payload["dtype"],
+                                        "shape": learner_payload["shape"],
+                                        "error": _head_input_error_summary(
+                                            learner_payload["values"],
+                                            engine_payload["values"],
+                                        ),
+                                    }
+                                    learner_sequence = learner_payload.get("sequence_fingerprint")
+                                    engine_sequence = engine_payload.get("sequence_fingerprint")
+                                    if learner_sequence is not None or engine_sequence is not None:
+                                        assert learner_payload["sequence_shape"] == engine_payload["sequence_shape"]
+                                        comparison.update(
+                                            {
+                                                "sequence_shape": learner_payload["sequence_shape"],
+                                                "sequence_fingerprint_exact": learner_sequence == engine_sequence,
+                                                "token_fingerprints": _token_fingerprint_summary(
+                                                    learner_payload["token_fingerprints"],
+                                                    engine_payload["token_fingerprints"],
+                                                ),
+                                            }
+                                        )
+                                    return comparison
+
+                                runtime_targets = {
+                                    "q_raw": "q_raw",
+                                    "gate": "gate",
+                                    "k_raw": "k_raw",
+                                    "v_raw": "v_raw",
+                                    "post_gate": "post_gate",
+                                    "out_proj": "out_proj",
+                                }
+                                runtime = [
+                                    compare_attention_payload(
+                                        f"runtime:{engine_name}",
+                                        learner_attention_stages[learner_name],
+                                        engine_attention_stages[engine_name],
+                                    )
+                                    for engine_name, learner_name in runtime_targets.items()
+                                ]
+                                processed_targets = {
+                                    "q_rope": "q_rope",
+                                    "k_rope": "k_rope",
+                                    "v": "v",
+                                    "attention_core": "attention_core",
+                                }
+                                processed = [
+                                    compare_attention_payload(
+                                        f"learner_replay_vs_engine_live:{engine_name}",
+                                        learner_attention_replays[learner_name],
+                                        engine_attention_stages[engine_name],
+                                    )
+                                    for engine_name, learner_name in processed_targets.items()
+                                ]
+                                processed.extend(
+                                    (
+                                        compare_attention_payload(
+                                            "runtime_eager:q_norm",
+                                            learner_attention_stages["q_norm"],
+                                            engine_attention_replays["runtime_eager_q_norm"],
+                                        ),
+                                        compare_attention_payload(
+                                            "runtime_eager:k_norm",
+                                            learner_attention_stages["k_norm"],
+                                            engine_attention_replays["runtime_eager_k_norm"],
+                                        ),
+                                    )
+                                )
+                                replay_targets = {
+                                    "separate_q_raw": ("stages", "q_raw"),
+                                    "separate_gate": ("stages", "gate"),
+                                    "separate_k_raw": ("stages", "k_raw"),
+                                    "separate_v_raw": ("stages", "v_raw"),
+                                    "runtime_eager_q_rope": ("replays", "q_rope"),
+                                    "runtime_eager_k_rope": ("replays", "k_rope"),
+                                    "runtime_eager_v": ("replays", "v"),
+                                    "runtime_eager_gate": ("stages", "gate"),
+                                    "separate_eager_q_norm": ("stages", "q_norm"),
+                                    "separate_eager_k_norm": ("stages", "k_norm"),
+                                    "separate_eager_q_rope": ("replays", "q_rope"),
+                                    "separate_eager_k_rope": ("replays", "k_rope"),
+                                    "separate_eager_v": ("replays", "v"),
+                                    "separate_eager_gate": ("stages", "gate"),
+                                    "separate_fused_q_rope": ("replays", "q_rope"),
+                                    "separate_fused_k_rope": ("replays", "k_rope"),
+                                    "separate_fused_v": ("replays", "v"),
+                                    "separate_fused_gate": ("stages", "gate"),
+                                    "post_gate": ("replays", "post_gate"),
+                                }
+                                replay_comparisons = []
+                                for replay_name, (learner_source, learner_name) in replay_targets.items():
+                                    learner_payloads = (
+                                        learner_attention_stages
+                                        if learner_source == "stages"
+                                        else learner_attention_replays
+                                    )
+                                    replay_comparisons.append(
+                                        compare_attention_payload(
+                                            f"engine_replay:{replay_name}",
+                                            learner_payloads[learner_name],
+                                            engine_attention_replays[replay_name],
+                                        )
+                                    )
+                                same_side = {
+                                    "learner_live_vs_learner_replay_post_gate": compare_attention_payload(
+                                        "learner_live_vs_learner_replay:post_gate",
+                                        learner_attention_stages["post_gate"],
+                                        learner_attention_replays["post_gate"],
+                                    ),
+                                    "learner_live_vs_learner_replay_out_proj": compare_attention_payload(
+                                        "learner_live_vs_learner_replay:out_proj",
+                                        learner_attention_stages["out_proj"],
+                                        learner_attention_replays["out_proj"],
+                                    ),
+                                    "engine_live_vs_engine_replay_post_gate": compare_attention_payload(
+                                        "engine_live_vs_engine_replay:post_gate",
+                                        engine_attention_stages["post_gate"],
+                                        engine_attention_replays["post_gate"],
+                                    ),
+                                }
+                                for payloads in (
+                                    learner_attention_stages,
+                                    learner_attention_replays,
+                                    engine_attention_stages,
+                                    engine_attention_replays,
+                                ):
+                                    for payload in payloads.values():
+                                        payload.pop("values")
+                                attention_diagnostics = {
+                                    "runtime": runtime,
+                                    "processed": processed,
+                                    "engine_replays": replay_comparisons,
+                                    "same_side_replays": same_side,
+                                    "learner": {
+                                        "stages": learner_attention_stages,
+                                        "replays": learner_attention_replays,
+                                    },
+                                    "engine": {
+                                        "stages": engine_attention_stages,
+                                        "replays": engine_attention_replays,
+                                    },
+                                }
                             learner_fla_core = learner_layer.pop("fla_core", None)
                             engine_fla_core = engine_layer.pop("fla_core", None)
                             assert (learner_fla_core is None) == (engine_fla_core is None)
@@ -1019,6 +1178,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                     "projections": projection_diagnostics,
                                     "mixer_stages": stage_diagnostics,
                                     "mlp_stages": mlp_stage_diagnostics,
+                                    "attention": attention_diagnostics,
                                 }
                             )
                         head_input_diagnostics.append(

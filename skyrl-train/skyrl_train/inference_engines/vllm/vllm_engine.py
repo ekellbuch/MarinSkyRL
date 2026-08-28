@@ -1021,6 +1021,22 @@ class WorkerWrap:
                 "shape": list(tensor.shape),
             }
 
+        def attention_payload(sequence_heads):
+            if sequence_heads.ndim != 3:
+                raise RuntimeError(f"Expected attention tensor [tokens, heads, head_dim], got {sequence_heads.shape}")
+            last_token = sequence_heads[-1].reshape(-1)
+            return {
+                "values": last_token.detach().float().cpu().tolist(),
+                "dtype": str(sequence_heads.dtype),
+                "shape": list(last_token.shape),
+                "sequence_shape": list(sequence_heads.shape),
+                "sequence_fingerprint": canonical_tensor_fingerprint(sequence_heads),
+                "token_fingerprints": [
+                    canonical_tensor_fingerprint(sequence_heads[index : index + 1])
+                    for index in range(sequence_heads.shape[0])
+                ],
+            }
+
         def capture_input(_module, args, kwargs, *, destination, key):
             hidden_states = kwargs.get("hidden_states")
             if hidden_states is None:
@@ -1672,6 +1688,242 @@ class WorkerWrap:
                         with_kwargs=True,
                     )
                 )
+            if layer_index == 3 and mixer_name == "self_attn":
+                attention_stages = {}
+                attention_replays = {}
+                attention_inputs = []
+                attention_core_tensors = []
+                attention_gate_tensors = []
+                entry["attention_stages"] = attention_stages
+                entry["attention_replays"] = attention_replays
+
+                def capture_attention_input(
+                    _module,
+                    args,
+                    kwargs,
+                    *,
+                    inputs=attention_inputs,
+                ):
+                    positions = kwargs.get("positions")
+                    if positions is None:
+                        positions = args[0]
+                    hidden_states = kwargs.get("hidden_states")
+                    if hidden_states is None:
+                        hidden_states = args[2]
+                    inputs.append((positions, hidden_states))
+
+                def attention_heads(tensor, heads, head_dim):
+                    if tensor.ndim != 2:
+                        raise RuntimeError(
+                            f"Expected packed vLLM attention tensor [tokens, hidden], got {tensor.shape}"
+                        )
+                    return tensor.view(tensor.shape[0], heads, head_dim)
+
+                def eager_project_qkv(layer_mixer, qkv, positions, *, destination, prefix):
+                    q_gate, key, value = qkv.split(
+                        [layer_mixer.q_size * 2, layer_mixer.kv_size, layer_mixer.kv_size], dim=-1
+                    )
+                    q_gate = q_gate.view(q_gate.shape[0], layer_mixer.num_heads, layer_mixer.head_dim * 2)
+                    query, gate = torch.chunk(q_gate, 2, dim=-1)
+                    query = layer_mixer.q_norm.forward(query)
+                    key = layer_mixer.k_norm.forward(
+                        key.view(key.shape[0], layer_mixer.num_kv_heads, layer_mixer.head_dim)
+                    )
+                    destination.setdefault(f"{prefix}_q_norm", []).append(attention_payload(query))
+                    destination.setdefault(f"{prefix}_k_norm", []).append(attention_payload(key))
+                    query = query.reshape(query.shape[0], -1)
+                    key = key.reshape(key.shape[0], -1)
+                    query, key = layer_mixer.rotary_emb.forward(positions, query, key)
+                    return query, key, value, gate.reshape(gate.shape[0], -1)
+
+                def store_processed_attention(
+                    destination,
+                    prefix,
+                    query,
+                    key,
+                    value,
+                    gate,
+                    *,
+                    layer_mixer,
+                ):
+                    destination.setdefault(f"{prefix}_q_rope", []).append(
+                        attention_payload(attention_heads(query, layer_mixer.num_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault(f"{prefix}_k_rope", []).append(
+                        attention_payload(attention_heads(key, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault(f"{prefix}_v", []).append(
+                        attention_payload(attention_heads(value, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault(f"{prefix}_gate", []).append(
+                        attention_payload(attention_heads(gate, layer_mixer.num_heads, layer_mixer.head_dim))
+                    )
+
+                def capture_qkv(
+                    _module,
+                    _args,
+                    output,
+                    *,
+                    inputs=attention_inputs,
+                    destination=attention_stages,
+                    replays=attention_replays,
+                    gates=attention_gate_tensors,
+                    layer_mixer=mixer,
+                ):
+                    if len(inputs) != 1:
+                        raise RuntimeError(f"Expected one vLLM attention input, got {len(inputs)}")
+                    positions, hidden_states = inputs[0]
+                    qkv = output[0] if isinstance(output, tuple) else output
+                    q_gate_size = layer_mixer.q_size * 2
+                    q_gate, key, value = qkv.split([q_gate_size, layer_mixer.kv_size, layer_mixer.kv_size], dim=-1)
+                    q_gate_heads = q_gate.view(q_gate.shape[0], layer_mixer.num_heads, layer_mixer.head_dim * 2)
+                    query, gate = torch.chunk(q_gate_heads, 2, dim=-1)
+                    gates.append(gate.reshape(gate.shape[0], -1))
+                    destination.setdefault("q_raw", []).append(attention_payload(query))
+                    destination.setdefault("gate", []).append(attention_payload(gate))
+                    destination.setdefault("k_raw", []).append(
+                        attention_payload(attention_heads(key, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault("v_raw", []).append(
+                        attention_payload(attention_heads(value, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+
+                    weight = layer_mixer.qkv_proj.weight
+                    bias = getattr(layer_mixer.qkv_proj, "bias", None)
+                    q_gate_bias = None if bias is None else bias[:q_gate_size]
+                    key_bias = None if bias is None else bias[q_gate_size : q_gate_size + layer_mixer.kv_size]
+                    value_bias = None if bias is None else bias[q_gate_size + layer_mixer.kv_size :]
+                    separate_q_gate = torch.nn.functional.linear(
+                        hidden_states,
+                        weight[:q_gate_size],
+                        q_gate_bias,
+                    )
+                    separate_key = torch.nn.functional.linear(
+                        hidden_states,
+                        weight[q_gate_size : q_gate_size + layer_mixer.kv_size],
+                        key_bias,
+                    )
+                    separate_value = torch.nn.functional.linear(
+                        hidden_states,
+                        weight[q_gate_size + layer_mixer.kv_size :],
+                        value_bias,
+                    )
+                    separate_q_gate_heads = separate_q_gate.view(
+                        separate_q_gate.shape[0], layer_mixer.num_heads, layer_mixer.head_dim * 2
+                    )
+                    separate_query, separate_gate = torch.chunk(separate_q_gate_heads, 2, dim=-1)
+                    replays.setdefault("separate_q_raw", []).append(attention_payload(separate_query))
+                    replays.setdefault("separate_gate", []).append(attention_payload(separate_gate))
+                    replays.setdefault("separate_k_raw", []).append(
+                        attention_payload(attention_heads(separate_key, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+                    replays.setdefault("separate_v_raw", []).append(
+                        attention_payload(
+                            attention_heads(separate_value, layer_mixer.num_kv_heads, layer_mixer.head_dim)
+                        )
+                    )
+                    separate_qkv = torch.cat((separate_q_gate, separate_key, separate_value), dim=-1)
+
+                    runtime_eager = eager_project_qkv(
+                        layer_mixer,
+                        qkv,
+                        positions,
+                        destination=replays,
+                        prefix="runtime_eager",
+                    )
+                    store_processed_attention(
+                        replays,
+                        "runtime_eager",
+                        *runtime_eager,
+                        layer_mixer=layer_mixer,
+                    )
+                    separate_eager = eager_project_qkv(
+                        layer_mixer,
+                        separate_qkv,
+                        positions,
+                        destination=replays,
+                        prefix="separate_eager",
+                    )
+                    store_processed_attention(
+                        replays,
+                        "separate_eager",
+                        *separate_eager,
+                        layer_mixer=layer_mixer,
+                    )
+                    separate_fused = layer_mixer._project_qkv_gate(separate_qkv, positions)
+                    store_processed_attention(
+                        replays,
+                        "separate_fused",
+                        *separate_fused,
+                        layer_mixer=layer_mixer,
+                    )
+
+                def capture_attention_backend_input(
+                    _module,
+                    args,
+                    *,
+                    destination=attention_stages,
+                    layer_mixer=mixer,
+                ):
+                    query, key, value = args[:3]
+                    destination.setdefault("q_rope", []).append(
+                        attention_payload(attention_heads(query, layer_mixer.num_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault("k_rope", []).append(
+                        attention_payload(attention_heads(key, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault("v", []).append(
+                        attention_payload(attention_heads(value, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+
+                def capture_attention_backend_output(
+                    _module,
+                    _args,
+                    output,
+                    *,
+                    destination=attention_stages,
+                    tensors=attention_core_tensors,
+                    layer_mixer=mixer,
+                ):
+                    tensors.append(output)
+                    destination.setdefault("attention_core", []).append(
+                        attention_payload(attention_heads(output, layer_mixer.num_heads, layer_mixer.head_dim))
+                    )
+
+                def capture_post_gate(
+                    _module,
+                    args,
+                    *,
+                    destination=attention_stages,
+                    replays=attention_replays,
+                    cores=attention_core_tensors,
+                    gates=attention_gate_tensors,
+                ):
+                    post_gate = args[0]
+                    destination.setdefault("post_gate", []).append(tensor_payload(post_gate))
+                    if len(cores) != 1 or len(gates) != 1:
+                        raise RuntimeError(f"Expected one attention core and gate, got {len(cores)} and {len(gates)}")
+                    replays.setdefault("post_gate", []).append(tensor_payload(cores[0] * torch.sigmoid(gates[0])))
+
+                layer_hooks.extend(
+                    (
+                        mixer.register_forward_pre_hook(capture_attention_input, with_kwargs=True),
+                        mixer.qkv_proj.register_forward_hook(capture_qkv),
+                        mixer.attn.register_forward_pre_hook(capture_attention_backend_input),
+                        mixer.attn.register_forward_hook(capture_attention_backend_output),
+                        mixer.o_proj.register_forward_pre_hook(capture_post_gate),
+                        mixer.o_proj.register_forward_hook(
+                            lambda module, args, output, destination=attention_stages: capture_output(
+                                module,
+                                args,
+                                {},
+                                output,
+                                destination=destination,
+                                key="out_proj",
+                            )
+                        ),
+                    )
+                )
             if layer_index == 0:
                 mlp_stages = {}
                 mlp_replays = {}
@@ -1889,6 +2141,14 @@ class WorkerWrap:
                         )
                     layer_entry["mixer_stages"][key] = values[0]
                 for capture_name in ("mlp_stages", "mlp_replays"):
+                    for key, values in layer_entry.get(capture_name, {}).items():
+                        if len(values) != 1:
+                            raise RuntimeError(
+                                f"Expected one vLLM {key} {capture_name} capture in layer "
+                                f"{layer_entry['layer']}, got {len(values)}"
+                            )
+                        layer_entry[capture_name][key] = values[0]
+                for capture_name in ("attention_stages", "attention_replays"):
                     for key, values in layer_entry.get(capture_name, {}).items():
                         if len(values) != 1:
                             raise RuntimeError(

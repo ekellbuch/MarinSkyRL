@@ -12,8 +12,10 @@ import torch
 from fla.modules.l2norm import l2norm_fwd
 from torch.distributed.tensor import DTensor
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    apply_rotary_pos_emb,
     chunk_gated_delta_rule as transformers_chunk_gated_delta_rule,
     is_fast_path_available,
+    repeat_kv,
     torch_chunk_gated_delta_rule,
 )
 
@@ -184,6 +186,24 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                     "values": tensor.detach().float().cpu().tolist(),
                     "dtype": str(tensor.dtype),
                     "shape": list(tensor.shape),
+                }
+
+            def attention_payload(sequence_heads):
+                if sequence_heads.ndim != 3:
+                    raise RuntimeError(
+                        f"Expected attention tensor [tokens, heads, head_dim], got {sequence_heads.shape}"
+                    )
+                last_token = sequence_heads[-1].reshape(-1)
+                return {
+                    "values": last_token.detach().float().cpu().tolist(),
+                    "dtype": str(sequence_heads.dtype),
+                    "shape": list(last_token.shape),
+                    "sequence_shape": list(sequence_heads.shape),
+                    "sequence_fingerprint": canonical_tensor_fingerprint(sequence_heads),
+                    "token_fingerprints": [
+                        canonical_tensor_fingerprint(sequence_heads[index : index + 1])
+                        for index in range(sequence_heads.shape[0])
+                    ],
                 }
 
             output_embeddings = model.get_output_embeddings()
@@ -649,6 +669,167 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                             )
                         )
 
+                if layer_index == 3 and mixer_name == "self_attn":
+                    attention_stages = {}
+                    attention_replays = {}
+                    attention_inputs = []
+                    entry["attention_stages"] = attention_stages
+                    entry["attention_replays"] = attention_replays
+
+                    def capture_attention_input(
+                        _module,
+                        args,
+                        kwargs,
+                        *,
+                        inputs=attention_inputs,
+                    ):
+                        hidden_states = kwargs.get("hidden_states")
+                        if hidden_states is None:
+                            hidden_states = args[0]
+                        position_embeddings = kwargs.get("position_embeddings")
+                        if position_embeddings is None:
+                            position_embeddings = args[1]
+                        attention_mask_value = kwargs.get("attention_mask")
+                        if attention_mask_value is None and len(args) > 2:
+                            attention_mask_value = args[2]
+                        inputs.append((hidden_states, position_embeddings, attention_mask_value))
+
+                    def capture_q_gate(_module, _args, output, *, destination=attention_stages, layer_mixer=mixer):
+                        input_shape = output.shape[:-1]
+                        q_gate = output.view(*input_shape, layer_mixer.config.num_attention_heads, -1)
+                        query, gate = torch.chunk(q_gate, 2, dim=-1)
+                        destination.setdefault("q_raw", []).append(attention_payload(query[0]))
+                        destination.setdefault("gate", []).append(attention_payload(gate[0]))
+
+                    def capture_kv(
+                        _module,
+                        _args,
+                        output,
+                        *,
+                        destination=attention_stages,
+                        key,
+                        layer_mixer=mixer,
+                    ):
+                        heads = layer_mixer.config.num_key_value_heads
+                        sequence_heads = output.view(output.shape[0], output.shape[1], heads, layer_mixer.head_dim)[0]
+                        destination.setdefault(key, []).append(attention_payload(sequence_heads))
+
+                    def capture_attention_norm(
+                        _module,
+                        _args,
+                        output,
+                        *,
+                        destination=attention_stages,
+                        key,
+                    ):
+                        destination.setdefault(key, []).append(attention_payload(output[0]))
+
+                    def replay_attention(
+                        _module,
+                        _args,
+                        _kwargs,
+                        _output,
+                        *,
+                        inputs=attention_inputs,
+                        destination=attention_replays,
+                        layer_mixer=mixer,
+                    ):
+                        if len(inputs) != 1:
+                            raise RuntimeError(f"Expected one learner attention input, got {len(inputs)}")
+                        hidden_states, position_embeddings, attention_mask_value = inputs[0]
+                        input_shape = hidden_states.shape[:-1]
+                        hidden_shape = (*input_shape, -1, layer_mixer.head_dim)
+                        q_gate = torch.nn.functional.linear(
+                            hidden_states,
+                            layer_mixer.q_proj.weight,
+                            layer_mixer.q_proj.bias,
+                        ).view(*input_shape, -1, layer_mixer.head_dim * 2)
+                        query, gate = torch.chunk(q_gate, 2, dim=-1)
+                        gate = gate.reshape(*input_shape, -1)
+                        query = layer_mixer.q_norm.forward(query.view(hidden_shape)).transpose(1, 2)
+                        key = layer_mixer.k_norm.forward(
+                            torch.nn.functional.linear(
+                                hidden_states,
+                                layer_mixer.k_proj.weight,
+                                layer_mixer.k_proj.bias,
+                            ).view(hidden_shape)
+                        ).transpose(1, 2)
+                        value = (
+                            torch.nn.functional.linear(
+                                hidden_states,
+                                layer_mixer.v_proj.weight,
+                                layer_mixer.v_proj.bias,
+                            )
+                            .view(hidden_shape)
+                            .transpose(1, 2)
+                        )
+                        cos, sin = position_embeddings
+                        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+                        destination.setdefault("q_rope", []).append(attention_payload(query[0].transpose(0, 1)))
+                        destination.setdefault("k_rope", []).append(attention_payload(key[0].transpose(0, 1)))
+                        destination.setdefault("v", []).append(attention_payload(value[0].transpose(0, 1)))
+
+                        repeated_key = repeat_kv(key, layer_mixer.num_key_value_groups)
+                        repeated_value = repeat_kv(value, layer_mixer.num_key_value_groups)
+                        weights = torch.matmul(query, repeated_key.transpose(2, 3)) * layer_mixer.scaling
+                        if attention_mask_value is not None:
+                            weights = weights + attention_mask_value
+                        weights = torch.nn.functional.softmax(weights, dim=-1, dtype=torch.float32).to(query.dtype)
+                        core = torch.matmul(weights, repeated_value).transpose(1, 2).contiguous()
+                        destination.setdefault("attention_core", []).append(attention_payload(core[0]))
+                        post_gate = core.reshape(*input_shape, -1).contiguous() * torch.sigmoid(gate)
+                        destination.setdefault("post_gate", []).append(tensor_payload(post_gate))
+                        projected = torch.nn.functional.linear(
+                            post_gate,
+                            layer_mixer.o_proj.weight,
+                            layer_mixer.o_proj.bias,
+                        )
+                        destination.setdefault("out_proj", []).append(tensor_payload(projected))
+
+                    hook_registrations.extend(
+                        (
+                            partial(mixer.register_forward_pre_hook, capture_attention_input, with_kwargs=True),
+                            partial(mixer.q_proj.register_forward_hook, capture_q_gate),
+                            partial(
+                                mixer.k_proj.register_forward_hook,
+                                lambda module, args, output, destination=attention_stages: capture_kv(
+                                    module, args, output, destination=destination, key="k_raw"
+                                ),
+                            ),
+                            partial(
+                                mixer.v_proj.register_forward_hook,
+                                lambda module, args, output, destination=attention_stages: capture_kv(
+                                    module, args, output, destination=destination, key="v_raw"
+                                ),
+                            ),
+                            partial(
+                                mixer.q_norm.register_forward_hook,
+                                lambda module, args, output, destination=attention_stages: capture_attention_norm(
+                                    module, args, output, destination=destination, key="q_norm"
+                                ),
+                            ),
+                            partial(
+                                mixer.k_norm.register_forward_hook,
+                                lambda module, args, output, destination=attention_stages: capture_attention_norm(
+                                    module, args, output, destination=destination, key="k_norm"
+                                ),
+                            ),
+                            partial(
+                                mixer.o_proj.register_forward_pre_hook,
+                                lambda module, args, destination=attention_stages: destination.setdefault(
+                                    "post_gate", []
+                                ).append(tensor_payload(args[0])),
+                            ),
+                            partial(
+                                mixer.o_proj.register_forward_hook,
+                                lambda module, args, output, destination=attention_stages: destination.setdefault(
+                                    "out_proj", []
+                                ).append(tensor_payload(output)),
+                            ),
+                            partial(mixer.register_forward_hook, replay_attention, with_kwargs=True),
+                        )
+                    )
+
                 def capture_input(_module, args, kwargs, *, destination=entry, key="mixer_input"):
                     hidden_states = kwargs.get("hidden_states")
                     if hidden_states is None:
@@ -908,6 +1089,14 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                     f"{layer_entry['layer']}, got {len(values)}"
                                 )
                             layer_entry["mlp_stages"][key] = values[0]
+                        for capture_name in ("attention_stages", "attention_replays"):
+                            for key, values in layer_entry.get(capture_name, {}).items():
+                                if len(values) != 1:
+                                    raise RuntimeError(
+                                        f"Expected one learner {key} {capture_name} capture in layer "
+                                        f"{layer_entry['layer']}, got {len(values)}"
+                                    )
+                                layer_entry[capture_name][key] = values[0]
                         compact_layer_capture(layer_entry, "fla_core", "FLA core")
                         compact_layer_capture(layer_entry, "causal_conv", "causal-convolution")
                     result["layer_trace"] = layer_captures

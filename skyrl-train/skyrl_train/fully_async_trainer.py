@@ -44,6 +44,12 @@ from skyrl_train.dynamic_sampling import (
     resolve_dynamic_sampling_criteria,
 )
 from skyrl_train.group_admission import AdmissionDecision, AdmissionRejection, GroupAdmissionPolicy
+from skyrl_train.sampler_ledger import (
+    DATASET_SELECTION_SOURCE,
+    SAMPLER_ATTEMPT_ID_KEY,
+    STALE_RETRY_SELECTION_SOURCE,
+    SamplerLedger,
+)
 from skyrl_train.utils.algorithm_registry import policy_loss_requires_rollout_logprobs
 
 
@@ -119,6 +125,7 @@ class _AdmissionPartition:
 class _CandidateSelection:
     admitted_groups: List[GeneratedOutputGroup]
     surplus_groups: List[GeneratedOutputGroup]
+    discarded_groups: List[tuple[GeneratedOutputGroup, GroupSelectionResult]]
     discarded_reasons: collections.Counter[str]
     candidate_count: int
 
@@ -413,6 +420,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             num_steps_per_epoch=self.num_steps_per_epoch,
         )
         self.async_train_dataloader = _AsyncDataloader(self.train_dataloader, self.mini_batch_size, self.data_tracker)
+        self.sampler_ledger = SamplerLedger.from_config(
+            OmegaConf.select(self.cfg, "trainer.sampler_ledger", default=None)
+        )
         # Register the data tracking callback for checkpoint persistence and epoch transitions
         self.callback_handler.add_callback(DataTrackingCallback(self.data_tracker))
         # Register buffer checkpoint callback for saving/restoring generation buffer on resume
@@ -948,7 +958,21 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         try:
             while True:
                 slot_acquired = False
-                rand_prompts = await self._next_generation_prompts(queues)
+                rand_prompts, selection_source = await self._next_generation_prompts(queues)
+                sampler_ledger = getattr(self, "sampler_ledger", None)
+                attempt_id = (
+                    sampler_ledger.record_selection(
+                        rand_prompts,
+                        optimizer_step=self.global_step,
+                        selection_source=selection_source,
+                    )
+                    if sampler_ledger is not None
+                    else None
+                )
+                task_id = rand_prompts[0]["uid"]
+                if sampler_ledger is not None:
+                    await sampler_ledger.wait_until_ready(task_id)
+                rand_prompts = [dict(prompt, **{SAMPLER_ATTEMPT_ID_KEY: attempt_id}) for prompt in rand_prompts]
                 await self._staleness_manager.acquire_submission_slot()
                 slot_acquired = True
                 assert len(rand_prompts) == 1
@@ -986,6 +1010,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 )
                 freshness = await self._enqueue_if_fresh(queues, completed_group)
                 if freshness is _GroupFreshness.STALE:
+                    if sampler_ledger is not None:
+                        sampler_ledger.record_outcome(
+                            attempt_id,
+                            optimizer_step=self.global_step,
+                            outcome="stale",
+                            task_id=task_id,
+                        )
                     await self._staleness_manager.cancel_submission_slot()
                     slot_acquired = False
                     self._record_admission_scan(
@@ -1020,24 +1051,30 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
     async def _next_generation_prompts(
         self,
         queues: _GenerationQueues,
-    ) -> List[dict]:
+    ) -> tuple[List[dict], str]:
         """Prefer retries and wait for one after the epoch's dataset rows are scheduled.
+
+        Returns one prompt group and its selection source, either ``dataset``
+        or ``stale_retry``.
 
         Raises ``GenerationStalledError`` when the dataset is exhausted and no
         retries arrive within the stall deadline, so the caller can end the
         epoch instead of blocking forever.
         """
         try:
-            return queues.retries.get_nowait()
+            return queues.retries.get_nowait(), STALE_RETRY_SELECTION_SOURCE
         except asyncio.QueueEmpty:
             prompts = await self.async_train_dataloader.get_next_non_consumed_data()
             if prompts is not None:
-                return prompts
+                return prompts, DATASET_SELECTION_SOURCE
 
         try:
-            return await asyncio.wait_for(
-                queues.retries.get(),
-                timeout=self._generation_stall_timeout(),
+            return (
+                await asyncio.wait_for(
+                    queues.retries.get(),
+                    timeout=self._generation_stall_timeout(),
+                ),
+                STALE_RETRY_SELECTION_SOURCE,
             )
         except asyncio.TimeoutError:
             raise GenerationStalledError("Dataset exhausted and no retries arrived within the stall deadline")
@@ -1234,6 +1271,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         available_slots: int,
     ) -> _CandidateSelection:
         admitted_groups = []
+        discarded_groups = []
         discarded_reasons: collections.Counter[str] = collections.Counter()
         candidate_count = 0
 
@@ -1242,6 +1280,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 return _CandidateSelection(
                     admitted_groups=admitted_groups,
                     surplus_groups=candidates[candidate_index:],
+                    discarded_groups=discarded_groups,
                     discarded_reasons=discarded_reasons,
                     candidate_count=candidate_count,
                 )
@@ -1251,11 +1290,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             if selection_result is GroupSelectionResult.KEEP:
                 admitted_groups.append(group)
             else:
+                discarded_groups.append((group, selection_result))
                 discarded_reasons[selection_result.value] += 1
 
         return _CandidateSelection(
             admitted_groups=admitted_groups,
             surplus_groups=[],
+            discarded_groups=discarded_groups,
             discarded_reasons=discarded_reasons,
             candidate_count=candidate_count,
         )
@@ -1312,6 +1353,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 dynamic_discarded_count += dynamic_discarded_this_scan
                 rejection_counts_since_admission.update(selection.discarded_reasons)
 
+                for group, decision in partition.rejected_groups:
+                    assert decision.primary_rejection is not None
+                    self._record_sampler_group_outcome(group, decision.primary_rejection.value)
+                for group, decision in partition.discarded_groups:
+                    assert decision.primary_rejection is not None
+                    self._record_sampler_group_outcome(group, decision.primary_rejection.value)
+                for group, selection_result in selection.discarded_groups:
+                    self._record_sampler_group_outcome(group, selection_result.value)
+                for group in selection.admitted_groups:
+                    self._record_sampler_group_outcome(group, "admitted")
+
                 for group in selection.surplus_groups:
                     queues.completed.put_nowait(group)
 
@@ -1355,6 +1407,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             dynamic_discarded_count=dynamic_discarded_count,
         )
         return batch
+
+    def _record_sampler_group_outcome(self, group: GeneratedOutputGroup, outcome: str) -> None:
+        sampler_ledger = getattr(self, "sampler_ledger", None)
+        if sampler_ledger is None:
+            return
+        prompt = group.source_prompts[0]
+        sampler_ledger.record_outcome(
+            prompt.get(SAMPLER_ATTEMPT_ID_KEY),
+            optimizer_step=self.global_step,
+            outcome=outcome,
+            task_id=group.uid,
+        )
 
     def convert_generation_group_mini_batch_to_training_input(
         self, cur_generation_group_mini_batch: List[GeneratedOutputGroup]

@@ -23,7 +23,12 @@ from skyrl_train.utils.loss_reduction import (
     build_think_weighted_loss_mask,
     reduce_loss,
 )
-from skyrl_train.utils.algorithm_registry import PolicyLossType, register_policy_loss
+from skyrl_train.utils.algorithm_registry import (
+    DPPODivergenceType,
+    PolicyLossType,
+    policy_loss_requires_rollout_logprobs,
+    register_policy_loss,
+)
 from skyrl_train.utils.policy_math import LOG_PROB_DELTA_CLIP, compute_approx_kl, masked_mean, safe_exp_delta
 
 
@@ -50,11 +55,6 @@ class LossScaling(StrEnum):
 
     CALLER = "caller"
     MEGATRON_PIPELINE = "megatron_pipeline"
-
-
-class DPPODivergenceType(StrEnum):
-    TV = "tv"
-    KL = "kl"
 
 
 @dataclass(frozen=True)
@@ -195,7 +195,7 @@ def _policy_objective_metrics(
     config: DictConfig,
 ) -> dict[str, float]:
     metrics = complete_clip_metrics(policy_loss_metrics)
-    if config.use_tis or config.get("policy_loss_type") in (PolicyLossType.BEHAVIOR_CLIP, PolicyLossType.DPPO):
+    if config.use_tis or policy_loss_requires_rollout_logprobs(config.get("policy_loss_type")):
         metrics.update(
             compute_tis_diagnostics(
                 old_action_log_probs,
@@ -413,7 +413,7 @@ def compute_dppo_mask(
     divergence_type: str,
     divergence_threshold: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute the directional DPPO mask from the pinned TMax implementation."""
+    """Return the directional keep mask and response-masked token divergence."""
     if response_mask is None:
         response_mask = torch.ones_like(policy_logprobs, dtype=torch.bool)
     else:

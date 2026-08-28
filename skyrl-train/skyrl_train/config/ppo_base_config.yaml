@@ -254,6 +254,12 @@ trainer:
     num_parallel_generation_workers: 768
     admission_stall_timeout: 21600
 
+  sampler_ledger:
+    path: null
+    ready_dir: null
+    ready_timeout_seconds: 1800
+    ready_poll_seconds: 0.5
+
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
   seed: 42

@@ -23,7 +23,7 @@ def _record_vllm_reload_metadata(module: nn.Module) -> None:
 
 
 def configure_hf_lm_head_compute_dtype(model: nn.Module, dtype_name: str | None) -> bool:
-    """Run a Hugging Face causal LM's final projection in the requested dtype."""
+    """Configure the final projection and report whether it changed."""
     if dtype_name is None:
         return False
     if dtype_name != FP32_DTYPE_NAME:
@@ -44,8 +44,8 @@ def configure_hf_lm_head_compute_dtype(model: nn.Module, dtype_name: str | None)
     return True
 
 
-def restore_vllm_lm_head_compute_dtype(model: Any, dtype_name: str | None = None) -> bool:
-    """Restore the configured vLLM projection dtype after a weight update."""
+def ensure_vllm_lm_head_compute_dtype(model: Any, dtype_name: str | None = None) -> bool:
+    """Configure or refresh a vLLM projection and report whether one qualified."""
     if dtype_name is not None and dtype_name != FP32_DTYPE_NAME:
         raise ValueError(f"Unsupported lm_head_compute_dtype: {dtype_name}")
     candidates = (model, getattr(model, "language_model", None))
@@ -96,7 +96,7 @@ def patch_vllm_model_class_lm_head_compute_dtype(model_class: type, dtype_name: 
     @functools.wraps(original_init)
     def fp32_init(self, *args, **kwargs) -> None:
         original_init(self, *args, **kwargs)
-        if not restore_vllm_lm_head_compute_dtype(self):
+        if not ensure_vllm_lm_head_compute_dtype(self):
             raise TypeError("lm_head_compute_dtype requires a vLLM model with a floating-point lm_head")
 
     @functools.wraps(original_compute_logits)
@@ -115,7 +115,7 @@ def configure_vllm_model_instance_lm_head_compute_dtype(model: Any, dtype_name: 
     """Configure an already-created vLLM model inside its EngineCore process."""
     candidate = getattr(model, "language_model", None) or model
     patch_vllm_model_class_lm_head_compute_dtype(type(candidate), dtype_name)
-    if not restore_vllm_lm_head_compute_dtype(model, dtype_name):
+    if not ensure_vllm_lm_head_compute_dtype(model, dtype_name):
         raise TypeError("lm_head_compute_dtype requires a vLLM model with a floating-point lm_head")
 
 

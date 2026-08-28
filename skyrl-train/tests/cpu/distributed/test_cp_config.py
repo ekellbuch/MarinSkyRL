@@ -75,9 +75,17 @@ RUNTIME_CONFIG_TRAINER_FIELDS = {
         "percent_step": 5.0,
         "count_step": 1000,
     },
+    "sampler_ledger": {
+        "path": None,
+        "ready_dir": None,
+        "ready_timeout_seconds": 1800,
+        "ready_poll_seconds": 0.5,
+    },
 }
 ADDITIVE_ALGORITHM_FIELDS = {
     "batch_invariant": False,
+    "dppo_divergence_threshold": 0.1,
+    "dppo_divergence_type": "tv",
 }
 ADDITIVE_DYNAMIC_SAMPLING_FIELDS = {
     "informative_on": "shaped",
@@ -96,11 +104,13 @@ ADDITIVE_GENERATOR_FIELDS = {
     "r3_dispatch_put_timeout_seconds": 600,
     "coordinator_executor_workers": 256,
     "gdn_backend": "torch",
+    "max_logprobs": 1,
 }
 ADDITIVE_TEACHER_FIELDS = {
     "engine_init_timeout_seconds": "${generator.engine_init_timeout_seconds}",
 }
 ADDITIVE_POLICY_MODEL_FIELDS = {
+    "lm_head_compute_dtype": None,
     "source_uri": None,
     "source_identity": None,
 }

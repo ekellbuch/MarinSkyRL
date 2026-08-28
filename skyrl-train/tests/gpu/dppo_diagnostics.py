@@ -181,11 +181,16 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
             def token_heads_payload(tensor, num_heads):
                 if tensor.ndim != 2 or tensor.shape[0] < num_heads:
                     raise RuntimeError(f"Expected flattened token heads [tokens * heads, head_dim], got {tensor.shape}")
-                tensor = tensor[-num_heads:].reshape(-1)
+                token_heads = tensor.reshape(-1, num_heads, tensor.shape[-1])
+                last_token = token_heads[-1].reshape(-1)
                 return {
-                    "values": tensor.detach().float().cpu().tolist(),
+                    "values": last_token.detach().float().cpu().tolist(),
                     "dtype": str(tensor.dtype),
-                    "shape": list(tensor.shape),
+                    "shape": list(last_token.shape),
+                    "token_fingerprints": [
+                        canonical_tensor_fingerprint(token_heads[index : index + 1])
+                        for index in range(token_heads.shape[0])
+                    ],
                 }
 
             def attention_payload(sequence_heads):
@@ -907,6 +912,7 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                 kwargs,
                                 destination=destination,
                                 key="out_proj_input",
+                                trace_tokens=True,
                             ),
                             with_kwargs=True,
                         )
@@ -921,6 +927,7 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                 output,
                                 destination=destination,
                                 key="out_proj_output",
+                                trace_tokens=True,
                             ),
                             with_kwargs=True,
                         )

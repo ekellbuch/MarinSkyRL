@@ -805,18 +805,26 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                 for stage_name, learner_stage in learner_stages.items():
                                     engine_stage = engine_stages[stage_name]
                                     assert learner_stage["shape"] == engine_stage["shape"]
-                                    stage_diagnostics.append(
-                                        {
-                                            "stage": stage_name,
-                                            "learner_dtype": learner_stage["dtype"],
-                                            "engine_dtype": engine_stage["dtype"],
-                                            "shape": learner_stage["shape"],
-                                            "error": _head_input_error_summary(
-                                                learner_stage.pop("values"),
-                                                engine_stage.pop("values"),
-                                            ),
-                                        }
-                                    )
+                                    stage_diagnostic = {
+                                        "stage": stage_name,
+                                        "learner_dtype": learner_stage["dtype"],
+                                        "engine_dtype": engine_stage["dtype"],
+                                        "shape": learner_stage["shape"],
+                                        "error": _head_input_error_summary(
+                                            learner_stage.pop("values"),
+                                            engine_stage.pop("values"),
+                                        ),
+                                    }
+                                    learner_tokens = learner_stage.pop("token_fingerprints", None)
+                                    engine_tokens = engine_stage.pop("token_fingerprints", None)
+                                    assert (learner_tokens is None) == (engine_tokens is None)
+                                    if learner_tokens is not None:
+                                        assert engine_tokens is not None
+                                        stage_diagnostic["token_fingerprints"] = _token_fingerprint_summary(
+                                            learner_tokens,
+                                            engine_tokens,
+                                        )
+                                    stage_diagnostics.append(stage_diagnostic)
                             mlp_stage_diagnostics = None
                             learner_mlp_stages = learner_layer.pop("mlp_stages", None)
                             engine_mlp_stages = engine_layer.pop("mlp_stages", None)

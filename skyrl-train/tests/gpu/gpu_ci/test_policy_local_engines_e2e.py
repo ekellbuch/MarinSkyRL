@@ -271,6 +271,10 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             cfg.trainer.algorithm.use_kl_loss = False
             cfg.trainer.algorithm.use_kl_in_reward = False
             cfg.trainer.algorithm.use_tis = False
+            with open_dict(cfg.trainer.algorithm):
+                cfg.trainer.algorithm.max_seq_len = (
+                    cfg.generator.max_input_length + cfg.generator.sampling_params.max_generate_length
+                )
             cfg.trainer.train_batch_size = 1
             cfg.trainer.policy_mini_batch_size = 1
             cfg.trainer.micro_forward_batch_size_per_gpu = 1

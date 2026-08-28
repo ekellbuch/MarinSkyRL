@@ -775,6 +775,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                             ),
                                         }
                                     )
+                            fla_core = engine_layer.pop("fla_core", None)
                             boundary_diagnostics = []
                             for boundary in ("mixer_input", "mixer_output", "mlp_input", "mlp_output"):
                                 learner_boundary = learner_layer[boundary]
@@ -797,6 +798,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                     "layer": learner_layer["layer"],
                                     "mixer": learner_layer["mixer"],
                                     "boundaries": boundary_diagnostics,
+                                    "fla_core": fla_core,
                                     "projections": projection_diagnostics,
                                     "mixer_stages": stage_diagnostics,
                                 }

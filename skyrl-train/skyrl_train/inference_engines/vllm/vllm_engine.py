@@ -1038,6 +1038,16 @@ class WorkerWrap:
             for key, tensor in zip(keys, projected.split(sizes, dim=-1), strict=True):
                 destination.setdefault(key, []).append(tensor_payload(tensor))
 
+        def exact_error_summary(actual, expected):
+            difference = (actual.float() - expected.float()).abs().reshape(-1)
+            return {
+                "exact": bool(torch.equal(actual, expected)),
+                "max": float(difference.max().item()),
+                "mismatch_count": int(torch.count_nonzero(difference).item()),
+                "p95": float(torch.quantile(difference, 0.95).item()),
+                "shape": list(actual.shape),
+            }
+
         language_model = getattr(model, "language_model", None)
         text_model = getattr(language_model, "model", None)
         layers = getattr(text_model, "layers", ())
@@ -1054,6 +1064,9 @@ class WorkerWrap:
                 entry["projections"] = projections
                 stages = {}
                 entry["mixer_stages"] = stages
+                fla_inputs = []
+                fla_captures = []
+                entry["fla_core"] = fla_captures
                 if hasattr(mixer, "in_proj_qkv"):
                     layer_hooks.extend(
                         (
@@ -1107,6 +1120,119 @@ class WorkerWrap:
                             sizes=(ba_size, ba_size),
                         )
                     )
+                )
+
+                def capture_fla_input(_module, args, kwargs, *, destination=fla_inputs):
+                    argument_names = (
+                        "q",
+                        "k",
+                        "v",
+                        "g",
+                        "beta",
+                        "initial_state",
+                        "output_final_state",
+                        "cu_seqlens",
+                        "chunk_indices",
+                        "chunk_offsets",
+                        "use_qk_l2norm_in_kernel",
+                    )
+                    values = {
+                        name: kwargs[name] if name in kwargs else args[index]
+                        for index, name in enumerate(argument_names)
+                    }
+                    if values["use_qk_l2norm_in_kernel"]:
+                        raise RuntimeError("Expected pre-normalized Q/K in the Qwen3.5 prefill path")
+                    destination.append(
+                        {
+                            name: value.detach().clone() if isinstance(value, torch.Tensor) else value
+                            for name, value in values.items()
+                        }
+                    )
+
+                def capture_fla_output(
+                    _module,
+                    _args,
+                    _kwargs,
+                    output,
+                    *,
+                    source=fla_inputs,
+                    destination=fla_captures,
+                ):
+                    if len(source) != 1:
+                        raise RuntimeError(f"Expected one pending FLA input capture, got {len(source)}")
+                    values = source.pop()
+                    live_output, live_final_state = output
+
+                    from fla.ops.gated_delta_rule.chunk import (
+                        chunk_gated_delta_rule_fwd as released_chunk_gated_delta_rule_fwd,
+                    )
+                    from vllm.model_executor.layers.fla.ops.chunk import (
+                        chunk_gated_delta_rule_fwd as vllm_chunk_gated_delta_rule_fwd,
+                    )
+
+                    released_g, released_output, released_A, released_final_state, _ = (
+                        released_chunk_gated_delta_rule_fwd(
+                            q=values["q"].clone(),
+                            k=values["k"].clone(),
+                            v=values["v"].clone(),
+                            g=values["g"].clone(),
+                            beta=values["beta"].clone(),
+                            scale=values["k"].shape[-1] ** -0.5,
+                            initial_state=values["initial_state"].clone(),
+                            output_final_state=values["output_final_state"],
+                            cu_seqlens=values["cu_seqlens"],
+                            chunk_indices=values["chunk_indices"],
+                        )
+                    )
+                    (
+                        vllm_g,
+                        vllm_output,
+                        vllm_A,
+                        vllm_final_state,
+                        _,
+                        _,
+                        _,
+                    ) = vllm_chunk_gated_delta_rule_fwd(
+                        q=values["q"].clone(),
+                        k=values["k"].clone(),
+                        v=values["v"].clone(),
+                        g=values["g"].clone(),
+                        beta=values["beta"].clone(),
+                        scale=values["k"].shape[-1] ** -0.5,
+                        initial_state=values["initial_state"].clone(),
+                        output_final_state=values["output_final_state"],
+                        cu_seqlens=values["cu_seqlens"],
+                        chunk_indices=values["chunk_indices"],
+                        chunk_offsets=values["chunk_offsets"],
+                    )
+                    destination.append(
+                        {
+                            "inputs": {
+                                name: canonical_tensor_fingerprint(values[name])
+                                for name in ("q", "k", "v", "g", "beta", "initial_state")
+                            },
+                            "metadata": {
+                                name: values[name].detach().cpu().tolist()
+                                for name in ("cu_seqlens", "chunk_indices", "chunk_offsets")
+                            },
+                            "live_vs_vllm_replay": {
+                                "output": exact_error_summary(live_output, vllm_output),
+                                "final_state": exact_error_summary(live_final_state, vllm_final_state),
+                            },
+                            "vllm_vs_released": {
+                                "g": exact_error_summary(vllm_g, released_g),
+                                "A": exact_error_summary(vllm_A, released_A),
+                                "output": exact_error_summary(vllm_output, released_output),
+                                "final_state": exact_error_summary(vllm_final_state, released_final_state),
+                            },
+                        }
+                    )
+
+                layer_hooks.append(
+                    mixer.chunk_gated_delta_rule.register_forward_pre_hook(capture_fla_input, with_kwargs=True)
+                )
+                layer_hooks.append(
+                    mixer.chunk_gated_delta_rule.register_forward_hook(capture_fla_output, with_kwargs=True)
                 )
 
                 def capture_norm_input(
@@ -1284,6 +1410,13 @@ class WorkerWrap:
                             f"Expected one vLLM {key} stage capture in layer {layer_entry['layer']}, got {len(values)}"
                         )
                     layer_entry["mixer_stages"][key] = values[0]
+                fla_core = layer_entry.get("fla_core")
+                if fla_core is not None:
+                    if len(fla_core) != 1:
+                        raise RuntimeError(
+                            f"Expected one vLLM FLA core capture in layer {layer_entry['layer']}, got {len(fla_core)}"
+                        )
+                    layer_entry["fla_core"] = fla_core[0]
             captures[0]["layer_trace"] = self._skyrl_layer_captures
         del self._skyrl_original_compute_logits
         del self._skyrl_had_instance_compute_logits

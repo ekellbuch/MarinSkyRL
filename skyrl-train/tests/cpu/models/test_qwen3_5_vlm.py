@@ -24,22 +24,29 @@ def test_remove_vision_no_split_modules_keeps_text_classes():
         (
             "model.language_model.layers.0.input_layernorm.weight",
             False,
-            ("language_model.model.layers.0.input_layernorm.weight",),
+            (
+                "model.language_model.layers.0.input_layernorm.weight",
+                "language_model.model.layers.0.input_layernorm.weight",
+            ),
         ),
         (
             "model.embed_tokens.weight",
             False,
-            ("language_model.model.embed_tokens.weight",),
+            ("model.embed_tokens.weight", "language_model.model.embed_tokens.weight"),
         ),
         (
             "lm_head.weight",
             False,
-            ("language_model.lm_head.weight",),
+            ("lm_head.weight", "language_model.lm_head.weight"),
         ),
         (
             "lm_head.weight",
             True,
-            ("language_model.lm_head.weight", "language_model.model.embed_tokens.weight"),
+            (
+                "lm_head.weight",
+                "language_model.lm_head.weight",
+                "language_model.model.embed_tokens.weight",
+            ),
         ),
         ("visual.patch_embed.weight", False, ("visual.patch_embed.weight",)),
     ],

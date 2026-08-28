@@ -31,6 +31,7 @@ LM_HEAD_COMPUTE_DTYPE = os.environ.get("SKYRL_GPU_TEST_LM_HEAD_COMPUTE_DTYPE")
 FLASH_ATTN = os.environ.get("SKYRL_GPU_TEST_FLASH_ATTN", "0") == "1"
 VERIFY_PARITY = os.environ.get("SKYRL_GPU_TEST_VERIFY_PARITY", "0") == "1"
 VERIFY_DPPO_UPDATE = os.environ.get("SKYRL_GPU_TEST_VERIFY_DPPO_UPDATE", "0") == "1"
+EXPECTED_VLLM_ENGINE_SHA256 = os.environ.get("SKYRL_GPU_TEST_VLLM_ENGINE_SHA256")
 PARITY_PROMPTS = (
     "Reply with four words about the sky.",
     "Name four common kitchen items.",
@@ -173,6 +174,22 @@ def _error_summary(values: list[dict]) -> dict:
     }
 
 
+def _head_input_error_summary(learner_values: list[float], engine_values: list[float]) -> dict:
+    assert len(learner_values) == len(engine_values)
+    absolute_errors = [abs(learner - engine) for learner, engine in zip(learner_values, engine_values, strict=True)]
+    first_mismatch = next((index for index, error in enumerate(absolute_errors) if error != 0.0), None)
+    return {
+        "elements": len(absolute_errors),
+        "exact": first_mismatch is None,
+        "first_mismatch": first_mismatch,
+        "max_absolute_error": max(absolute_errors),
+        "p50_absolute_error": _percentile(absolute_errors, 0.50),
+        "p95_absolute_error": _percentile(absolute_errors, 0.95),
+        "learner_at_first_mismatch": None if first_mismatch is None else learner_values[first_mismatch],
+        "engine_at_first_mismatch": None if first_mismatch is None else engine_values[first_mismatch],
+    }
+
+
 def _logprob_error_gate(summary: dict) -> dict:
     absolute_error = summary["absolute_error"]
     return {
@@ -299,6 +316,23 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             sleep_level=2,  # since we explicitly sync weights
         )
 
+        if VERIFY_PARITY:
+            assert EXPECTED_VLLM_ENGINE_SHA256 is not None, (
+                "SKYRL_GPU_TEST_VLLM_ENGINE_SHA256 must identify the prepared checkout"
+            )
+            engine_actor = client.engines[0].inference_engine_actor
+            runtime_installations = ray.get(
+                engine_actor.report_runtime_installation.remote(EXPECTED_VLLM_ENGINE_SHA256)
+            )
+            if isinstance(runtime_installations, dict):
+                runtime_installations = [runtime_installations]
+            assert runtime_installations
+            assert all(
+                installation["matches_checkout"] and installation["vllm_engine_sha256"] == EXPECTED_VLLM_ENGINE_SHA256
+                for installation in runtime_installations
+            ), runtime_installations
+            print(f"SKYRL_ENGINECORE_RUNTIME_RESULT {json.dumps(runtime_installations, sort_keys=True)}")
+
         policy = init_worker_with_type(
             "policy",
             shared_pg=pg,
@@ -354,19 +388,18 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             print(f"SKYRL_DPPO_PARITY_RESULT {json.dumps(payload, sort_keys=True, allow_nan=False)}")
 
         def verify_synced_weights(update_index: int):
-            weight_names = [
+            representative_names = [
                 "model.language_model.embed_tokens.weight",
                 "model.language_model.layers.0.input_layernorm.weight",
                 "lm_head.weight",
             ]
             policy_fingerprints = {}
-            per_rank = ray.get(
-                policy.async_run_ray_method("pass_through", "fingerprint_broadcast_weights", weight_names)
-            )
+            per_rank = ray.get(policy.async_run_ray_method("pass_through", "fingerprint_broadcast_weights"))
             for rank_fingerprints in per_rank:
                 if isinstance(rank_fingerprints, dict):
                     policy_fingerprints.update(rank_fingerprints)
-            assert set(policy_fingerprints) == set(weight_names), policy_fingerprints.keys()
+            assert all(name in policy_fingerprints for name in representative_names), policy_fingerprints.keys()
+            weight_names = sorted(policy_fingerprints)
 
             engine_actor = client.engines[0].inference_engine_actor
             expected_shapes = {name: value["shape"] for name, value in policy_fingerprints.items()}
@@ -374,19 +407,36 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             if isinstance(engine_per_rank, dict):
                 engine_per_rank = [engine_per_rank]
             assert len(engine_per_rank) == 1, len(engine_per_rank)
+            mismatches = []
             for name in weight_names:
                 entry = engine_per_rank[0][name]
-                assert entry["found"], (name, entry)
-                assert "tensor" not in entry, (name, entry.keys())
-                assert not entry["shape_mismatch"], (name, entry)
-                assert entry["fingerprint"] == policy_fingerprints[name], (name, entry, policy_fingerprints[name])
+                if not entry["found"]:
+                    mismatches.append({"name": name, "reason": "not_found", "engine": entry})
+                elif "tensor" in entry:
+                    mismatches.append({"name": name, "reason": "returned_tensor"})
+                elif entry.get("shape_mismatch"):
+                    mismatches.append({"name": name, "reason": "shape_mismatch", "engine": entry})
+                elif entry["fingerprint"] != policy_fingerprints[name]:
+                    mismatches.append(
+                        {
+                            "name": name,
+                            "reason": "fingerprint_mismatch",
+                            "learner": policy_fingerprints[name],
+                            "engine": entry,
+                        }
+                    )
+            assert not mismatches, {
+                "mismatch_count": len(mismatches),
+                "sample": mismatches[:20],
+                "weight_count": len(weight_names),
+            }
             assert engine_per_rank[0]["model.language_model.embed_tokens.weight"]["dtype"] == "bfloat16"
             assert engine_per_rank[0]["lm_head.weight"]["dtype"] == "float32"
             assert (
                 engine_per_rank[0]["lm_head.weight"]["internal_name"]
                 != engine_per_rank[0]["model.language_model.embed_tokens.weight"]["internal_name"]
             )
-            print(f"Verified exact learner/vLLM weights after complete load {update_index}: {weight_names}")
+            print(f"Verified {len(weight_names)} exact learner/vLLM weights after complete load {update_index}")
             verified_engine_weights[update_index] = engine_per_rank[0]
             return engine_per_rank[0]
 
@@ -614,15 +664,214 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
 
                     weights_before_diagnostics = verified_engine_weights[update_index]
                     diagnostics = asyncio.run(collect_fast_path_diagnostics())
+                    head_input_diagnostics = []
+                    engine_actor = client.engines[0].inference_engine_actor
+                    for pair in diagnostic_pairs:
+                        prompt_index = pair["prompt_index"]
+                        token_index = pair["token_index"]
+                        selected_token = pair["selected_token"]
+                        prefix_ids = (
+                            prompt_token_ids[prompt_index] + outputs["response_ids"][prompt_index][:token_index]
+                        )
+                        learner_results = ray.get(
+                            policy.async_run_ray_method(
+                                "pass_through",
+                                "score_next_token",
+                                prefix_ids,
+                                selected_token,
+                                True,
+                            )
+                        )
+                        assert len(learner_results) == 1, learner_results
+                        learner_result = learner_results[0]
+
+                        async def capture_engine_head_input():
+                            capture_started = False
+                            try:
+                                await asyncio.to_thread(
+                                    ray.get,
+                                    engine_actor.begin_head_input_capture.remote(selected_token),
+                                )
+                                capture_started = True
+                                await client.reset_prefix_cache()
+                                capture_params = dict(sampling_params)
+                                capture_params.update({"max_tokens": 1, "logprobs": 2})
+                                generated = await client.generate(
+                                    InferenceEngineInput(
+                                        prompt_token_ids=[prefix_ids],
+                                        sampling_params=capture_params,
+                                    )
+                                )
+                            finally:
+                                if capture_started:
+                                    captures = await asyncio.to_thread(
+                                        ray.get, engine_actor.end_head_input_capture.remote()
+                                    )
+                            return generated, captures
+
+                        captured_generation, engine_captures_per_rank = asyncio.run(capture_engine_head_input())
+                        assert len(engine_captures_per_rank) == 1, engine_captures_per_rank
+                        engine_captures = engine_captures_per_rank[0]
+                        assert len(engine_captures) == 1, engine_captures
+                        engine_capture = engine_captures[0]
+                        assert engine_capture["compute_logits_input_shape"][0] == 1, engine_capture
+                        assert learner_result["head_input_shape"] == engine_capture["head_input_shape"]
+                        learner_layer_trace = learner_result.pop("layer_trace")
+                        engine_layer_trace = engine_capture.pop("layer_trace")
+                        assert len(learner_layer_trace) == len(engine_layer_trace)
+                        layer_diagnostics = []
+                        for learner_layer, engine_layer in zip(
+                            learner_layer_trace,
+                            engine_layer_trace,
+                            strict=True,
+                        ):
+                            assert learner_layer["layer"] == engine_layer["layer"]
+                            assert learner_layer["mixer"] == engine_layer["mixer"]
+                            projection_diagnostics = {}
+                            learner_projections = learner_layer.pop("projections", None)
+                            engine_projections = engine_layer.pop("projections", None)
+                            assert (learner_projections is None) == (engine_projections is None)
+                            if learner_projections is not None:
+                                assert engine_projections is not None
+                                for mode, engine_mode in engine_projections.items():
+                                    mode_diagnostics = []
+                                    for projection_name, learner_projection in learner_projections.items():
+                                        engine_projection = engine_mode[projection_name]
+                                        assert learner_projection["shape"] == engine_projection["shape"]
+                                        mode_diagnostics.append(
+                                            {
+                                                "projection": projection_name,
+                                                "learner_dtype": learner_projection["dtype"],
+                                                "engine_dtype": engine_projection["dtype"],
+                                                "shape": learner_projection["shape"],
+                                                "error": _head_input_error_summary(
+                                                    learner_projection["values"],
+                                                    engine_projection.pop("values"),
+                                                ),
+                                            }
+                                        )
+                                    projection_diagnostics[mode] = mode_diagnostics
+                                for projection in learner_projections.values():
+                                    projection.pop("values")
+                            stage_diagnostics = []
+                            learner_stages = learner_layer.pop("mixer_stages", None)
+                            engine_stages = engine_layer.pop("mixer_stages", None)
+                            assert (learner_stages is None) == (engine_stages is None)
+                            if learner_stages is not None:
+                                assert engine_stages is not None
+                                assert learner_stages.keys() == engine_stages.keys()
+                                for stage_name, learner_stage in learner_stages.items():
+                                    engine_stage = engine_stages[stage_name]
+                                    assert learner_stage["shape"] == engine_stage["shape"]
+                                    stage_diagnostics.append(
+                                        {
+                                            "stage": stage_name,
+                                            "learner_dtype": learner_stage["dtype"],
+                                            "engine_dtype": engine_stage["dtype"],
+                                            "shape": learner_stage["shape"],
+                                            "error": _head_input_error_summary(
+                                                learner_stage.pop("values"),
+                                                engine_stage.pop("values"),
+                                            ),
+                                        }
+                                    )
+                            boundary_diagnostics = []
+                            for boundary in ("mixer_input", "mixer_output", "mlp_input", "mlp_output"):
+                                learner_boundary = learner_layer[boundary]
+                                engine_boundary = engine_layer[boundary]
+                                assert learner_boundary["shape"] == engine_boundary["shape"]
+                                boundary_diagnostics.append(
+                                    {
+                                        "boundary": boundary,
+                                        "learner_dtype": learner_boundary["dtype"],
+                                        "engine_dtype": engine_boundary["dtype"],
+                                        "shape": learner_boundary["shape"],
+                                        "error": _head_input_error_summary(
+                                            learner_boundary.pop("values"),
+                                            engine_boundary.pop("values"),
+                                        ),
+                                    }
+                                )
+                            layer_diagnostics.append(
+                                {
+                                    "layer": learner_layer["layer"],
+                                    "mixer": learner_layer["mixer"],
+                                    "boundaries": boundary_diagnostics,
+                                    "projections": projection_diagnostics,
+                                    "mixer_stages": stage_diagnostics,
+                                }
+                            )
+                        head_input_diagnostics.append(
+                            {
+                                "load": update_index,
+                                "prompt_index": prompt_index,
+                                "token_index": token_index,
+                                "prefix_token_count": len(prefix_ids),
+                                "prefix_token_sha256": hashlib.sha256(
+                                    json.dumps(prefix_ids, separators=(",", ":")).encode()
+                                ).hexdigest(),
+                                "selected_token": selected_token,
+                                "generated_token": captured_generation["response_ids"][0][0],
+                                "learner_head_input_dtype": learner_result["head_input_dtype"],
+                                "engine_head_input_dtype": engine_capture["head_input_dtype"],
+                                "learner_head_input_shape": learner_result["head_input_shape"],
+                                "learner_output_embedding_input_shape": learner_result["output_embedding_input_shape"],
+                                "engine_head_input_shape": engine_capture["head_input_shape"],
+                                "engine_compute_logits_input_shape": engine_capture["compute_logits_input_shape"],
+                                "learner_logits_dtype": learner_result["logits_dtype"],
+                                "engine_logits_dtype": engine_capture["logits_dtype"],
+                                "learner_selected_logit": learner_result["selected_logit"],
+                                "engine_selected_logit": engine_capture["selected_logit"],
+                                "selected_logit_absolute_error": abs(
+                                    learner_result["selected_logit"] - engine_capture["selected_logit"]
+                                ),
+                                "learner_logsumexp": learner_result["logsumexp"],
+                                "engine_logsumexp": engine_capture["logsumexp"],
+                                "logsumexp_absolute_error": abs(
+                                    learner_result["logsumexp"] - engine_capture["logsumexp"]
+                                ),
+                                "learner_selected_logprob": learner_result["selected_logprob"],
+                                "engine_selected_logprob": engine_capture["selected_logprob"],
+                                "layers": layer_diagnostics,
+                                "error": _head_input_error_summary(
+                                    learner_result.pop("head_input"),
+                                    engine_capture.pop("head_input"),
+                                ),
+                            }
+                        )
                     weights_after_diagnostics = verify_synced_weights(update_index)
                     fingerprint_names = (
                         "model.language_model.embed_tokens.weight",
                         "model.language_model.layers.0.input_layernorm.weight",
                         "lm_head.weight",
                     )
+                    diagnostic_payload = {
+                        "load": update_index,
+                        "resolved_sampling_params": {
+                            name: sampling_params.get(name)
+                            for name in (
+                                "temperature",
+                                "top_p",
+                                "top_k",
+                                "min_p",
+                                "repetition_penalty",
+                                "presence_penalty",
+                                "frequency_penalty",
+                                "seed",
+                            )
+                        },
+                        "max_num_batched_tokens": cfg.generator.get("max_num_batched_tokens"),
+                        "weights_unchanged": all(
+                            weights_before_diagnostics[name]["fingerprint"]
+                            == weights_after_diagnostics[name]["fingerprint"]
+                            for name in fingerprint_names
+                        ),
+                        "head_inputs": head_input_diagnostics,
+                        "prompts": diagnostics,
+                    }
                     print(
                         "SKYRL_DPPO_FAST_PATH_DIAGNOSTIC "
-                        f"{json.dumps({'load': update_index, 'resolved_sampling_params': {name: sampling_params.get(name) for name in ('temperature', 'top_p', 'top_k', 'min_p', 'repetition_penalty', 'presence_penalty', 'frequency_penalty', 'seed')}, 'max_num_batched_tokens': cfg.generator.get('max_num_batched_tokens'), 'weights_unchanged': all(weights_before_diagnostics[name]['fingerprint'] == weights_after_diagnostics[name]['fingerprint'] for name in fingerprint_names), 'prompts': diagnostics}, sort_keys=True, allow_nan=False)}"
+                        f"{json.dumps(diagnostic_payload, sort_keys=True, allow_nan=False)}"
                     )
                 assert load_gate["max"]["passed"], load_gate
                 assert load_gate["p95"]["passed"], load_gate

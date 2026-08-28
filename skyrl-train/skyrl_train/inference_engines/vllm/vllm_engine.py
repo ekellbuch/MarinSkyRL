@@ -12,6 +12,7 @@ import vllm
 from types import SimpleNamespace
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
+from vllm.outputs import STREAM_FINISHED
 
 from skyrl_train.numa_policy import NUMA_AFFINITY_ENV
 
@@ -707,6 +708,7 @@ class WorkerWrap:
         self,
         hf_names,
         dump_inventory: bool = False,
+        expected_shapes=None,
     ):
         """Read engine-side weights back
         from the live vLLM model, reconstructed under the HF parameter names the
@@ -730,6 +732,8 @@ class WorkerWrap:
             hf_names: list of HF parameter names to read back.
             dump_inventory: if True, also returns the full ``named_parameters()``
                 name->shape inventory under key ``__inventory__`` (first run aid).
+            expected_shapes: optional HF name-to-shape mapping used to reconstruct
+                dense projections stored in fused vLLM parameters.
         The Qwen3.5 multimodal shell accepts the sender-side broadcast namespace
         ``model.language_model.*``. It is resolved to vLLM's internal
         ``language_model.model.*`` namespace before direct lookup.
@@ -758,6 +762,7 @@ class WorkerWrap:
         def _payload(tensor):
             return {"tensor": tensor.detach().to("cpu", dtype=_torch.float32).contiguous()}
 
+        expected_shapes = expected_shapes or {}
         out = {}
         if dump_inventory:
             out["__inventory__"] = {n: list(p.shape) for n, p in all_params.items()}
@@ -790,7 +795,87 @@ class WorkerWrap:
                     out[name] = entry
                     continue
 
-                # 2. Routed expert -> FusedMoE fused weights.
+                # 2. Dense stacked projections. At TP=1, rebuild the exact HF
+                # tensor view from vLLM's fused storage without transferring the
+                # fused tensor through Ray. The real Qwen3.5 parity smoke uses
+                # one engine rank; other TP layouts are reported as unsupported
+                # rather than silently compared with the wrong shard.
+                stacked_groups = (
+                    (("q_proj", "k_proj", "v_proj"), "qkv_proj"),
+                    (("gate_proj", "up_proj"), "gate_up_proj"),
+                    (("in_proj_qkv", "in_proj_z"), "in_proj_qkvz"),
+                    (("in_proj_b", "in_proj_a"), "in_proj_ba"),
+                )
+                stacked_match = None
+                if ".experts." not in name:
+                    for shard_names, fused_name in stacked_groups:
+                        for shard_index, shard_name in enumerate(shard_names):
+                            marker = f".{shard_name}."
+                            if marker not in name:
+                                continue
+                            internal_name = next(
+                                (
+                                    candidate.replace(marker, f".{fused_name}.")
+                                    for candidate in candidates
+                                    if candidate.replace(marker, f".{fused_name}.") in all_params
+                                ),
+                                None,
+                            )
+                            if internal_name is not None:
+                                stacked_match = (shard_names, shard_index, shard_name, internal_name)
+                            break
+                        if stacked_match is not None:
+                            break
+                if stacked_match is not None:
+                    shard_names, shard_index, shard_name, internal_name = stacked_match
+                    if tp_size != 1:
+                        out[name] = {
+                            "found": False,
+                            "mode": "stacked",
+                            "internal_name": internal_name,
+                            "note": f"full stacked reconstruction requires tp_size=1, got {tp_size}",
+                        }
+                        continue
+                    expected_shape = expected_shapes.get(name)
+                    peer_shapes = [
+                        expected_shapes.get(name.replace(f".{shard_name}.", f".{peer_name}."))
+                        for peer_name in shard_names
+                    ]
+                    if expected_shape is None or any(shape is None for shape in peer_shapes):
+                        out[name] = {
+                            "found": False,
+                            "mode": "stacked",
+                            "internal_name": internal_name,
+                            "note": "missing expected shapes for stacked projection",
+                        }
+                        continue
+                    tensor = all_params[internal_name]
+                    offset = sum(shape[0] for shape in peer_shapes[:shard_index])
+                    length = expected_shape[0]
+                    if tensor.ndim < 1 or tensor.shape[0] < offset + length:
+                        out[name] = {
+                            "found": False,
+                            "mode": "stacked",
+                            "internal_name": internal_name,
+                            "actual_shape": list(tensor.shape),
+                            "note": f"cannot select rows [{offset}:{offset + length}]",
+                        }
+                        continue
+                    tensor = tensor.narrow(0, offset, length)
+                    entry = {
+                        "data_ptr": tensor.data_ptr(),
+                        "found": True,
+                        "parameter_id": id(all_params[internal_name]),
+                        "mode": "stacked",
+                        "internal_name": internal_name,
+                        "shard_index": shard_index,
+                        "dtype": torch_dtype_to_str(tensor.dtype),
+                        **_payload(tensor),
+                    }
+                    out[name] = entry
+                    continue
+
+                # 3. Routed expert -> FusedMoE fused weights.
                 m = expert_re.match(name)
                 if m is not None:
                     prefix, gj, proj = m.group(1), int(m.group(2)), m.group(3)
@@ -832,7 +917,7 @@ class WorkerWrap:
                     out[name] = entry
                     continue
 
-                # 3. Unknown / unsupported name.
+                # 4. Unknown / unsupported name.
                 entry = {"found": False, "note": "no mapping"}
                 out[name] = entry
             except Exception as e:  # never crash the collective_rpc
@@ -841,25 +926,39 @@ class WorkerWrap:
 
     def fingerprint_named_weights(self, hf_names, expected_shapes):
         """Return compact exact fingerprints for requested engine weights."""
-        weights = self.read_named_weights(hf_names)
-        fingerprints = {"__ranks__": weights["__ranks__"]}
+        fingerprints = {"__ranks__": None}
         for name in hf_names:
+            # Read and hash one tensor at a time so the engine actor never holds
+            # a second full-model CPU copy. Only the compact digest leaves the
+            # actor.
+            weights = self.read_named_weights([name], expected_shapes=expected_shapes)
+            if fingerprints["__ranks__"] is None:
+                fingerprints["__ranks__"] = weights["__ranks__"]
             entry = dict(weights[name])
             tensor = entry.pop("tensor", None)
             if tensor is None:
                 fingerprints[name] = entry
+                del weights
                 continue
 
             actual_shape = list(tensor.shape)
             expected_shape = expected_shapes.get(name)
             compared_tensor = tensor
             if expected_shape is not None and actual_shape != expected_shape:
+                expected_numel = 1
+                for dimension in expected_shape:
+                    expected_numel *= dimension
+                if tensor.numel() == expected_numel:
+                    compared_tensor = tensor.reshape(expected_shape)
+                    actual_shape = list(compared_tensor.shape)
                 can_trim_vocab_padding = (
                     len(actual_shape) == len(expected_shape)
                     and actual_shape[1:] == expected_shape[1:]
                     and actual_shape[0] >= expected_shape[0]
                 )
-                if not can_trim_vocab_padding:
+                if actual_shape == expected_shape:
+                    pass
+                elif not can_trim_vocab_padding:
                     entry.update(
                         {
                             "actual_shape": actual_shape,
@@ -868,8 +967,10 @@ class WorkerWrap:
                         }
                     )
                     fingerprints[name] = entry
+                    del tensor, weights
                     continue
-                compared_tensor = tensor[: expected_shape[0]]
+                else:
+                    compared_tensor = tensor[: expected_shape[0]]
             entry.update(
                 {
                     "actual_shape": actual_shape,
@@ -878,7 +979,320 @@ class WorkerWrap:
                 }
             )
             fingerprints[name] = entry
+            del tensor, weights
         return fingerprints
+
+    def begin_head_input_capture(self, selected_token: int):
+        """Capture bounded inputs to the live model's next logits computation."""
+        if getattr(self, "_skyrl_head_input_capture_active", False):
+            raise RuntimeError("A vLLM head-input capture is already active")
+
+        model = self.model_runner.model
+        had_instance_compute_logits = "compute_logits" in model.__dict__
+        instance_compute_logits = model.__dict__.get("compute_logits")
+        original_compute_logits = model.compute_logits
+        captures = []
+        layer_captures = []
+        layer_hooks = []
+
+        def tensor_payload(tensor):
+            if tensor.ndim == 3:
+                if tensor.shape[0] != 1:
+                    raise RuntimeError(f"Expected vLLM diagnostic batch size 1, got {tensor.shape}")
+                tensor = tensor[0, -1]
+            elif tensor.ndim == 2:
+                tensor = tensor[-1]
+            else:
+                raise RuntimeError(f"Expected vLLM hidden states with rank 2 or 3, got {tensor.shape}")
+            return {
+                "values": tensor.detach().float().cpu().tolist(),
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+            }
+
+        def token_heads_payload(tensor, num_heads):
+            if tensor.ndim != 2 or tensor.shape[0] < num_heads:
+                raise RuntimeError(f"Expected flattened token heads [tokens * heads, head_dim], got {tensor.shape}")
+            tensor = tensor[-num_heads:].reshape(-1)
+            return {
+                "values": tensor.detach().float().cpu().tolist(),
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+            }
+
+        def capture_input(_module, args, kwargs, *, destination, key):
+            hidden_states = kwargs.get("hidden_states")
+            if hidden_states is None:
+                hidden_states = args[0]
+            destination.setdefault(key, []).append(tensor_payload(hidden_states))
+
+        def capture_output(_module, args, kwargs, output, *, destination, key):
+            del args
+            hidden_states = kwargs.get("output")
+            if hidden_states is None:
+                hidden_states = output[0] if isinstance(output, tuple) else output
+            destination.setdefault(key, []).append(tensor_payload(hidden_states))
+
+        def capture_projection_output(_module, _args, output, *, destination, keys, sizes):
+            projected = output[0] if isinstance(output, tuple) else output
+            for key, tensor in zip(keys, projected.split(sizes, dim=-1), strict=True):
+                destination.setdefault(key, []).append(tensor_payload(tensor))
+
+        language_model = getattr(model, "language_model", None)
+        text_model = getattr(language_model, "model", None)
+        layers = getattr(text_model, "layers", ())
+        for layer_index, layer in enumerate(layers):
+            mixer_name = "linear_attn" if layer.layer_type == "linear_attention" else "self_attn"
+            mixer = getattr(layer, mixer_name)
+            entry = {"layer": layer_index, "mixer": mixer_name}
+            layer_captures.append(entry)
+            if layer_index == 0 and mixer_name == "linear_attn":
+                qkv_size = (mixer.key_dim * 2 + mixer.value_dim) // mixer.tp_size
+                z_size = mixer.value_dim // mixer.tp_size
+                ba_size = mixer.in_proj_ba.weight.shape[0] // 2
+                projections = {"runtime": {}}
+                entry["projections"] = projections
+                stages = {}
+                entry["mixer_stages"] = stages
+                if hasattr(mixer, "in_proj_qkv"):
+                    layer_hooks.extend(
+                        (
+                            mixer.in_proj_qkv.register_forward_hook(
+                                lambda module, args, output, destination=projections["runtime"]: (
+                                    capture_projection_output(
+                                        module,
+                                        args,
+                                        output,
+                                        destination=destination,
+                                        keys=("qkv",),
+                                        sizes=(qkv_size,),
+                                    )
+                                )
+                            ),
+                            mixer.in_proj_z.register_forward_hook(
+                                lambda module, args, output, destination=projections["runtime"]: (
+                                    capture_projection_output(
+                                        module,
+                                        args,
+                                        output,
+                                        destination=destination,
+                                        keys=("z",),
+                                        sizes=(z_size,),
+                                    )
+                                )
+                            ),
+                        )
+                    )
+                else:
+                    layer_hooks.append(
+                        mixer.in_proj_qkvz.register_forward_hook(
+                            lambda module, args, output, destination=projections["runtime"]: capture_projection_output(
+                                module,
+                                args,
+                                output,
+                                destination=destination,
+                                keys=("qkv", "z"),
+                                sizes=(qkv_size, z_size),
+                            )
+                        )
+                    )
+                layer_hooks.append(
+                    mixer.in_proj_ba.register_forward_hook(
+                        lambda module, args, output, destination=projections["runtime"]: capture_projection_output(
+                            module,
+                            args,
+                            output,
+                            destination=destination,
+                            keys=("b", "a"),
+                            sizes=(ba_size, ba_size),
+                        )
+                    )
+                )
+
+                def capture_norm_input(
+                    _module,
+                    args,
+                    kwargs,
+                    *,
+                    destination=stages,
+                    heads=mixer.num_v_heads // mixer.tp_size,
+                ):
+                    core_attn_out = kwargs.get("x")
+                    if core_attn_out is None:
+                        core_attn_out = args[0]
+                    gate = kwargs.get("residual")
+                    if gate is None:
+                        gate = args[1]
+                    destination.setdefault("core_attn_out", []).append(token_heads_payload(core_attn_out, heads))
+                    destination.setdefault("z", []).append(token_heads_payload(gate, heads))
+
+                def capture_norm_output(
+                    _module,
+                    _args,
+                    _kwargs,
+                    output,
+                    *,
+                    destination=stages,
+                    heads=mixer.num_v_heads // mixer.tp_size,
+                ):
+                    destination.setdefault("norm_output", []).append(token_heads_payload(output, heads))
+
+                layer_hooks.append(mixer.norm.register_forward_pre_hook(capture_norm_input, with_kwargs=True))
+                layer_hooks.append(mixer.norm.register_forward_hook(capture_norm_output, with_kwargs=True))
+                layer_hooks.append(
+                    mixer.out_proj.register_forward_pre_hook(
+                        lambda module, args, kwargs, destination=stages: capture_input(
+                            module,
+                            args,
+                            kwargs,
+                            destination=destination,
+                            key="out_proj_input",
+                        ),
+                        with_kwargs=True,
+                    )
+                )
+                layer_hooks.append(
+                    mixer.out_proj.register_forward_hook(
+                        lambda module, args, kwargs, output, destination=stages: capture_output(
+                            module,
+                            args,
+                            kwargs,
+                            output,
+                            destination=destination,
+                            key="out_proj_output",
+                        ),
+                        with_kwargs=True,
+                    )
+                )
+            layer_hooks.append(
+                mixer.register_forward_pre_hook(
+                    lambda module, args, kwargs, destination=entry: capture_input(
+                        module,
+                        args,
+                        kwargs,
+                        destination=destination,
+                        key="mixer_input",
+                    ),
+                    with_kwargs=True,
+                )
+            )
+            layer_hooks.append(
+                mixer.register_forward_hook(
+                    lambda module, args, kwargs, output, destination=entry: capture_output(
+                        module,
+                        args,
+                        kwargs,
+                        output,
+                        destination=destination,
+                        key="mixer_output",
+                    ),
+                    with_kwargs=True,
+                )
+            )
+            layer_hooks.append(
+                layer.mlp.register_forward_pre_hook(
+                    lambda module, args, kwargs, destination=entry: capture_input(
+                        module,
+                        args,
+                        kwargs,
+                        destination=destination,
+                        key="mlp_input",
+                    ),
+                    with_kwargs=True,
+                )
+            )
+            layer_hooks.append(
+                layer.mlp.register_forward_hook(
+                    lambda module, args, kwargs, output, destination=entry: capture_output(
+                        module,
+                        args,
+                        kwargs,
+                        output,
+                        destination=destination,
+                        key="mlp_output",
+                    ),
+                    with_kwargs=True,
+                )
+            )
+
+        def capture_compute_logits(hidden_states, *args, **kwargs):
+            captured_hidden_state = None
+            if len(captures) < 8:
+                captured_hidden_state = hidden_states[0].detach().float().cpu().contiguous()
+            logits = original_compute_logits(hidden_states, *args, **kwargs)
+            if captured_hidden_state is not None:
+                selected_logit = logits[0, selected_token]
+                logsumexp = logits[0].logsumexp(dim=-1)
+                captures.append(
+                    {
+                        "head_input": captured_hidden_state.tolist(),
+                        "head_input_dtype": str(hidden_states.dtype),
+                        "head_input_shape": list(captured_hidden_state.shape),
+                        "compute_logits_input_shape": list(hidden_states.shape),
+                        "logits_dtype": str(logits.dtype),
+                        "logits_shape": list(logits.shape),
+                        "selected_logit": float(selected_logit.item()),
+                        "logsumexp": float(logsumexp.item()),
+                        "selected_logprob": float((selected_logit - logsumexp).item()),
+                    }
+                )
+            return logits
+
+        self._skyrl_original_compute_logits = original_compute_logits
+        self._skyrl_had_instance_compute_logits = had_instance_compute_logits
+        self._skyrl_instance_compute_logits = instance_compute_logits
+        self._skyrl_head_input_captures = captures
+        self._skyrl_layer_captures = layer_captures
+        self._skyrl_layer_capture_hooks = layer_hooks
+        model.compute_logits = capture_compute_logits
+        self._skyrl_head_input_capture_active = True
+        return {"active": True}
+
+    def end_head_input_capture(self):
+        """Restore logits computation and return the bounded diagnostic capture."""
+        if not getattr(self, "_skyrl_head_input_capture_active", False):
+            raise RuntimeError("No vLLM head-input capture is active")
+
+        model = self.model_runner.model
+        if self._skyrl_had_instance_compute_logits:
+            model.compute_logits = self._skyrl_instance_compute_logits
+        else:
+            del model.compute_logits
+        for hook in self._skyrl_layer_capture_hooks:
+            hook.remove()
+        captures = self._skyrl_head_input_captures
+        if len(captures) == 1:
+            for layer_entry in self._skyrl_layer_captures:
+                for key in ("mixer_input", "mixer_output", "mlp_input", "mlp_output"):
+                    values = layer_entry[key]
+                    if len(values) != 1:
+                        raise RuntimeError(
+                            f"Expected one vLLM {key} capture in layer {layer_entry['layer']}, got {len(values)}"
+                        )
+                    layer_entry[key] = values[0]
+                for mode, projection_captures in layer_entry.get("projections", {}).items():
+                    for key, values in projection_captures.items():
+                        if len(values) != 1:
+                            raise RuntimeError(
+                                f"Expected one vLLM {mode} {key} projection capture in layer "
+                                f"{layer_entry['layer']}, got {len(values)}"
+                            )
+                        projection_captures[key] = values[0]
+                for key, values in layer_entry.get("mixer_stages", {}).items():
+                    if len(values) != 1:
+                        raise RuntimeError(
+                            f"Expected one vLLM {key} stage capture in layer {layer_entry['layer']}, got {len(values)}"
+                        )
+                    layer_entry["mixer_stages"][key] = values[0]
+            captures[0]["layer_trace"] = self._skyrl_layer_captures
+        del self._skyrl_original_compute_logits
+        del self._skyrl_had_instance_compute_logits
+        del self._skyrl_instance_compute_logits
+        del self._skyrl_head_input_captures
+        del self._skyrl_layer_captures
+        del self._skyrl_layer_capture_hooks
+        self._skyrl_head_input_capture_active = False
+        return captures
 
     def read_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 disaggregated-receive diag): return THIS engine worker's
@@ -981,6 +1395,32 @@ class WorkerWrap:
         import socket
 
         return socket.gethostname()
+
+    def report_runtime_installation(self, expected_vllm_engine_sha256: str):
+        """Return and verify the MarinSkyRL module loaded by this engine worker."""
+        import hashlib
+        from pathlib import Path
+
+        import skyrl_train
+
+        if len(expected_vllm_engine_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in expected_vllm_engine_sha256
+        ):
+            raise ValueError("expected_vllm_engine_sha256 must be a lowercase SHA256 digest")
+
+        module_path = Path(__file__).resolve()
+        actual_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
+        payload = {
+            "skyrl_train_file": str(Path(skyrl_train.__file__).resolve()),
+            "vllm_engine_file": str(module_path),
+            "vllm_engine_sha256": actual_sha256,
+            "expected_vllm_engine_sha256": expected_vllm_engine_sha256,
+            "matches_checkout": actual_sha256 == expected_vllm_engine_sha256,
+        }
+        print(f"SKYRL_ENGINECORE_RUNTIME {json.dumps(payload, sort_keys=True)}", flush=True)
+        if not payload["matches_checkout"]:
+            raise RuntimeError(f"EngineCore MarinSkyRL source mismatch: {payload}")
+        return payload
 
 
 class BaseVLLMInferenceEngine(InferenceEngineInterface):
@@ -1561,6 +2001,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
     def __init__(self, *args, **kwargs):
         # Generate unique engine ID before calling super().__init__() which calls _create_engine
         self._stats_engine_id = id(self)
+        self._batch_admission_lock = asyncio.Lock()
         super().__init__(*args, **kwargs)
         self._weight_loader = VLLMWeightLoader(self.llm, is_async=True)
 
@@ -1897,6 +2338,50 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
 
         return final_output
 
+    async def _collect_admitted_output(self, queue):
+        """Collect one request that was admitted before scheduler resume."""
+        final_output = None
+        finished = False
+        while not finished:
+            request_output = queue.get_nowait() or await queue.get()
+            if request_output is STREAM_FINISHED:
+                break
+            final_output = request_output
+            finished = request_output.finished
+        return final_output
+
+    async def _admit_batch(self, prompt_token_ids, sampling_params: SamplingParams, request_ids: list[str]):
+        """Admit one logical batch before vLLM can execute its first step."""
+        lora_request = None
+        if self._is_lora:
+            lora_int_ids = list(await self.llm.list_loras())
+            if lora_int_ids:
+                lora_int_id = lora_int_ids[0]
+                lora_request = LoRARequest(
+                    lora_name=f"{lora_int_id}",
+                    lora_int_id=lora_int_id,
+                    lora_path="/dummy_lora_path",
+                )
+        queues = []
+        pause_scheduler = len(prompt_token_ids) > 1
+        async with self._batch_admission_lock:
+            if pause_scheduler:
+                await self.llm.pause_generation(mode="keep", clear_cache=False)
+            try:
+                for prompt, request_id in zip(prompt_token_ids, request_ids, strict=True):
+                    queues.append(
+                        await self.llm.add_request(
+                            request_id=request_id,
+                            prompt=TokensPrompt(prompt_token_ids=prompt),
+                            params=sampling_params,
+                            lora_request=lora_request,
+                        )
+                    )
+            finally:
+                if pause_scheduler:
+                    await self.llm.resume_generation()
+        return queues
+
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
         """Generate responses using vLLM's async engine.
 
@@ -1915,16 +2400,11 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         """
         prompt_token_ids, sampling_params = self._preprocess_prompts(input_batch)
 
+        request_ids = [str(uuid4().hex) for _ in prompt_token_ids]
         tasks = []
-        request_ids: list[str] = []
-        for prompt in prompt_token_ids:
-            # Schedule the collection of outputs for each prompt.
-            # Avoid duplicate request_ids
-            request_id = str(uuid4().hex)
-            request_ids.append(request_id)
-            task = asyncio.create_task(self._collect_outputs(prompt, request_id, sampling_params))
-            tasks.append(task)
         try:
+            queues = await self._admit_batch(prompt_token_ids, sampling_params, request_ids)
+            tasks = [asyncio.create_task(self._collect_admitted_output(queue)) for queue in queues]
             outputs = await asyncio.gather(*tasks)
         except BaseException as e:
             # Cancel any sibling asyncio tasks still in flight.
@@ -2029,6 +2509,16 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             args=(list(hf_names), dict(expected_shapes)),
         )
 
+    async def begin_head_input_capture(self, selected_token: int):
+        """Start a bounded, test-only capture in each live engine worker."""
+        engine = self._get_engine()
+        return await engine.collective_rpc("begin_head_input_capture", args=(int(selected_token),))
+
+    async def end_head_input_capture(self):
+        """Stop a bounded, test-only capture and return its compact payload."""
+        engine = self._get_engine()
+        return await engine.collective_rpc("end_head_input_capture")
+
     async def read_engine_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 diag): per-engine-worker RAW FusedMoE local-slot weights +
         the engine's own expert_map for ``layer_idx``. Returns List[Dict] (one per
@@ -2040,6 +2530,14 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         """TEST-ONLY (disaggregation proof): hostname of every engine TP/EP worker."""
         engine = self._get_engine()
         return await engine.collective_rpc("report_host")
+
+    async def report_runtime_installation(self, expected_vllm_engine_sha256: str):
+        """Return and verify MarinSkyRL provenance inside each engine worker."""
+        engine = self._get_engine()
+        return await engine.collective_rpc(
+            "report_runtime_installation",
+            args=(expected_vllm_engine_sha256,),
+        )
 
     async def begin_weight_reload(self):
         """#1685 fix: open the layerwise-reload bracket on every engine worker so the

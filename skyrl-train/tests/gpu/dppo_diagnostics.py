@@ -849,6 +849,14 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                     f"{layer_entry['layer']}, got {len(fla_core)}"
                                 )
                             layer_entry["fla_core"] = fla_core[0]
+                        causal_conv = layer_entry.get("causal_conv")
+                        if causal_conv is not None:
+                            if len(causal_conv) != 1:
+                                raise RuntimeError(
+                                    f"Expected one learner causal-convolution capture in layer "
+                                    f"{layer_entry['layer']}, got {len(causal_conv)}"
+                                )
+                            layer_entry["causal_conv"] = causal_conv[0]
                     result["layer_trace"] = layer_captures
         finally:
             restore_diagnostic_state()

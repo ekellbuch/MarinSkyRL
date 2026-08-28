@@ -45,6 +45,7 @@ from skyrl_train.weight_sync.weight_extractor import (
 )
 from skyrl_train.weight_sync.weight_extractor_utils import yield_module_grouped_chunks
 from skyrl_train.utils.fd_monitor import start_fd_monitor
+from skyrl_train.utils.tensor_fingerprint import canonical_tensor_fingerprint
 
 
 def _fsdp_moe_model_kwargs(fsdp_config) -> dict[str, bool]:
@@ -506,6 +507,19 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 if is_rank0 and name in wanted:
                     collected[name] = tensor.detach().to("cpu", dtype=torch.float32).contiguous()
         return collected
+
+    def fingerprint_post_step_weights(self, names):
+        """TEST-ONLY: fingerprint broadcast-form weights without returning tensors."""
+        wanted = set(names)
+        fingerprints = {}
+        generator_dtype = str_to_torch_dtype(self.cfg.generator.model_dtype)
+        is_rank0 = torch.distributed.get_rank() == 0
+        # Every rank must drive the extractor because full_tensor() is collective.
+        for chunk in self.weight_extractor.extract_weights(generator_dtype):
+            for name, tensor in zip(chunk.names, chunk.tensors):
+                if is_rank0 and name in wanted:
+                    fingerprints[name] = canonical_tensor_fingerprint(tensor)
+        return fingerprints
 
     def perturb_weight_for_sync_test(self, name: str, delta: float):
         """TEST-ONLY: change one local parameter element before a repeat sync."""

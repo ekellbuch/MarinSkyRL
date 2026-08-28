@@ -73,6 +73,7 @@ from skyrl_train.inference_engines.vllm.utils import (
     PrefixCacheHitRateAccumulator,
 )
 from skyrl_train.utils import get_tcp_url, str_to_torch_dtype, torch_dtype_to_str
+from skyrl_train.utils.tensor_fingerprint import canonical_tensor_fingerprint
 import time
 from packaging import version
 
@@ -700,7 +701,13 @@ class WorkerWrap:
             return
         destroy_process_group(self._model_update_group)
 
-    def read_named_weights(self, hf_names, dump_inventory: bool = False):
+    def read_named_weights(
+        self,
+        hf_names,
+        dump_inventory: bool = False,
+        fingerprints_only: bool = False,
+        expected_shapes: Optional[Dict[str, List[int]]] = None,
+    ):
         """TEST-ONLY (Stage 6 weight-equality gate): read engine-side weights back
         from the live vLLM model, reconstructed under the HF parameter names the
         trainer broadcasts.
@@ -708,10 +715,9 @@ class WorkerWrap:
         This is the symmetric inverse of ``load_weights`` (vLLM consumes HF-named
         tensors in ``model.load_weights`` and maps them into its internal
         fused/sharded params; here we read those internal params back and rebuild
-        the HF view so the trainer's post-step HF tensors can be compared
-        tensor-by-tensor). Returns, per requested HF name, this worker's
-        contribution as a CPU fp32 tensor plus the live engine dtype and rank
-        coordinates so the caller can assemble across TP/EP shards.
+        the HF view). By default it returns CPU fp32 tensors for the established
+        MoE diagnostics. ``fingerprints_only`` instead hashes canonical FP32
+        chunks in this actor and returns compact exact-comparison metadata.
 
         Supported HF name forms (Qwen1.5-MoE / Qwen2MoE vLLM layout):
           * ``model.embed_tokens.weight``                       -> VocabParallelEmbedding (TP vocab-sharded)
@@ -725,6 +731,9 @@ class WorkerWrap:
             hf_names: list of HF parameter names to read back.
             dump_inventory: if True, also returns the full ``named_parameters()``
                 name->shape inventory under key ``__inventory__`` (first run aid).
+            fingerprints_only: return SHA-256 records instead of tensors.
+            expected_shapes: optional shapes used to exclude vLLM vocabulary
+                padding from fingerprint comparisons.
 
         The Qwen3.5 multimodal shell accepts the sender-side broadcast namespace
         ``model.language_model.*``. It is resolved to vLLM's internal
@@ -751,8 +760,31 @@ class WorkerWrap:
         except Exception:
             ep_rank, ep_size = 0, 1
 
-        def _cpu(t):
-            return t.detach().to("cpu", dtype=_torch.float32).contiguous()
+        def _payload(name, tensor):
+            if not fingerprints_only:
+                return {"tensor": tensor.detach().to("cpu", dtype=_torch.float32).contiguous()}
+
+            actual_shape = list(tensor.shape)
+            compared_tensor = tensor
+            expected_shape = None if expected_shapes is None else expected_shapes.get(name)
+            if expected_shape is not None and actual_shape != expected_shape:
+                can_trim_vocab_padding = (
+                    len(actual_shape) == len(expected_shape)
+                    and actual_shape[1:] == expected_shape[1:]
+                    and actual_shape[0] >= expected_shape[0]
+                )
+                if not can_trim_vocab_padding:
+                    return {
+                        "actual_shape": actual_shape,
+                        "expected_shape": expected_shape,
+                        "shape_mismatch": True,
+                    }
+                compared_tensor = tensor[: expected_shape[0]]
+            return {
+                "actual_shape": actual_shape,
+                "shape_mismatch": False,
+                "fingerprint": canonical_tensor_fingerprint(compared_tensor),
+            }
 
         out = {}
         if dump_inventory:
@@ -786,7 +818,7 @@ class WorkerWrap:
                         "mode": "direct",
                         "internal_name": direct_name,
                         "dtype": torch_dtype_to_str(tensor.dtype),
-                        "tensor": _cpu(tensor),
+                        **_payload(name, tensor),
                     }
                     out[name] = entry
                     continue
@@ -828,7 +860,7 @@ class WorkerWrap:
                         "owner_ep": owner_ep,
                         "local_e": local_e,
                         "dtype": torch_dtype_to_str(t.dtype),
-                        "tensor": _cpu(t),
+                        **_payload(name, t),
                     }
                     out[name] = entry
                     continue
@@ -1958,17 +1990,25 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         engine = self._get_engine()
         return await engine.collective_rpc("end_weight_update")
 
-    async def read_engine_weights(self, hf_names, dump_inventory: bool = False):
+    async def read_engine_weights(
+        self,
+        hf_names,
+        dump_inventory: bool = False,
+        fingerprints_only: bool = False,
+        expected_shapes: Optional[Dict[str, List[int]]] = None,
+    ):
         """TEST-ONLY (Stage 6 weight-equality gate): read engine-side weights back
         under the trainer's HF parameter names, gathered across all TP/EP workers.
 
         Returns ``List[Dict]`` (one dict per worker rank), each as produced by
-        ``WorkerWrap.read_named_weights``. The caller assembles the per-rank
-        contributions (TP/EP shards) into the full HF tensors to compare against
-        the trainer's post-step weights.
+        ``WorkerWrap.read_named_weights``. Callers may request compact in-actor
+        fingerprints instead of moving full tensors through Ray.
         """
         engine = self._get_engine()
-        return await engine.collective_rpc("read_named_weights", args=(list(hf_names), dump_inventory))
+        return await engine.collective_rpc(
+            "read_named_weights",
+            args=(list(hf_names), dump_inventory, fingerprints_only, expected_shapes),
+        )
 
     async def read_engine_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 diag): per-engine-worker RAW FusedMoE local-slot weights +

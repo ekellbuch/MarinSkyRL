@@ -24,6 +24,7 @@ from skyrl_train.trajectory_runners.base import TrajectoryRunner
 from skyrl_train.utils.tracking import Tracking
 
 from tests.gpu.dppo_diagnostics import PolicyWorker as DPPOPolicyWorker
+from tests.gpu.dppo_diagnostics import compact_layer_capture
 from tests.gpu.utils import get_test_prompts, init_inference_engines, init_worker_with_type, run_inference
 
 MODEL = os.environ.get("SKYRL_GPU_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
@@ -49,6 +50,28 @@ DPPO_DIVERGENCE_THRESHOLD = 0.1
 # the p95 pair below 50%.
 MAX_SELECTED_LOGPROB_ERROR = math.log1p(0.8 * DPPO_DIVERGENCE_THRESHOLD)
 P95_SELECTED_LOGPROB_ERROR = math.log1p(0.5 * DPPO_DIVERGENCE_THRESHOLD)
+
+
+def test_compact_layer_capture_preserves_causal_conv_payload() -> None:
+    capture = {
+        "comparisons": {"live_vs_released": {"exact": True}},
+        "inputs": {"weight": {"fingerprint": {"sha256": "weight"}}},
+    }
+    layer_entry = {"layer": 0, "causal_conv": [capture]}
+
+    compact_layer_capture(layer_entry, "causal_conv", "causal-convolution")
+
+    assert layer_entry["causal_conv"] == capture
+    assert layer_entry["causal_conv"]["inputs"]["weight"]["fingerprint"]["sha256"] == "weight"
+    assert layer_entry["causal_conv"]["comparisons"]["live_vs_released"]["exact"] is True
+
+
+@pytest.mark.parametrize("captures", [[], [{}, {}]])
+def test_compact_layer_capture_rejects_non_singleton_causal_conv(captures: list[dict]) -> None:
+    layer_entry = {"layer": 0, "causal_conv": captures}
+
+    with pytest.raises(RuntimeError, match="Expected one learner causal-convolution capture"):
+        compact_layer_capture(layer_entry, "causal_conv", "causal-convolution")
 
 
 class _OnePromptDataset:

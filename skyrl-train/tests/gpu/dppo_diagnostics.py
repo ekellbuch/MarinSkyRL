@@ -62,6 +62,17 @@ def _token_fingerprints(tensor: torch.Tensor) -> list[dict]:
     return [canonical_tensor_fingerprint(tensor[index : index + 1]) for index in range(tensor.shape[0])]
 
 
+def compact_layer_capture(layer_entry: dict, capture_key: str, capture_label: str) -> None:
+    captures = layer_entry.get(capture_key)
+    if captures is None:
+        return
+    if len(captures) != 1:
+        raise RuntimeError(
+            f"Expected one learner {capture_label} capture in layer {layer_entry['layer']}, got {len(captures)}"
+        )
+    layer_entry[capture_key] = captures[0]
+
+
 class DPPOPolicyWorker(FSDPPolicyWorkerBase):
     def fingerprint_broadcast_weights(self, names=None):
         wanted = None if names is None else set(names)
@@ -841,22 +852,8 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                     f"{layer_entry['layer']}, got {len(values)}"
                                 )
                             layer_entry["mixer_stages"][key] = values[0]
-                        fla_core = layer_entry.get("fla_core")
-                        if fla_core is not None:
-                            if len(fla_core) != 1:
-                                raise RuntimeError(
-                                    f"Expected one learner FLA core capture in layer "
-                                    f"{layer_entry['layer']}, got {len(fla_core)}"
-                                )
-                            layer_entry["fla_core"] = fla_core[0]
-                        causal_conv = layer_entry.get("causal_conv")
-                        if causal_conv is not None:
-                            if len(causal_conv) != 1:
-                                raise RuntimeError(
-                                    f"Expected one learner causal-convolution capture in layer "
-                                    f"{layer_entry['layer']}, got {len(causal_conv)}"
-                                )
-                            layer_entry["causal_conv"] = causal_conv[0]
+                        compact_layer_capture(layer_entry, "fla_core", "FLA core")
+                        compact_layer_capture(layer_entry, "causal_conv", "causal-convolution")
                     result["layer_trace"] = layer_captures
         finally:
             restore_diagnostic_state()

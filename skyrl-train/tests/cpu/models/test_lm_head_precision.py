@@ -176,7 +176,7 @@ def test_vllm_lm_head_restore_waits_for_layerwise_reload_to_materialize_weights(
     language_model.lm_head = IncompleteEmbedding()
     shell = type("IncompleteShell", (), {"language_model": language_model})()
 
-    assert not ensure_vllm_lm_head_compute_dtype(shell)
+    assert not ensure_vllm_lm_head_compute_dtype(shell, "float32")
 
 
 def test_vllm_tied_lm_head_registers_two_layerwise_reloads():

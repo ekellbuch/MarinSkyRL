@@ -3,6 +3,7 @@
 import ray
 import torch
 from torch.distributed.tensor import DTensor
+from transformers.models.qwen3_5.modeling_qwen3_5 import is_fast_path_available
 
 from skyrl_train.utils import str_to_torch_dtype
 from skyrl_train.utils.tensor_fingerprint import canonical_tensor_fingerprint
@@ -34,7 +35,13 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
         local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
         flat_parameter = local_parameter.reshape(-1)
         if flat_parameter.numel() == 0:
-            return {"name": parameter_name, "changed": False, "rank": torch.distributed.get_rank()}
+            return {
+                "name": parameter_name,
+                "changed": False,
+                "before": None,
+                "after": None,
+                "rank": torch.distributed.get_rank(),
+            }
 
         with torch.no_grad():
             before = flat_parameter[0].float().item()
@@ -49,8 +56,6 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
         }
 
     def score_next_token(self, prompt_token_ids, selected_token: int):
-        from transformers.models.qwen3_5.modeling_qwen3_5 import is_fast_path_available
-
         if not is_fast_path_available:
             raise RuntimeError("Qwen3.5 learner parity requires the flash-linear-attention and causal-conv1d fast path")
         device = torch.cuda.current_device()
@@ -85,7 +90,6 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                     "logsumexp": float(logsumexp.item()),
                     "selected_logprob": float((selected_logit - logsumexp).item()),
                     "logits_dtype": str(logits.dtype),
-                    "gdn_fast_path": True,
                 }
         finally:
             if was_training:

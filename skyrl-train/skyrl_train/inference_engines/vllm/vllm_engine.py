@@ -265,6 +265,12 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
             logger.warning(f"setup_envvars_for_vllm: NUMA affinity setup failed: {e}")
 
 
+def _refresh_vllm_lm_head_compute_dtype(model) -> None:
+    dtype_name = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
+    if dtype_name is not None:
+        configure_vllm_model_instance_lm_head_compute_dtype(model, dtype_name)
+
+
 class WorkerWrap:
     def set_numa_affinity(self):
         """Set CPU affinity to match this worker's GPU NUMA node.
@@ -472,9 +478,7 @@ class WorkerWrap:
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             finalize_layerwise_reload(model, self.model_config)
         self._skyrl_weight_update_active = False
-        lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
-        if lm_head_compute_dtype is not None:
-            configure_vllm_model_instance_lm_head_compute_dtype(model, lm_head_compute_dtype)
+        _refresh_vllm_lm_head_compute_dtype(model)
 
     def begin_weight_update(self) -> None:
         """Start accumulating weights for batched load_weights call.
@@ -653,9 +657,8 @@ class WorkerWrap:
                 torch.cuda.empty_cache()
             else:
                 model.load_weights(weights=iter(self._accumulated_weights))
-            lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
-            if lm_head_compute_dtype is not None and not getattr(self, "_skyrl_weight_update_active", False):
-                configure_vllm_model_instance_lm_head_compute_dtype(model, lm_head_compute_dtype)
+            if not getattr(self, "_skyrl_weight_update_active", False):
+                _refresh_vllm_lm_head_compute_dtype(model)
             self._accumulated_weights.clear()
             del self._accumulated_weights
             gc.collect()
@@ -689,9 +692,7 @@ class WorkerWrap:
             if not getattr(self, "_skyrl_weight_update_active", False) and any(
                 name == "lm_head.weight" or name.endswith("embed_tokens.weight") for name, _ in weight_list
             ):
-                lm_head_compute_dtype = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
-                if lm_head_compute_dtype is not None:
-                    configure_vllm_model_instance_lm_head_compute_dtype(self.model_runner.model, lm_head_compute_dtype)
+                _refresh_vllm_lm_head_compute_dtype(self.model_runner.model)
             for weight in weight_list:
                 del weight
 
@@ -706,19 +707,16 @@ class WorkerWrap:
         self,
         hf_names,
         dump_inventory: bool = False,
-        fingerprints_only: bool = False,
-        expected_shapes: Optional[Dict[str, List[int]]] = None,
     ):
-        """TEST-ONLY (Stage 6 weight-equality gate): read engine-side weights back
+        """Read engine-side weights back
         from the live vLLM model, reconstructed under the HF parameter names the
         trainer broadcasts.
 
         This is the symmetric inverse of ``load_weights`` (vLLM consumes HF-named
         tensors in ``model.load_weights`` and maps them into its internal
         fused/sharded params; here we read those internal params back and rebuild
-        the HF view). By default it returns CPU fp32 tensors for the established
-        MoE diagnostics. ``fingerprints_only`` instead hashes canonical FP32
-        chunks in this actor and returns compact exact-comparison metadata.
+        the HF view). It returns CPU fp32 tensors for the established MoE
+        diagnostics.
 
         Supported HF name forms (Qwen1.5-MoE / Qwen2MoE vLLM layout):
           * ``model.embed_tokens.weight``                       -> VocabParallelEmbedding (TP vocab-sharded)
@@ -732,10 +730,6 @@ class WorkerWrap:
             hf_names: list of HF parameter names to read back.
             dump_inventory: if True, also returns the full ``named_parameters()``
                 name->shape inventory under key ``__inventory__`` (first run aid).
-            fingerprints_only: return SHA-256 records instead of tensors.
-            expected_shapes: optional shapes used to exclude vLLM vocabulary
-                padding from fingerprint comparisons.
-
         The Qwen3.5 multimodal shell accepts the sender-side broadcast namespace
         ``model.language_model.*``. It is resolved to vLLM's internal
         ``language_model.model.*`` namespace before direct lookup.
@@ -761,31 +755,8 @@ class WorkerWrap:
         except Exception:
             ep_rank, ep_size = 0, 1
 
-        def _payload(name, tensor):
-            if not fingerprints_only:
-                return {"tensor": tensor.detach().to("cpu", dtype=_torch.float32).contiguous()}
-
-            actual_shape = list(tensor.shape)
-            compared_tensor = tensor
-            expected_shape = None if expected_shapes is None else expected_shapes.get(name)
-            if expected_shape is not None and actual_shape != expected_shape:
-                can_trim_vocab_padding = (
-                    len(actual_shape) == len(expected_shape)
-                    and actual_shape[1:] == expected_shape[1:]
-                    and actual_shape[0] >= expected_shape[0]
-                )
-                if not can_trim_vocab_padding:
-                    return {
-                        "actual_shape": actual_shape,
-                        "expected_shape": expected_shape,
-                        "shape_mismatch": True,
-                    }
-                compared_tensor = tensor[: expected_shape[0]]
-            return {
-                "actual_shape": actual_shape,
-                "shape_mismatch": False,
-                "fingerprint": canonical_tensor_fingerprint(compared_tensor),
-            }
+        def _payload(tensor):
+            return {"tensor": tensor.detach().to("cpu", dtype=_torch.float32).contiguous()}
 
         out = {}
         if dump_inventory:
@@ -814,7 +785,7 @@ class WorkerWrap:
                         "mode": "direct",
                         "internal_name": direct_name,
                         "dtype": torch_dtype_to_str(tensor.dtype),
-                        **_payload(name, tensor),
+                        **_payload(tensor),
                     }
                     out[name] = entry
                     continue
@@ -856,7 +827,7 @@ class WorkerWrap:
                         "owner_ep": owner_ep,
                         "local_e": local_e,
                         "dtype": torch_dtype_to_str(t.dtype),
-                        **_payload(name, t),
+                        **_payload(t),
                     }
                     out[name] = entry
                     continue
@@ -867,6 +838,47 @@ class WorkerWrap:
             except Exception as e:  # never crash the collective_rpc
                 out[name] = {"found": False, "error": repr(e)}
         return out
+
+    def fingerprint_named_weights(self, hf_names, expected_shapes):
+        """Return compact exact fingerprints for requested engine weights."""
+        weights = self.read_named_weights(hf_names)
+        fingerprints = {"__ranks__": weights["__ranks__"]}
+        for name in hf_names:
+            entry = dict(weights[name])
+            tensor = entry.pop("tensor", None)
+            if tensor is None:
+                fingerprints[name] = entry
+                continue
+
+            actual_shape = list(tensor.shape)
+            expected_shape = expected_shapes.get(name)
+            compared_tensor = tensor
+            if expected_shape is not None and actual_shape != expected_shape:
+                can_trim_vocab_padding = (
+                    len(actual_shape) == len(expected_shape)
+                    and actual_shape[1:] == expected_shape[1:]
+                    and actual_shape[0] >= expected_shape[0]
+                )
+                if not can_trim_vocab_padding:
+                    entry.update(
+                        {
+                            "actual_shape": actual_shape,
+                            "expected_shape": expected_shape,
+                            "shape_mismatch": True,
+                        }
+                    )
+                    fingerprints[name] = entry
+                    continue
+                compared_tensor = tensor[: expected_shape[0]]
+            entry.update(
+                {
+                    "actual_shape": actual_shape,
+                    "shape_mismatch": False,
+                    "fingerprint": canonical_tensor_fingerprint(compared_tensor),
+                }
+            )
+            fingerprints[name] = entry
+        return fingerprints
 
     def read_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 disaggregated-receive diag): return THIS engine worker's
@@ -977,6 +989,8 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
     def __init__(self, *args, bundle_indices: list = None, **kwargs):
         setup_envvars_for_vllm(kwargs, bundle_indices)
         lm_head_compute_dtype = kwargs.pop("lm_head_compute_dtype", None)
+        # vLLM may construct the model in a separate EngineCore process, so the
+        # explicit constructor setting crosses that process boundary via env.
         if lm_head_compute_dtype is None:
             os.environ.pop(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV, None)
         else:
@@ -1997,20 +2011,22 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         self,
         hf_names,
         dump_inventory: bool = False,
-        fingerprints_only: bool = False,
-        expected_shapes: Optional[Dict[str, List[int]]] = None,
     ):
-        """TEST-ONLY (Stage 6 weight-equality gate): read engine-side weights back
+        """Read engine-side weights back
         under the trainer's HF parameter names, gathered across all TP/EP workers.
 
         Returns ``List[Dict]`` (one dict per worker rank), each as produced by
-        ``WorkerWrap.read_named_weights``. Callers may request compact in-actor
-        fingerprints instead of moving full tensors through Ray.
+        ``WorkerWrap.read_named_weights``.
         """
         engine = self._get_engine()
+        return await engine.collective_rpc("read_named_weights", args=(list(hf_names), dump_inventory))
+
+    async def fingerprint_engine_weights(self, hf_names, expected_shapes):
+        """Return compact in-actor fingerprints for engine weights."""
+        engine = self._get_engine()
         return await engine.collective_rpc(
-            "read_named_weights",
-            args=(list(hf_names), dump_inventory, fingerprints_only, expected_shapes),
+            "fingerprint_named_weights",
+            args=(list(hf_names), dict(expected_shapes)),
         )
 
     async def read_engine_expert_slots_raw(self, layer_idx: int):

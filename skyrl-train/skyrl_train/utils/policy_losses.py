@@ -481,11 +481,10 @@ def dppo_policy_loss(
         config.max_seq_len,
         global_denom=global_loss_denom,
     )
-    masked_divergence = divergence if loss_mask is None else divergence.masked_fill(loss_mask == 0, 0)
     metrics = {
         "dppo/masked_fraction": 1.0 - _masked_fraction(keep, loss_mask),
         "dppo/divergence_mean": masked_mean(divergence, loss_mask).mean().detach().item(),
-        "dppo/divergence_max": masked_divergence.max().detach().item(),
+        "dppo/divergence_max": divergence.max().detach().item(),
     }
     return loss, metrics
 

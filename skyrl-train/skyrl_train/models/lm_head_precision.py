@@ -45,15 +45,13 @@ def configure_hf_lm_head_compute_dtype(model: nn.Module, dtype_name: str | None)
     return True
 
 
-def ensure_vllm_lm_head_compute_dtype(model: Any, dtype_name: str | None = None) -> bool:
+def ensure_vllm_lm_head_compute_dtype(model: Any, dtype_name: str) -> bool:
     """Configure or refresh a vLLM projection and report whether one qualified."""
-    if dtype_name is not None and dtype_name != FP32_DTYPE_NAME:
+    if dtype_name != FP32_DTYPE_NAME:
         raise ValueError(f"Unsupported lm_head_compute_dtype: {dtype_name}")
     candidates = (model, getattr(model, "language_model", None))
     for candidate in candidates:
         if candidate is None:
-            continue
-        if dtype_name is None:
             continue
         lm_head = getattr(candidate, "lm_head", None)
         if lm_head is not None and hasattr(lm_head, "float"):

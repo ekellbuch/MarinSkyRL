@@ -1,5 +1,7 @@
 """Ray worker diagnostics used by the DPPO GPU integration test."""
 
+import sys
+
 import ray
 import torch
 from torch.distributed.tensor import DTensor
@@ -97,4 +99,8 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
         return result
 
 
+# Pytest adds ``skyrl-train`` to the driver's import path, but Ray workers do
+# not inherit that test-only path. Serialize this helper module by value so the
+# diagnostic actor does not require ``tests`` to be installed on every worker.
+ray.cloudpickle.register_pickle_by_value(sys.modules[__name__])
 PolicyWorker = ray.remote(num_gpus=1)(DPPOPolicyWorker)

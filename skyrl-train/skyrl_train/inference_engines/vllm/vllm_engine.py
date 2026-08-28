@@ -1096,6 +1096,7 @@ class WorkerWrap:
                 entry["mixer_stages"] = stages
                 fla_inputs = []
                 fla_outputs = []
+                fla_values = []
                 fla_captures = []
                 entry["fla_core"] = fla_captures
                 causal_conv_captures = []
@@ -1198,6 +1199,7 @@ class WorkerWrap:
                     *,
                     source=fla_inputs,
                     live_outputs=fla_outputs,
+                    live_values=fla_values,
                     destination=fla_captures,
                     backend=mixer.gdn_prefill_backend,
                     backend_method=mixer.chunk_gated_delta_rule._forward_method,
@@ -1207,6 +1209,7 @@ class WorkerWrap:
                     values = source.pop()
                     live_output, live_final_state = output
                     live_outputs.append(live_output.detach())
+                    live_values.append({name: values[name].detach().clone() for name in ("q", "k", "v")})
 
                     from fla.ops.gated_delta_rule.chunk import (
                         chunk_gated_delta_rule_fwd as released_chunk_gated_delta_rule_fwd,
@@ -1395,108 +1398,196 @@ class WorkerWrap:
                 original_forward_core = mixer._forward_core
 
                 def capture_forward_core(*args, original=original_forward_core, **kwargs):
+                    mixed_qkv = kwargs.get("mixed_qkv")
+                    if mixed_qkv is None:
+                        mixed_qkv = args[0]
                     model_destination = kwargs.get("core_attn_out")
                     if model_destination is None:
                         model_destination = args[3]
 
                     from causal_conv1d import causal_conv1d_fn as released_causal_conv1d_fn
-                    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
+                    from vllm.forward_context import get_forward_context
+                    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+                    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+                        causal_conv1d_fn as vllm_causal_conv1d_fn,
+                    )
+                    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-                    live_causal_conv1d_fn = qwen_gdn_linear_attn.causal_conv1d_fn
-
-                    def capture_causal_conv1d(*conv_args, **conv_kwargs):
-                        if causal_conv_captures:
-                            raise RuntimeError("Expected one layer-zero causal-convolution call")
-                        x = conv_args[0]
-                        weight = conv_args[1]
-                        bias = conv_args[2]
-                        conv_states = conv_kwargs["conv_states"]
-                        query_start_loc = conv_kwargs["query_start_loc"]
-                        has_initial_state = conv_kwargs["has_initial_state"]
-                        metadata = conv_kwargs["metadata"]
-                        if query_start_loc.detach().cpu().tolist() != [0, x.shape[1]]:
-                            raise RuntimeError(
-                                "Expected one complete prefill sequence in the causal-convolution diagnostic"
-                            )
-                        if has_initial_state is None or torch.any(has_initial_state):
-                            raise RuntimeError("Expected a zero-state causal-convolution prefill")
-                        if metadata.num_prefills != 1 or metadata.num_decodes != 0:
-                            raise RuntimeError(
-                                "Expected one prefill and no decodes in the causal-convolution diagnostic"
-                            )
-
-                        captured_x = x.detach().clone()
-                        captured_weight = weight.detach().clone()
-                        captured_bias = bias.detach().clone() if bias is not None else None
-                        live_output = live_causal_conv1d_fn(*conv_args, **conv_kwargs)
-                        released_output = released_causal_conv1d_fn(
-                            captured_x.unsqueeze(0),
-                            captured_weight,
-                            bias=captured_bias,
-                            seq_idx=None,
-                            activation=conv_kwargs["activation"],
-                        ).squeeze(0)
-                        token_major_x = captured_x.transpose(0, 1).unsqueeze(0)
-                        token_major_live_output = live_output.transpose(0, 1).unsqueeze(0)
-                        token_major_released_output = released_output.transpose(0, 1).unsqueeze(0)
-                        causal_conv_captures.append(
-                            {
-                                "inputs": {
-                                    "x": {
-                                        "fingerprint": canonical_tensor_fingerprint(token_major_x),
-                                        "layout": tensor_layout(captured_x),
-                                        "token_fingerprints": token_fingerprints(token_major_x),
-                                    },
-                                    "weight": {
-                                        "fingerprint": canonical_tensor_fingerprint(captured_weight),
-                                        "layout": tensor_layout(captured_weight),
-                                    },
-                                    "bias": (
-                                        {
-                                            "fingerprint": canonical_tensor_fingerprint(captured_bias),
-                                            "layout": tensor_layout(captured_bias),
-                                        }
-                                        if captured_bias is not None
-                                        else None
-                                    ),
-                                    "conv_states_layout": tensor_layout(conv_states),
-                                    "has_initial_state": has_initial_state.detach().cpu().tolist(),
-                                    "query_start_loc": query_start_loc.detach().cpu().tolist(),
-                                },
-                                "live": {
-                                    "fingerprint": canonical_tensor_fingerprint(token_major_live_output),
-                                    "layout": tensor_layout(live_output),
-                                    "token_fingerprints": token_fingerprints(token_major_live_output),
-                                },
-                                "released_replay": {
-                                    "fingerprint": canonical_tensor_fingerprint(token_major_released_output),
-                                    "layout": tensor_layout(released_output),
-                                    "token_fingerprints": token_fingerprints(token_major_released_output),
-                                },
-                                "live_vs_released_replay": exact_error_summary(live_output, released_output),
-                                "metadata": {
-                                    "num_actual_tokens": metadata.num_actual_tokens,
-                                    "num_decode_tokens": metadata.num_decode_tokens,
-                                    "num_decodes": metadata.num_decodes,
-                                    "num_prefills": metadata.num_prefills,
-                                },
-                                "options": {
-                                    "activation": conv_kwargs["activation"],
-                                },
-                            }
+                    forward_context = get_forward_context()
+                    attn_metadata_raw = forward_context.attn_metadata
+                    if not isinstance(attn_metadata_raw, dict):
+                        raise RuntimeError("Expected per-layer GDN attention metadata")
+                    attn_metadata = attn_metadata_raw[mixer.prefix]
+                    if not isinstance(attn_metadata, GDNAttentionMetadata):
+                        raise RuntimeError("Expected GDN attention metadata for the layer-zero diagnostic")
+                    num_actual_tokens = attn_metadata.num_actual_tokens
+                    query_start_loc = attn_metadata.non_spec_query_start_loc.detach().clone()
+                    has_initial_state = attn_metadata.has_initial_state.detach().clone()
+                    state_indices = attn_metadata.non_spec_state_indices_tensor.detach().clone()
+                    captured_x = mixed_qkv[:num_actual_tokens].detach().clone()
+                    if query_start_loc.cpu().tolist() != [0, captured_x.shape[0]]:
+                        raise RuntimeError(
+                            "Expected one complete prefill sequence in the causal-convolution diagnostic"
                         )
-                        return live_output
+                    if torch.any(has_initial_state):
+                        raise RuntimeError("Expected a cold zero-state causal-convolution prefill")
+                    if (
+                        attn_metadata.num_prefills != 1
+                        or attn_metadata.num_decodes != 0
+                        or attn_metadata.spec_sequence_masks is not None
+                    ):
+                        raise RuntimeError("Expected one non-speculative prefill and no decodes")
 
-                    qwen_gdn_linear_attn.causal_conv1d_fn = capture_causal_conv1d
-                    try:
-                        result = original(*args, **kwargs)
-                    finally:
-                        qwen_gdn_linear_attn.causal_conv1d_fn = live_causal_conv1d_fn
-                    if len(causal_conv_captures) != 1:
-                        raise RuntimeError("Expected one captured layer-zero causal-convolution call")
-                    if len(fla_outputs) != 1 or len(fla_captures) != 1:
+                    conv_weight = (
+                        mixer.conv1d.weight.view(mixer.conv1d.weight.shape[0], mixer.conv1d.weight.shape[2])
+                        .detach()
+                        .clone()
+                    )
+                    conv_bias = mixer.conv1d.bias
+                    conv_bias = conv_bias.detach().clone() if conv_bias is not None else None
+                    live_conv_state = (
+                        mixer.kv_cache[0] if is_conv_state_dim_first() else mixer.kv_cache[0].transpose(-1, -2)
+                    )
+
+                    result = original(*args, **kwargs)
+                    if len(fla_outputs) != 1 or len(fla_values) != 1 or len(fla_captures) != 1:
                         raise RuntimeError("Expected one live FLA output before the model destination capture")
                     live_output = fla_outputs.pop()
+                    live_fla_values = fla_values.pop()
+
+                    def run_vllm_conv(token_major_x, *, activation, dirty_state=False):
+                        channel_last_x = token_major_x.contiguous().transpose(0, 1)
+                        scratch_state = torch.zeros(
+                            2,
+                            channel_last_x.shape[0],
+                            conv_weight.shape[1] - 1,
+                            dtype=live_conv_state.dtype,
+                            device=channel_last_x.device,
+                        )
+                        if dirty_state:
+                            scratch_state.fill_(1)
+                        scratch_query_start_loc = torch.tensor(
+                            [0, token_major_x.shape[0]], dtype=torch.int32, device=channel_last_x.device
+                        )
+                        scratch_output = vllm_causal_conv1d_fn(
+                            channel_last_x,
+                            conv_weight,
+                            conv_bias,
+                            conv_states=scratch_state,
+                            query_start_loc=scratch_query_start_loc,
+                            cache_indices=torch.ones(1, dtype=torch.int32, device=channel_last_x.device),
+                            has_initial_state=torch.zeros(1, dtype=torch.bool, device=channel_last_x.device),
+                            activation=activation,
+                            metadata=None,
+                            validate_data=True,
+                        )
+                        return scratch_output.transpose(0, 1).unsqueeze(0), scratch_state[1:2]
+
+                    def run_released_conv(token_major_x, *, activation):
+                        channel_first_x = token_major_x.transpose(0, 1).unsqueeze(0)
+                        return released_causal_conv1d_fn(
+                            channel_first_x,
+                            conv_weight,
+                            bias=conv_bias,
+                            seq_idx=None,
+                            activation=activation,
+                        ).transpose(1, 2)
+
+                    scratch_output, scratch_state = run_vllm_conv(captured_x, activation=mixer.activation)
+                    scratch_raw_output, _ = run_vllm_conv(captured_x, activation=None)
+                    dirty_output, _ = run_vllm_conv(captured_x, activation=mixer.activation, dirty_state=True)
+                    released_output = run_released_conv(captured_x, activation=mixer.activation)
+                    released_raw_output = run_released_conv(captured_x, activation=None)
+                    scratch_q, scratch_k, scratch_v = mixer.rearrange_mixed_qkv(scratch_output.squeeze(0))
+                    del scratch_q, scratch_k
+                    scratch_v = scratch_v.unsqueeze(0)
+                    expected_state = torch.nn.functional.pad(
+                        captured_x.to(live_conv_state.dtype).transpose(0, 1),
+                        (conv_weight.shape[1] - 1, 0),
+                    )[:, -(conv_weight.shape[1] - 1) :].unsqueeze(0)
+
+                    token0 = captured_x[:1]
+                    vllm_token0_raw, _ = run_vllm_conv(token0, activation=None)
+                    vllm_token0_silu, _ = run_vllm_conv(token0, activation="silu")
+                    released_token0_raw = run_released_conv(token0, activation=None)
+                    released_token0_silu = run_released_conv(token0, activation="silu")
+                    manual_token0_raw = token0.float() * conv_weight[:, -1].float()
+                    if conv_bias is not None:
+                        manual_token0_raw = manual_token0_raw + conv_bias.float()
+                    manual_token0_raw = manual_token0_raw.to(vllm_token0_raw.dtype).unsqueeze(0)
+                    manual_token0_silu = torch.nn.functional.silu(manual_token0_raw.float()).to(vllm_token0_silu.dtype)
+
+                    def tensor_payload(tensor):
+                        return {
+                            "fingerprint": canonical_tensor_fingerprint(tensor),
+                            "layout": tensor_layout(tensor),
+                            "token_fingerprints": token_fingerprints(tensor),
+                        }
+
+                    causal_conv_captures.append(
+                        {
+                            "backend": {
+                                "method": vllm_causal_conv1d_fn.__qualname__,
+                                "method_module": vllm_causal_conv1d_fn.__module__,
+                                "released_method": released_causal_conv1d_fn.__qualname__,
+                                "released_method_module": released_causal_conv1d_fn.__module__,
+                            },
+                            "inputs": {
+                                "x": tensor_payload(captured_x.unsqueeze(0)),
+                                "weight": {
+                                    "fingerprint": canonical_tensor_fingerprint(conv_weight),
+                                    "layout": tensor_layout(conv_weight),
+                                },
+                                "bias": (
+                                    {
+                                        "fingerprint": canonical_tensor_fingerprint(conv_bias),
+                                        "layout": tensor_layout(conv_bias),
+                                    }
+                                    if conv_bias is not None
+                                    else None
+                                ),
+                                "live_conv_state_layout": tensor_layout(live_conv_state),
+                            },
+                            "live_post_conv_v": tensor_payload(live_fla_values["v"]),
+                            "scratch_replay": tensor_payload(scratch_output),
+                            "released_replay": tensor_payload(released_output),
+                            "comparisons": {
+                                "dirty_vs_zero_state": exact_error_summary(dirty_output, scratch_output),
+                                "live_post_conv_v_vs_scratch": exact_error_summary(live_fla_values["v"], scratch_v),
+                                "scratch_state_vs_expected_tail": exact_error_summary(scratch_state, expected_state),
+                                "scratch_vs_released": exact_error_summary(scratch_output, released_output),
+                                "token0_raw": {
+                                    "full_vs_singleton": exact_error_summary(
+                                        scratch_raw_output[:, :1], vllm_token0_raw
+                                    ),
+                                    "released_full_vs_singleton": exact_error_summary(
+                                        released_raw_output[:, :1], released_token0_raw
+                                    ),
+                                    "scratch_vs_manual": exact_error_summary(vllm_token0_raw, manual_token0_raw),
+                                    "scratch_vs_released": exact_error_summary(vllm_token0_raw, released_token0_raw),
+                                },
+                                "token0_silu": {
+                                    "full_vs_singleton": exact_error_summary(scratch_output[:, :1], vllm_token0_silu),
+                                    "released_full_vs_singleton": exact_error_summary(
+                                        released_output[:, :1], released_token0_silu
+                                    ),
+                                    "scratch_vs_manual": exact_error_summary(vllm_token0_silu, manual_token0_silu),
+                                    "scratch_vs_released": exact_error_summary(vllm_token0_silu, released_token0_silu),
+                                },
+                            },
+                            "metadata": {
+                                "has_initial_state": has_initial_state.cpu().tolist(),
+                                "num_actual_tokens": num_actual_tokens,
+                                "num_decode_tokens": attn_metadata.num_decode_tokens,
+                                "num_decodes": attn_metadata.num_decodes,
+                                "num_prefills": attn_metadata.num_prefills,
+                                "query_start_loc": query_start_loc.cpu().tolist(),
+                                "spec_sequence_masks": None,
+                                "state_indices": state_indices.cpu().tolist(),
+                            },
+                            "options": {"activation": mixer.activation, "state_layout": "N,C,K-1"},
+                        }
+                    )
                     if (
                         model_destination.ndim == live_output.ndim - 1
                         and model_destination.shape[1:] == live_output.shape[2:]

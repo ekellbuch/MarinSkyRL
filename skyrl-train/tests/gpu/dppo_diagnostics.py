@@ -127,10 +127,17 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
         hook_registrations = []
         learner_fla_capture = None
         learner_fla_restore = None
+        learner_conv_capture = None
+        learner_conv_restore = None
         finalize_fla_capture = None
+        finalize_conv_capture = None
 
         def restore_diagnostic_state():
-            nonlocal learner_fla_restore
+            nonlocal learner_conv_restore, learner_fla_restore
+            if learner_conv_restore is not None:
+                mixer, live_causal_conv1d_fn = learner_conv_restore
+                mixer.causal_conv1d_fn = live_causal_conv1d_fn
+                learner_conv_restore = None
             if learner_fla_restore is not None:
                 mixer, live_chunk_gated_delta_rule = learner_fla_restore
                 mixer.chunk_gated_delta_rule = live_chunk_gated_delta_rule
@@ -200,8 +207,43 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                     entry["mixer_stages"] = {}
                     fla_captures = []
                     entry["fla_core"] = fla_captures
+                    conv_captures = []
+                    entry["causal_conv"] = conv_captures
 
+                    from causal_conv1d import causal_conv1d_fn as released_causal_conv1d_fn
                     from fla.ops.gated_delta_rule import chunk_gated_delta_rule as released_chunk_gated_delta_rule
+
+                    live_causal_conv1d_fn = mixer.causal_conv1d_fn
+
+                    def capture_causal_conv1d(*args, **kwargs):
+                        if conv_captures:
+                            raise RuntimeError("Expected one learner causal-convolution call")
+                        x = kwargs.get("x", args[0] if args else None)
+                        weight = kwargs.get("weight", args[1] if len(args) > 1 else None)
+                        bias = kwargs.get("bias", args[2] if len(args) > 2 else None)
+                        seq_idx = kwargs.get("seq_idx", args[3] if len(args) > 3 else None)
+                        activation = kwargs.get("activation")
+                        if x is None or weight is None:
+                            raise RuntimeError("Missing learner causal-convolution inputs")
+                        captured_x = x.detach().clone()
+                        captured_weight = weight.detach().clone()
+                        captured_bias = bias.detach().clone() if bias is not None else None
+                        live_output = live_causal_conv1d_fn(*args, **kwargs)
+                        if isinstance(live_output, tuple):
+                            raise RuntimeError("Expected learner causal convolution without a returned final state")
+                        conv_captures.append(
+                            {
+                                "activation": activation,
+                                "bias": captured_bias,
+                                "live_output": live_output.detach().clone(),
+                                "seq_idx": seq_idx.detach().clone() if isinstance(seq_idx, torch.Tensor) else seq_idx,
+                                "weight": captured_weight,
+                                "x": captured_x,
+                            }
+                        )
+                        return live_output
+
+                    learner_conv_capture = (mixer, live_causal_conv1d_fn, capture_causal_conv1d)
 
                     live_chunk_gated_delta_rule = mixer.chunk_gated_delta_rule
                     backend_module = importlib.import_module(live_chunk_gated_delta_rule.__module__)
@@ -287,6 +329,100 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                         return live_output, live_final_state
 
                     learner_fla_capture = (mixer, live_chunk_gated_delta_rule, capture_fla_core)
+
+                    def finalize_causal_conv_capture(capture):
+                        captured_x = capture["x"]
+                        captured_weight = capture["weight"]
+                        captured_bias = capture["bias"]
+                        activation = capture["activation"]
+                        live_output = capture["live_output"]
+                        released_output = released_causal_conv1d_fn(
+                            captured_x.clone(),
+                            captured_weight.clone(),
+                            bias=captured_bias.clone() if captured_bias is not None else None,
+                            seq_idx=capture["seq_idx"],
+                            activation=activation,
+                        )
+                        token0_x = captured_x[:, :, :1]
+                        token0_raw = released_causal_conv1d_fn(
+                            token0_x.clone(),
+                            captured_weight.clone(),
+                            bias=captured_bias.clone() if captured_bias is not None else None,
+                            seq_idx=None,
+                            activation=None,
+                        ).transpose(1, 2)
+                        token0_silu = released_causal_conv1d_fn(
+                            token0_x.clone(),
+                            captured_weight.clone(),
+                            bias=captured_bias.clone() if captured_bias is not None else None,
+                            seq_idx=None,
+                            activation="silu",
+                        ).transpose(1, 2)
+                        manual_token0_raw = captured_x[:, :, 0].float() * captured_weight[:, -1].float()
+                        if captured_bias is not None:
+                            manual_token0_raw = manual_token0_raw + captured_bias.float()
+                        manual_token0_raw = manual_token0_raw.to(token0_raw.dtype).unsqueeze(1)
+                        manual_token0_silu = torch.nn.functional.silu(manual_token0_raw.float()).to(token0_silu.dtype)
+
+                        def tensor_payload(tensor):
+                            token_major = tensor.transpose(1, 2)
+                            return {
+                                "fingerprint": canonical_tensor_fingerprint(token_major),
+                                "layout": _tensor_layout(tensor),
+                                "token_fingerprints": _token_fingerprints(token_major),
+                            }
+
+                        return {
+                            "backend": {
+                                "live_callable_is_released": live_causal_conv1d_fn is released_causal_conv1d_fn,
+                                "method": getattr(
+                                    live_causal_conv1d_fn,
+                                    "__qualname__",
+                                    type(live_causal_conv1d_fn).__qualname__,
+                                ),
+                                "method_module": getattr(
+                                    live_causal_conv1d_fn,
+                                    "__module__",
+                                    type(live_causal_conv1d_fn).__module__,
+                                ),
+                            },
+                            "inputs": {
+                                "x": tensor_payload(captured_x),
+                                "weight": {
+                                    "fingerprint": canonical_tensor_fingerprint(captured_weight),
+                                    "layout": _tensor_layout(captured_weight),
+                                },
+                                "bias": (
+                                    {
+                                        "fingerprint": canonical_tensor_fingerprint(captured_bias),
+                                        "layout": _tensor_layout(captured_bias),
+                                    }
+                                    if captured_bias is not None
+                                    else None
+                                ),
+                            },
+                            "live": tensor_payload(live_output),
+                            "released_replay": tensor_payload(released_output),
+                            "comparisons": {
+                                "live_vs_released": _exact_error_summary(live_output, released_output),
+                                "token0_raw": {
+                                    "released_vs_manual": _exact_error_summary(token0_raw, manual_token0_raw),
+                                },
+                                "token0_silu": {
+                                    "released_vs_manual": _exact_error_summary(token0_silu, manual_token0_silu),
+                                },
+                            },
+                            "options": {
+                                "activation": activation,
+                                "seq_idx": (
+                                    capture["seq_idx"].detach().cpu().tolist()
+                                    if isinstance(capture["seq_idx"], torch.Tensor)
+                                    else capture["seq_idx"]
+                                ),
+                            },
+                        }
+
+                    finalize_conv_capture = finalize_causal_conv_capture
 
                     def finalize_fla_capture(capture):
                         captured_inputs = capture["captured_inputs"]
@@ -610,12 +746,20 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                 mixer, live_chunk_gated_delta_rule, capture_fla_core = learner_fla_capture
                 mixer.chunk_gated_delta_rule = capture_fla_core
                 learner_fla_restore = (mixer, live_chunk_gated_delta_rule)
+            if learner_conv_capture is not None:
+                mixer, live_causal_conv1d_fn, capture_causal_conv1d = learner_conv_capture
+                mixer.causal_conv1d_fn = capture_causal_conv1d
+                learner_conv_restore = (mixer, live_causal_conv1d_fn)
         except BaseException:
             restore_diagnostic_state()
             raise
         try:
             with torch.no_grad():
                 model_output = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                if learner_conv_restore is not None:
+                    conv_mixer, live_causal_conv1d_fn = learner_conv_restore
+                    conv_mixer.causal_conv1d_fn = live_causal_conv1d_fn
+                    learner_conv_restore = None
                 if learner_fla_restore is not None:
                     fla_mixer, live_chunk_gated_delta_rule = learner_fla_restore
                     fla_mixer.chunk_gated_delta_rule = live_chunk_gated_delta_rule
@@ -624,6 +768,14 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                     if finalize_fla_capture is None:
                         raise RuntimeError("Missing learner FLA capture finalizer")
                     for layer_entry in layer_captures:
+                        causal_conv = layer_entry.get("causal_conv")
+                        if causal_conv is not None:
+                            if finalize_conv_capture is None or len(causal_conv) != 1:
+                                raise RuntimeError(
+                                    f"Expected one learner causal-convolution capture in layer "
+                                    f"{layer_entry['layer']}, got {len(causal_conv)}"
+                                )
+                            causal_conv[0] = finalize_conv_capture(causal_conv[0])
                         fla_core = layer_entry.get("fla_core")
                         if fla_core is None:
                             continue

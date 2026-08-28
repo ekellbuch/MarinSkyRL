@@ -847,31 +847,45 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                     }
                                 engine_initial_state = engine_fla_core["inputs"]["initial_state"]
                                 engine_causal_conv = engine_layer.pop("causal_conv")
-                                learner_post_conv_qkv = learner_fla_core["post_conv_qkv"]
+                                learner_causal_conv = learner_layer.pop("causal_conv")
                                 fla_core = {
                                     "cross_engine": {
                                         "causal_conv": {
-                                            "learner_vs_engine_live": {
+                                            "inputs": {
+                                                "weight_fingerprint_exact": (
+                                                    learner_causal_conv["inputs"]["weight"]["fingerprint"]
+                                                    == engine_causal_conv["inputs"]["weight"]["fingerprint"]
+                                                ),
+                                                "x_fingerprint_exact": (
+                                                    learner_causal_conv["inputs"]["x"]["fingerprint"]
+                                                    == engine_causal_conv["inputs"]["x"]["fingerprint"]
+                                                ),
+                                                "x_token_fingerprints": _token_fingerprint_summary(
+                                                    learner_causal_conv["inputs"]["x"]["token_fingerprints"],
+                                                    engine_causal_conv["inputs"]["x"]["token_fingerprints"],
+                                                ),
+                                            },
+                                            "learner_live_vs_engine_scratch": {
                                                 "fingerprint_exact": (
-                                                    learner_post_conv_qkv["fingerprint"]
-                                                    == engine_causal_conv["live"]["fingerprint"]
+                                                    learner_causal_conv["live"]["fingerprint"]
+                                                    == engine_causal_conv["scratch_replay"]["fingerprint"]
                                                 ),
                                                 "token_fingerprints": _token_fingerprint_summary(
-                                                    learner_post_conv_qkv["token_fingerprints"],
-                                                    engine_causal_conv["live"]["token_fingerprints"],
+                                                    learner_causal_conv["live"]["token_fingerprints"],
+                                                    engine_causal_conv["scratch_replay"]["token_fingerprints"],
                                                 ),
                                             },
                                             "learner_vs_released_replay": {
                                                 "fingerprint_exact": (
-                                                    learner_post_conv_qkv["fingerprint"]
+                                                    learner_causal_conv["released_replay"]["fingerprint"]
                                                     == engine_causal_conv["released_replay"]["fingerprint"]
                                                 ),
                                                 "token_fingerprints": _token_fingerprint_summary(
-                                                    learner_post_conv_qkv["token_fingerprints"],
+                                                    learner_causal_conv["released_replay"]["token_fingerprints"],
                                                     engine_causal_conv["released_replay"]["token_fingerprints"],
                                                 ),
                                             },
-                                            "learner": learner_post_conv_qkv,
+                                            "learner": learner_causal_conv,
                                             "engine": engine_causal_conv,
                                         },
                                         "inputs": input_comparisons,

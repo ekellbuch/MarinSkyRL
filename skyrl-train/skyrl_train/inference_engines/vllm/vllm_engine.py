@@ -1098,6 +1098,8 @@ class WorkerWrap:
                 fla_outputs = []
                 fla_captures = []
                 entry["fla_core"] = fla_captures
+                causal_conv_captures = []
+                entry["causal_conv"] = causal_conv_captures
                 if hasattr(mixer, "in_proj_qkv"):
                     layer_hooks.extend(
                         (
@@ -1396,7 +1398,102 @@ class WorkerWrap:
                     model_destination = kwargs.get("core_attn_out")
                     if model_destination is None:
                         model_destination = args[3]
-                    result = original(*args, **kwargs)
+
+                    from causal_conv1d import causal_conv1d_fn as released_causal_conv1d_fn
+                    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
+
+                    live_causal_conv1d_fn = qwen_gdn_linear_attn.causal_conv1d_fn
+
+                    def capture_causal_conv1d(*conv_args, **conv_kwargs):
+                        if causal_conv_captures:
+                            raise RuntimeError("Expected one layer-zero causal-convolution call")
+                        x = conv_args[0]
+                        weight = conv_args[1]
+                        bias = conv_args[2]
+                        conv_states = conv_kwargs["conv_states"]
+                        query_start_loc = conv_kwargs["query_start_loc"]
+                        has_initial_state = conv_kwargs["has_initial_state"]
+                        metadata = conv_kwargs["metadata"]
+                        if query_start_loc.detach().cpu().tolist() != [0, x.shape[1]]:
+                            raise RuntimeError(
+                                "Expected one complete prefill sequence in the causal-convolution diagnostic"
+                            )
+                        if has_initial_state is None or torch.any(has_initial_state):
+                            raise RuntimeError("Expected a zero-state causal-convolution prefill")
+                        if metadata.num_prefills != 1 or metadata.num_decodes != 0:
+                            raise RuntimeError(
+                                "Expected one prefill and no decodes in the causal-convolution diagnostic"
+                            )
+
+                        captured_x = x.detach().clone()
+                        captured_weight = weight.detach().clone()
+                        captured_bias = bias.detach().clone() if bias is not None else None
+                        live_output = live_causal_conv1d_fn(*conv_args, **conv_kwargs)
+                        released_output = released_causal_conv1d_fn(
+                            captured_x.unsqueeze(0),
+                            captured_weight,
+                            bias=captured_bias,
+                            seq_idx=None,
+                            activation=conv_kwargs["activation"],
+                        ).squeeze(0)
+                        token_major_x = captured_x.transpose(0, 1).unsqueeze(0)
+                        token_major_live_output = live_output.transpose(0, 1).unsqueeze(0)
+                        token_major_released_output = released_output.transpose(0, 1).unsqueeze(0)
+                        causal_conv_captures.append(
+                            {
+                                "inputs": {
+                                    "x": {
+                                        "fingerprint": canonical_tensor_fingerprint(token_major_x),
+                                        "layout": tensor_layout(captured_x),
+                                        "token_fingerprints": token_fingerprints(token_major_x),
+                                    },
+                                    "weight": {
+                                        "fingerprint": canonical_tensor_fingerprint(captured_weight),
+                                        "layout": tensor_layout(captured_weight),
+                                    },
+                                    "bias": (
+                                        {
+                                            "fingerprint": canonical_tensor_fingerprint(captured_bias),
+                                            "layout": tensor_layout(captured_bias),
+                                        }
+                                        if captured_bias is not None
+                                        else None
+                                    ),
+                                    "conv_states_layout": tensor_layout(conv_states),
+                                    "has_initial_state": has_initial_state.detach().cpu().tolist(),
+                                    "query_start_loc": query_start_loc.detach().cpu().tolist(),
+                                },
+                                "live": {
+                                    "fingerprint": canonical_tensor_fingerprint(token_major_live_output),
+                                    "layout": tensor_layout(live_output),
+                                    "token_fingerprints": token_fingerprints(token_major_live_output),
+                                },
+                                "released_replay": {
+                                    "fingerprint": canonical_tensor_fingerprint(token_major_released_output),
+                                    "layout": tensor_layout(released_output),
+                                    "token_fingerprints": token_fingerprints(token_major_released_output),
+                                },
+                                "live_vs_released_replay": exact_error_summary(live_output, released_output),
+                                "metadata": {
+                                    "num_actual_tokens": metadata.num_actual_tokens,
+                                    "num_decode_tokens": metadata.num_decode_tokens,
+                                    "num_decodes": metadata.num_decodes,
+                                    "num_prefills": metadata.num_prefills,
+                                },
+                                "options": {
+                                    "activation": conv_kwargs["activation"],
+                                },
+                            }
+                        )
+                        return live_output
+
+                    qwen_gdn_linear_attn.causal_conv1d_fn = capture_causal_conv1d
+                    try:
+                        result = original(*args, **kwargs)
+                    finally:
+                        qwen_gdn_linear_attn.causal_conv1d_fn = live_causal_conv1d_fn
+                    if len(causal_conv_captures) != 1:
+                        raise RuntimeError("Expected one captured layer-zero causal-convolution call")
                     if len(fla_outputs) != 1 or len(fla_captures) != 1:
                         raise RuntimeError("Expected one live FLA output before the model destination capture")
                     live_output = fla_outputs.pop()
@@ -1615,6 +1712,14 @@ class WorkerWrap:
                     if "model_destination" not in fla_core[0]:
                         raise RuntimeError(f"Missing vLLM model destination capture in layer {layer_entry['layer']}")
                     layer_entry["fla_core"] = fla_core[0]
+                causal_conv = layer_entry.get("causal_conv")
+                if causal_conv is not None:
+                    if len(causal_conv) != 1:
+                        raise RuntimeError(
+                            f"Expected one vLLM causal-convolution capture in layer "
+                            f"{layer_entry['layer']}, got {len(causal_conv)}"
+                        )
+                    layer_entry["causal_conv"] = causal_conv[0]
             captures[0]["layer_trace"] = self._skyrl_layer_captures
         del self._skyrl_original_compute_logits
         del self._skyrl_had_instance_compute_logits

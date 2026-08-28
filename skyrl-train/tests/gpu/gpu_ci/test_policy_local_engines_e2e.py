@@ -846,8 +846,34 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                                         "engine": engine_input,
                                     }
                                 engine_initial_state = engine_fla_core["inputs"]["initial_state"]
+                                engine_causal_conv = engine_layer.pop("causal_conv")
+                                learner_post_conv_qkv = learner_fla_core["post_conv_qkv"]
                                 fla_core = {
                                     "cross_engine": {
+                                        "causal_conv": {
+                                            "learner_vs_engine_live": {
+                                                "fingerprint_exact": (
+                                                    learner_post_conv_qkv["fingerprint"]
+                                                    == engine_causal_conv["live"]["fingerprint"]
+                                                ),
+                                                "token_fingerprints": _token_fingerprint_summary(
+                                                    learner_post_conv_qkv["token_fingerprints"],
+                                                    engine_causal_conv["live"]["token_fingerprints"],
+                                                ),
+                                            },
+                                            "learner_vs_released_replay": {
+                                                "fingerprint_exact": (
+                                                    learner_post_conv_qkv["fingerprint"]
+                                                    == engine_causal_conv["released_replay"]["fingerprint"]
+                                                ),
+                                                "token_fingerprints": _token_fingerprint_summary(
+                                                    learner_post_conv_qkv["token_fingerprints"],
+                                                    engine_causal_conv["released_replay"]["token_fingerprints"],
+                                                ),
+                                            },
+                                            "learner": learner_post_conv_qkv,
+                                            "engine": engine_causal_conv,
+                                        },
                                         "inputs": input_comparisons,
                                         "output_fingerprint_exact": (
                                             learner_fla_core["live"]["output"]["fingerprint"]

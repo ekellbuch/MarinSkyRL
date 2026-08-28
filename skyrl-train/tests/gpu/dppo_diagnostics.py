@@ -387,6 +387,14 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                 payload["normalized_fingerprint"] = canonical_tensor_fingerprint(normalized)
                                 payload["normalized_token_fingerprints"] = _token_fingerprints(normalized)
                             input_payloads[name] = payload
+                        post_conv_qkv = torch.cat(
+                            [
+                                captured_inputs["q"].flatten(2),
+                                captured_inputs["k"].flatten(2),
+                                captured_inputs["v"].flatten(2),
+                            ],
+                            dim=-1,
+                        )
                         live_output = capture["live_output"]
                         live_final_state = capture["live_final_state"]
                         return {
@@ -424,6 +432,11 @@ class DPPOPolicyWorker(FSDPPolicyWorkerBase):
                                 "segment_boundaries": [list(boundary) for boundary in segment_boundaries],
                             },
                             "inputs": input_payloads,
+                            "post_conv_qkv": {
+                                "fingerprint": canonical_tensor_fingerprint(post_conv_qkv),
+                                "layout": _tensor_layout(post_conv_qkv),
+                                "token_fingerprints": _token_fingerprints(post_conv_qkv),
+                            },
                             "zero_initial_state": {
                                 "fingerprint": canonical_tensor_fingerprint(zero_state),
                                 "layout": _tensor_layout(zero_state),

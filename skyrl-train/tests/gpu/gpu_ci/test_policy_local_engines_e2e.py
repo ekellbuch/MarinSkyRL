@@ -122,6 +122,27 @@ class _StepMetrics(TrainerCallback):
         self.metrics = dict(state.metrics)
 
 
+class _PreinitializedWeightSyncTrainer(RayPPOTrainer):
+    """Reuse the communicator and rollout weights established by this test."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._reuse_preloaded_rollout_weights = True
+        self.weight_sync_calls = 0
+
+    def init_weight_sync_state(self):
+        # The test initializes this state before load 1 so it can verify the
+        # learner/vLLM handshake independently of the optimizer update.
+        return None
+
+    async def _sync_policy_for_rollouts(self):
+        self.weight_sync_calls += 1
+        if self._reuse_preloaded_rollout_weights:
+            self._reuse_preloaded_rollout_weights = False
+            return
+        await super()._sync_policy_for_rollouts()
+
+
 def _percentile(values: list[float], quantile: float) -> float:
     ordered = sorted(values)
     position = (len(ordered) - 1) * quantile
@@ -240,6 +261,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 cfg.generator.max_logprobs = 2
         if VERIFY_DPPO_UPDATE:
             assert VERIFY_PARITY, "The DPPO update gate includes both pre- and post-update parity checks"
+            assert not colocate_all, "The DPPO update gate uses separate learner and inference GPUs"
             cfg.generator.n_samples_per_prompt = 2
             cfg.generator.sampling_params.max_generate_length = PARITY_TOKENS_PER_PROMPT
             cfg.generator.sampling_params.logprobs = 1
@@ -491,7 +513,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             if VERIFY_DPPO_UPDATE:
                 trajectory_runner = _InferenceTrajectoryRunner(client)
                 step_metrics = _StepMetrics()
-                trainer = RayPPOTrainer(
+                trainer = _PreinitializedWeightSyncTrainer(
                     cfg=cfg,
                     tracker=Tracking("gpu-ci", "dppo-one-update", backends="console", config=cfg),
                     tokenizer=client.tokenizer,
@@ -504,6 +526,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 trainer.policy_model = policy
                 asyncio.run(trainer._train_loop())
                 assert trainer.global_step == 1
+                assert trainer.weight_sync_calls == 2
                 assert step_metrics.metrics is not None
                 assert trajectory_runner.last_batch is not None
 
@@ -551,8 +574,6 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                     },
                     "metrics": update_metrics,
                 }
-                if colocate_all:
-                    asyncio.run(trainer._sync_policy_for_rollouts())
                 print(f"Completed one real DPPO optimizer update: {json.dumps(dppo_update_evidence, sort_keys=True)}")
             else:
                 mutation_results = ray.get(

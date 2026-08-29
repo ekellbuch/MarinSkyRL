@@ -33,6 +33,13 @@ FLASH_ATTN = os.environ.get("SKYRL_GPU_TEST_FLASH_ATTN", "0") == "1"
 VERIFY_PARITY = os.environ.get("SKYRL_GPU_TEST_VERIFY_PARITY", "0") == "1"
 VERIFY_DPPO_UPDATE = os.environ.get("SKYRL_GPU_TEST_VERIFY_DPPO_UPDATE", "0") == "1"
 EXPECTED_VLLM_ENGINE_SHA256 = os.environ.get("SKYRL_GPU_TEST_VLLM_ENGINE_SHA256")
+# "assert" aborts on the first failed learner/vLLM parity gate. "report" records every
+# gate outcome and continues through load 2 and the DPPO update, so the smoke measures
+# the learner/rollout logprob mismatch that DPPO is designed to absorb instead of
+# requiring bitwise-like agreement between the two engines up front.
+PARITY_GATE_MODE = os.environ.get("SKYRL_GPU_TEST_PARITY_GATE", "assert")
+if PARITY_GATE_MODE not in {"assert", "report"}:
+    raise ValueError(f"SKYRL_GPU_TEST_PARITY_GATE must be assert or report, got {PARITY_GATE_MODE!r}")
 PARITY_PROMPTS = (
     "Reply with four words about the sky.",
     "Name four common kitchen items.",
@@ -50,6 +57,15 @@ DPPO_DIVERGENCE_THRESHOLD = 0.1
 # the p95 pair below 50%.
 MAX_SELECTED_LOGPROB_ERROR = math.log1p(0.8 * DPPO_DIVERGENCE_THRESHOLD)
 P95_SELECTED_LOGPROB_ERROR = math.log1p(0.5 * DPPO_DIVERGENCE_THRESHOLD)
+
+
+def _check_gate(name: str, passed: bool, payload) -> None:
+    """Assert a parity gate, or in report mode record its outcome and continue."""
+    if PARITY_GATE_MODE == "assert":
+        assert passed, payload
+        return
+    record = {"gate": name, "passed": bool(passed), "payload": payload}
+    print(f"SKYRL_DPPO_PARITY_GATE {json.dumps(record, sort_keys=True, allow_nan=False)}")
 
 
 def test_compact_layer_capture_preserves_causal_conv_payload() -> None:
@@ -1268,8 +1284,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                         "SKYRL_DPPO_FAST_PATH_DIAGNOSTIC "
                         f"{json.dumps(diagnostic_payload, sort_keys=True, allow_nan=False)}"
                     )
-                assert load_gate["max"]["passed"], load_gate
-                assert load_gate["p95"]["passed"], load_gate
+                _check_gate(f"load_{update_index}_max", load_gate["max"]["passed"], load_gate)
+                _check_gate(f"load_{update_index}_p95", load_gate["p95"]["passed"], load_gate)
             print(
                 f"Verified rollout logprobs after complete load {update_index} "
                 f"for {sum(map(len, response_logprobs))} tokens"
@@ -1314,7 +1330,11 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 assert all(math.isfinite(value) for value in update_metrics.values()), update_metrics
                 assert update_metrics["policy/raw_grad_norm"] > 0.0, update_metrics
                 assert update_metrics["policy/policy_update_steps"] == 1.0, update_metrics
-                assert update_metrics["policy/dppo/masked_fraction"] == 0.0, update_metrics
+                _check_gate(
+                    "dppo_masked_fraction_zero",
+                    update_metrics["policy/dppo/masked_fraction"] == 0.0,
+                    update_metrics,
+                )
 
                 batch = trajectory_runner.last_batch
                 active_tokens = sum(sum(mask) for mask in batch["loss_masks"])
@@ -1382,10 +1402,15 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 }
                 print(f"SKYRL_DPPO_UPDATE_RESULT {json.dumps(dppo_update_evidence, sort_keys=True, allow_nan=False)}")
             assert len(parity_values) == 2 * len(PARITY_PROMPTS) * PARITY_TOKENS_PER_PROMPT
-            assert all(value["top1_match"] for value in parity_values), parity_values
-            overall_gate = _logprob_error_gate(_error_summary(parity_values))
-            assert overall_gate["max"]["passed"], overall_gate
-            assert overall_gate["p95"]["passed"], overall_gate
+            overall_summary = _error_summary(parity_values)
+            _check_gate(
+                "overall_top1",
+                overall_summary["top1_matches"] == overall_summary["comparisons"],
+                overall_summary,
+            )
+            overall_gate = _logprob_error_gate(overall_summary)
+            _check_gate("overall_max", overall_gate["max"]["passed"], overall_gate)
+            _check_gate("overall_p95", overall_gate["p95"]["passed"], overall_gate)
             outputs = second_outputs
         else:
             sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)

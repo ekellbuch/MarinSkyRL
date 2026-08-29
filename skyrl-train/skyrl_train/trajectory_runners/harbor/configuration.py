@@ -504,7 +504,7 @@ class HarborConfigBuilder:
     # (so the schema validator doesn't flag them as "unknown"). PRM lives here
     # because it's consumed directly by _build_prm_turn_callback to construct
     # a turn_callback, not by the schema-based field-mapping pipeline.
-    SKYRL_EXTENSION_KEYS = frozenset({"prm"})
+    SKYRL_EXTENSION_KEYS = frozenset({"environment_kwargs", "prm"})
 
     def _validate_config(self) -> None:
         """Validate config and issue warnings for unknown/unsupported fields."""
@@ -597,6 +597,12 @@ class HarborConfigBuilder:
         # Default to Daytona if neither type nor import_path specified
         if "type" not in env_fields and "import_path" not in env_fields:
             env_fields["type"] = EnvironmentType.DAYTONA
+
+        # Generic environment_kwargs passthrough. The schema maps only the fields it
+        # names; backends such as GKE take constructor arguments it has never heard
+        # of, so this dict goes through untouched. Named fields win on collision.
+        for key, value in dict(self._harbor_cfg.get("environment_kwargs") or {}).items():
+            env_kwargs.setdefault(key, value)
 
         # Add kwargs if any were collected
         if env_kwargs:

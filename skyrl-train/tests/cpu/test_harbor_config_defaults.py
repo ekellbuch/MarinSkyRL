@@ -103,3 +103,25 @@ def test_trial_attempt_timeout_reaches_harbor_trial_config():
 
 def test_trial_attempt_timeout_remains_unset_when_omitted():
     assert _trial_config({}).trial_attempt_timeout_sec is None
+
+
+def test_environment_kwargs_reach_the_backend_constructor():
+    trial_config = _trial_config(
+        {
+            "environment_type": "gke",
+            "env_cpu": 4,
+            "environment_kwargs": {
+                "project_id": "soe-hazy-gemini",
+                "cluster_name": "harbor-tb21",
+                "region": "asia-northeast3",
+                "cpu": 99,
+            },
+        }
+    )
+
+    assert trial_config.environment.type.value == "gke"
+    assert trial_config.environment.kwargs["project_id"] == "soe-hazy-gemini"
+    assert trial_config.environment.kwargs["cluster_name"] == "harbor-tb21"
+    assert trial_config.environment.kwargs["region"] == "asia-northeast3"
+    # The schema-named field keeps precedence over the passthrough dict.
+    assert trial_config.environment.kwargs["cpu"] == 4

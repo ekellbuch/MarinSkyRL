@@ -40,6 +40,18 @@ EXPECTED_VLLM_ENGINE_SHA256 = os.environ.get("SKYRL_GPU_TEST_VLLM_ENGINE_SHA256"
 PARITY_GATE_MODE = os.environ.get("SKYRL_GPU_TEST_PARITY_GATE", "assert")
 if PARITY_GATE_MODE not in {"assert", "report"}:
     raise ValueError(f"SKYRL_GPU_TEST_PARITY_GATE must be assert or report, got {PARITY_GATE_MODE!r}")
+# "console" keeps the original tracker. "wandb" sends the DPPO update metrics, the
+# per-load parity summaries, and every gate outcome to one Weights & Biases run so a
+# PR can link the evidence instead of pointing at files on the GPU host.
+TRACKER_BACKEND = os.environ.get("SKYRL_GPU_TEST_TRACKER", "console")
+if TRACKER_BACKEND not in {"console", "wandb"}:
+    raise ValueError(f"SKYRL_GPU_TEST_TRACKER must be console or wandb, got {TRACKER_BACKEND!r}")
+WANDB_PROJECT = os.environ.get("SKYRL_GPU_TEST_WANDB_PROJECT")
+WANDB_ENTITY = os.environ.get("SKYRL_GPU_TEST_WANDB_ENTITY")
+RUN_NAME = os.environ.get("SKYRL_GPU_TEST_RUN_NAME", "dppo-one-update")
+if TRACKER_BACKEND == "wandb" and not WANDB_PROJECT:
+    raise ValueError("SKYRL_GPU_TEST_WANDB_PROJECT is required when SKYRL_GPU_TEST_TRACKER=wandb")
+GATE_OUTCOMES: dict[str, bool] = {}
 PARITY_PROMPTS = (
     "Reply with four words about the sky.",
     "Name four common kitchen items.",
@@ -61,11 +73,39 @@ P95_SELECTED_LOGPROB_ERROR = math.log1p(0.5 * DPPO_DIVERGENCE_THRESHOLD)
 
 def _check_gate(name: str, passed: bool, payload) -> None:
     """Assert a parity gate, or in report mode record its outcome and continue."""
+    GATE_OUTCOMES[name] = bool(passed)
     if PARITY_GATE_MODE == "assert":
         assert passed, payload
         return
     record = {"gate": name, "passed": bool(passed), "payload": payload}
     print(f"SKYRL_DPPO_PARITY_GATE {json.dumps(record, sort_keys=True, allow_nan=False)}")
+
+
+def _build_tracker(cfg) -> Tracking:
+    if TRACKER_BACKEND == "wandb":
+        if WANDB_ENTITY:
+            os.environ["WANDB_ENTITY"] = WANDB_ENTITY
+        tracker = Tracking(WANDB_PROJECT, RUN_NAME, backends="wandb", config=cfg)
+        run = tracker.logger["wandb"]
+        record = {"entity": run.entity, "id": run.id, "project": run.project, "url": run.url}
+        print(f"SKYRL_DPPO_WANDB_RUN {json.dumps(record, sort_keys=True)}")
+        return tracker
+    return Tracking("gpu-ci", RUN_NAME, backends="console", config=cfg)
+
+
+def _wandb_summary(tracker, values: dict) -> None:
+    """Record step-independent parity evidence on the W&B run; a no-op for the console tracker."""
+    if tracker is None or "wandb" not in tracker.logger:
+        return
+    tracker.logger["wandb"].summary.update(values)
+
+
+def _flatten_summary(prefix: str, summary: dict) -> dict:
+    values = {f"{prefix}/comparisons": summary["comparisons"], f"{prefix}/top1_matches": summary["top1_matches"]}
+    for kind in ("absolute_error", "relative_error"):
+        for stat, value in summary[kind].items():
+            values[f"{prefix}/{kind}/{stat}"] = value
+    return values
 
 
 def test_compact_layer_capture_preserves_causal_conv_payload() -> None:
@@ -317,6 +357,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
     """
     Tests initalizing the policy actor group and inference engine, syncing weights, and performing generation.
     """
+    tracker = None
     try:
         cfg = get_test_actor_config()
         cfg.trainer.placement.colocate_all = colocate_all
@@ -604,6 +645,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                     f"{json.dumps({'summary': _error_summary(load_values), 'pairs': load_values}, sort_keys=True)}"
                 )
                 emit_parity_result()
+                _wandb_summary(tracker, _flatten_summary(f"parity/load_{update_index}", _error_summary(load_values)))
                 load_gate = _logprob_error_gate(_error_summary(load_values))
 
                 if not all(entry["passed"] for entry in load_gate.values()):
@@ -1293,6 +1335,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             return outputs
 
         if VERIFY_PARITY:
+            if VERIFY_DPPO_UPDATE or TRACKER_BACKEND == "wandb":
+                tracker = _build_tracker(cfg)
             first_engine_weights = verify_synced_weights(1)
             generate_with_logprob_checks(1)
             dppo_update_evidence = None
@@ -1301,7 +1345,7 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
                 step_metrics = _StepMetrics()
                 trainer = _PreinitializedWeightSyncTrainer(
                     cfg=cfg,
-                    tracker=Tracking("gpu-ci", "dppo-one-update", backends="console", config=cfg),
+                    tracker=tracker,
                     tokenizer=client.tokenizer,
                     train_dataset=_OnePromptDataset(),
                     inference_engine_client=client,
@@ -1411,6 +1455,8 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             overall_gate = _logprob_error_gate(overall_summary)
             _check_gate("overall_max", overall_gate["max"]["passed"], overall_gate)
             _check_gate("overall_p95", overall_gate["p95"]["passed"], overall_gate)
+            _wandb_summary(tracker, _flatten_summary("parity/overall", overall_summary))
+            _wandb_summary(tracker, {f"parity/gate/{name}": int(passed) for name, passed in GATE_OUTCOMES.items()})
             outputs = second_outputs
         else:
             sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
@@ -1418,4 +1464,6 @@ def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_ba
             assert len(outputs["responses"]) == len(outputs["response_ids"])
         print(f"Example output: {outputs['responses'][0]}, {outputs['stop_reasons'][0]}")
     finally:
+        if tracker is not None and "wandb" in tracker.logger:
+            tracker.logger["wandb"].finish()
         ray.shutdown()

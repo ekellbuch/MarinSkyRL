@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from skyrl_train.trajectory_runners.trajectory_processing import (
     apply_overlong_filtering,
+    classify_reward_groups,
     concatenate_trajectory_batches,
     minimum_captured_global_step,
     encode_messages_subset,
@@ -973,3 +974,54 @@ def test_required_rollout_logprobs_reject_partial_generation_batch():
             require_rollout_logprobs=True,
             tis_lcs_alert_threshold=0.005,
         )
+
+
+def _graded_output(instance_id, reward, *, stop_reason="stop", baseline_eligible=True, exception_type=None):
+    return SimpleNamespace(
+        trajectory_id=SimpleNamespace(instance_id=instance_id),
+        evidence=SimpleNamespace(stop_reason=stop_reason),
+        disposition=SimpleNamespace(baseline_eligible=baseline_eligible, exception_type=exception_type),
+        reward_result=SimpleNamespace(optimization_reward=reward),
+    )
+
+
+def test_classify_reward_groups_counts_composition_from_requested_rollouts():
+    outputs = [
+        # all_one: every requested member graded positive
+        _graded_output("a", 1.0),
+        _graded_output("a", 1.0),
+        # all_zero: graded, unanimous zero (one member truncated but still graded)
+        _graded_output("b", 0.0),
+        _graded_output("b", 0.0, stop_reason="length"),
+        # nonconstant: mixed rewards; one agent timeout graded zero
+        _graded_output("c", 1.0),
+        _graded_output("c", 0.0, exception_type="AgentTimeoutError"),
+        # incomplete: an infrastructure failure hides the group's true composition
+        _graded_output("d", 0.0),
+        _graded_output("d", 0.0, stop_reason="error", baseline_eligible=False),
+        # incomplete: only one of two requested rollouts came back
+        _graded_output("e", 1.0),
+    ]
+    expected = {"a": 2, "b": 2, "c": 2, "d": 2, "e": 2}
+
+    metrics = classify_reward_groups(outputs, expected)
+
+    assert metrics["generate/num_groups"] == 5
+    assert metrics["generate/num_expected_samples"] == 10
+    assert metrics["generate/num_graded_samples"] == 8
+    assert metrics["generate/num_infrastructure_failures"] == 1
+    assert metrics["generate/num_agent_timeouts"] == 1
+    assert metrics["generate/num_truncated_samples"] == 1
+    assert metrics["generate/num_all_one_groups"] == 1
+    assert metrics["generate/num_all_zero_groups"] == 1
+    assert metrics["generate/num_nonconstant_groups"] == 1
+    assert metrics["generate/num_incomplete_groups"] == 2
+    assert metrics["generate/frac_nonconstant_groups"] == pytest.approx(0.2)
+    assert metrics["generate/infrastructure_failure_fraction"] == pytest.approx(0.1)
+
+
+def test_classify_reward_groups_with_no_outputs_reports_nan_fractions():
+    metrics = classify_reward_groups([], {})
+
+    assert metrics["generate/num_groups"] == 0
+    assert metrics["generate/frac_all_zero_groups"] != metrics["generate/frac_all_zero_groups"]  # NaN

@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from typing import Callable, Deque, List, Optional, Dict, Any, Tuple
 
@@ -22,6 +22,7 @@ from skyrl_train.trajectory_runners.projections import project_loss_mask
 from skyrl_train.metric_names import TIS_LCS_FALLBACK_ALERT_METRIC, TIS_METRIC_PREFIX
 from skyrl_train.trajectory_runners.trajectory_processing import (
     BATCH_ERROR_METRIC_PREFIX,
+    classify_reward_groups,
     get_batch_failure_metrics,
     get_rollout_metrics,
     get_response_ids_and_loss_mask_from_messages,
@@ -1104,6 +1105,14 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         #   - If ALL trajectories in a group fail, they all get excluded from baseline
         enable_error_classification = self._error_handling_config.enable_error_classification
 
+        # Group composition is measured on every requested rollout, before the
+        # loops below zero failed trajectories, so a dead sandbox never reads as
+        # a unanimous zero-reward group.
+        expected_per_group: Dict[str, int] = defaultdict(int)
+        for trajectory_id in trajectory_ids:
+            expected_per_group[trajectory_id.instance_id] += 1
+        group_metrics = classify_reward_groups(all_outputs, expected_per_group)
+
         failed_instance_ids = set()
         num_failed_trajectories = 0  # per-trajectory, rather than per-instance
         num_masked_trajectories = 0  # trajectories excluded from baseline
@@ -1174,6 +1183,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 rollout_metrics["generate/out_tok_p90_p25_ratio"] = p90 / p25 if p25 > 0 else 0.0
         else:
             rollout_metrics = {}
+        rollout_metrics.update(group_metrics)
         rollout_metrics.update(
             get_batch_failure_metrics(
                 num_trials,

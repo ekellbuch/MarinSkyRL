@@ -874,6 +874,77 @@ def _merge_batch_failure_metrics(trajectory_batches: List[TrajectoryBatch]) -> d
     return merged
 
 
+def classify_reward_groups(outputs: Iterable[Any], expected_per_group: Dict[str, int]) -> Dict[str, float]:
+    """Describe the reward composition of every requested rollout group.
+
+    ``outputs`` is every rollout that came back for a batch, before the loops
+    that zero failed trajectories. Groups are keyed by ``trajectory_id.instance_id``
+    and ``expected_per_group`` says how many rollouts each instance asked for, so a
+    group with a missing or infrastructure-failed member counts as ``incomplete``
+    rather than as unanimous. A group is ``all_zero`` or ``all_one`` only when every
+    requested member was graded; ``nonconstant`` groups are the ones that carry a
+    learning signal under a group-baseline estimator.
+
+    Each rollout is one of: infrastructure failure (``stop_reason == "error"`` and
+    not baseline eligible), agent timeout (``exception_type == "AgentTimeoutError"``,
+    graded zero), truncated (``stop_reason == "length"``, still graded), or a graded
+    verifier outcome.
+    """
+    groups: Dict[str, List[Any]] = defaultdict(list)
+    for output in outputs:
+        groups[output.trajectory_id.instance_id].append(output)
+
+    num_all_zero = num_all_one = num_nonconstant = num_incomplete = 0
+    num_graded = num_infra = num_timeout = num_truncated = 0
+    for instance_id, members in groups.items():
+        rewards: List[float] = []
+        complete = len(members) >= expected_per_group.get(instance_id, len(members))
+        for output in members:
+            stop_reason = output.evidence.stop_reason
+            if stop_reason == "error" and not output.disposition.baseline_eligible:
+                num_infra += 1
+                complete = False
+                continue
+            if output.disposition.exception_type == "AgentTimeoutError":
+                num_timeout += 1
+            if stop_reason == "length":
+                num_truncated += 1
+            rewards.append(float(output.reward_result.optimization_reward))
+            num_graded += 1
+        if not complete or not rewards:
+            num_incomplete += 1
+        elif all(reward > 0 for reward in rewards):
+            num_all_one += 1
+        elif all(reward <= 0 for reward in rewards):
+            num_all_zero += 1
+        else:
+            num_nonconstant += 1
+
+    num_groups = len(groups)
+    expected_total = sum(expected_per_group.get(instance_id, len(members)) for instance_id, members in groups.items())
+
+    def fraction(count: int) -> float:
+        return count / num_groups if num_groups else float("nan")
+
+    return {
+        "generate/num_groups": num_groups,
+        "generate/num_expected_samples": expected_total,
+        "generate/num_graded_samples": num_graded,
+        "generate/num_infrastructure_failures": num_infra,
+        "generate/num_agent_timeouts": num_timeout,
+        "generate/num_truncated_samples": num_truncated,
+        "generate/num_all_zero_groups": num_all_zero,
+        "generate/num_all_one_groups": num_all_one,
+        "generate/num_nonconstant_groups": num_nonconstant,
+        "generate/num_incomplete_groups": num_incomplete,
+        "generate/frac_all_zero_groups": fraction(num_all_zero),
+        "generate/frac_all_one_groups": fraction(num_all_one),
+        "generate/frac_nonconstant_groups": fraction(num_nonconstant),
+        "generate/frac_incomplete_groups": fraction(num_incomplete),
+        "generate/infrastructure_failure_fraction": num_infra / expected_total if expected_total else float("nan"),
+    }
+
+
 def get_batch_failure_metrics(
     num_trials: int,
     num_failed_trajectories: int,

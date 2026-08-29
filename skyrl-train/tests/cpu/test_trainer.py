@@ -200,7 +200,12 @@ def test_intermediate_checkpoint_does_not_suppress_non_storage_failure():
 def test_sync_trainer_attaches_global_loss_denominator_before_dispatch(monkeypatch):
     trainer = object.__new__(RayPPOTrainer)
     trainer.cfg = OmegaConf.create(
-        {"trainer": {"algorithm": {"loss_reduction": "seq_mean_token_sum_norm_global", "max_seq_len": 8}}}
+        {
+            "trainer": {
+                "algorithm": {"loss_reduction": "seq_mean_token_sum_norm_global", "max_seq_len": 8},
+                "token_stats": {"enabled": False},
+            }
+        }
     )
     trainer.global_step = 3
     trainer.all_metrics = {}
@@ -1055,6 +1060,7 @@ def test_ppo_train_batch_calculations():
                 "progress": _TEST_PROGRESS_CONFIG,
                 "micro_train_batch_size_per_gpu": 2,
                 "update_epochs_per_batch": 1,
+                "token_stats": {"enabled": False},
                 "policy": {
                     "grug_query_bias_update_mode": "frozen",
                     "optimizer_config": {"max_grad_norm": 1.0},
@@ -1232,6 +1238,7 @@ def test_grug_ppo_train_does_not_retain_consumed_microbatches():
                 "progress": _TEST_PROGRESS_CONFIG,
                 "micro_train_batch_size_per_gpu": 1,
                 "update_epochs_per_batch": 1,
+                "token_stats": {"enabled": False},
                 "policy": {
                     "grug_query_bias_update_mode": "frozen",
                     "optimizer_config": {"max_grad_norm": 1.0},

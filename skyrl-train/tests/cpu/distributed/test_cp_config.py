@@ -53,6 +53,9 @@ STAGE2_TRAINER_FIELDS = {
         "num_trials": 256,
         "on_failure": "abort",
     },
+    # token_stats is a default-off per-token diagnostics switch unrelated to CP;
+    # additive like preflight_gate, so it is stripped before the golden diff.
+    "token_stats": {"enabled": False},
 }
 DEBUG_MODE_TRAINER_FIELDS = {
     "debug_mode": "off",

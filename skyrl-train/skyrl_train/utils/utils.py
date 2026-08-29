@@ -609,6 +609,8 @@ def validate_cfg(cfg: DictConfig):
         )
     if cfg.generator.gdn_backend not in set(GDNBackend):
         raise ValueError(f"generator.gdn_backend must be one of torch, flashqla; got {cfg.generator.gdn_backend!r}")
+    if cfg.trainer.token_stats.enabled and cfg.trainer.strategy == "megatron":
+        raise ValueError("trainer.token_stats.enabled requires an HF policy wrapper; megatron is not supported")
     validate_generator_cfg(cfg)
     validate_batch_invariant_config(cfg)
     validate_moe_router_replay_config(cfg)

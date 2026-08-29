@@ -39,6 +39,7 @@ def _algorithm_cfg(use_tis: bool, policy_loss_type: str = "regular") -> OmegaCon
         {
             "trainer": {
                 "use_sample_packing": False,
+                "token_stats": {"enabled": False},
                 "algorithm": {
                     "use_tis": use_tis,
                     "tis_imp_ratio_cap": CAP,

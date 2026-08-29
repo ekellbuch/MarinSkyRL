@@ -77,6 +77,7 @@ from skyrl_train.utils.utils import (
     policy_force_cvd_mask_enabled,
 )
 from skyrl_train.utils.algorithm_registry import policy_loss_requires_rollout_logprobs
+from skyrl_train.utils.token_stats import TokenStatsBatch, gather_token_stats
 from skyrl_train.evaluate import evaluate, evaluate_step_wise
 from skyrl_train.utils.logging_utils import log_example
 from skyrl_train.callbacks import (
@@ -169,6 +170,11 @@ class RayPPOTrainer:
 
         # Trainer control object for callback coordination
         self._control = TrainerControl()
+
+        # Per-token learner/rollout statistics of the last optimizer step, for
+        # on_step_end callbacks (trainer.token_stats.enabled).
+        self.last_token_stats: Optional[TokenStatsBatch] = None
+        self._token_stats_sample_ids: List[str] = []
 
     def _configure_training_schedule(self):
         """Set ``total_training_steps`` and any inputs required to execute that schedule."""
@@ -1487,7 +1493,10 @@ class RayPPOTrainer:
         data = self.apply_loop_advantages(data)
         data.pop("rewards")
         data.pop("loop_advantages", None)
-        data.metadata.pop("uids")
+        uids = data.metadata.pop("uids")
+        if self.cfg.trainer.token_stats.enabled:
+            # Workers never see uids; the trainer re-attaches them to the token stats.
+            self._token_stats_sample_ids = list(uids)
         return data
 
     def dump_data(self, data: TrainingInputBatch, file_name: str):
@@ -1841,6 +1850,13 @@ class RayPPOTrainer:
         policy_status = policy_statuses[0].metadata["train_status"]
         for k, v in policy_status.items():
             self.all_metrics.update({f"policy/{k}": v})
+        if self.cfg.trainer.token_stats.enabled:
+            self.last_token_stats = gather_token_stats(
+                self.policy_model.actor_infos,
+                policy_statuses,
+                sample_ids=self._token_stats_sample_ids,
+                global_step=self.global_step,
+            )
         empty_cache_refs += self.policy_model.async_run_ray_method("pass_through", "empty_cache")
         ray.get(empty_cache_refs)
 

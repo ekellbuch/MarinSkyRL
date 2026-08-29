@@ -25,6 +25,7 @@ from skyrl_train.distributed.cp_utils import (
     cp_sdpa_dispatcher_span,
     cp_load_balance_indices,
 )
+from skyrl_train.utils.token_stats import top1_margin_from_logits
 from skyrl_train.utils.torch_utils import chunked_entropy_from_logits, logprobs_from_logits
 from skyrl_train.models.grug_moe import (
     GRUG_MOE_MODEL_TYPE,
@@ -41,6 +42,9 @@ from skyrl_train.utils.flash_attention import (
 )
 from packaging.version import Version
 from marinskyrl.runtime_options import GDNBackend
+
+# Per-token `[B, S]` outputs that share the logprob tensor's layout restoration.
+_PER_TOKEN_OUTPUT_KEYS = ("entropy", "top1_margin", "top1_token")
 
 # Rank-0 HF weight-index resolution retry (transient EOF flake). The helper now
 # lives in skyrl_train.utils.hf_load_retry (dependency-light) so the Megatron
@@ -771,8 +775,14 @@ class HFModelWrapper(nn.Module):
         compute_entropy=False,
         entropy_requires_grad=True,
         rollout_routed_experts: Optional[torch.Tensor] = None,
+        compute_top1_margin=False,
     ) -> torch.Tensor:
-        """Returns action log probs"""
+        """Returns action log probs.
+
+        With ``compute_top1_margin`` the returned output also carries
+        ``top1_margin`` (top-1 minus runner-up logit) and ``top1_token`` per
+        position, in the same ``[B, S]`` layout as ``entropy``.
+        """
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
 
@@ -1173,6 +1183,23 @@ class HFModelWrapper(nn.Module):
 
             output["entropy"] = entropy_BS
 
+        if compute_top1_margin:
+            # Same no-grad layout restoration as entropy: CP unshard, Ulysses gather,
+            # and packing pad. Padding positions are sliced away by the caller's
+            # action slice, so no mask is applied here.
+            margin_BS, top1_BS = top1_margin_from_logits(logits_BSV)
+            for key, tensor in (("top1_margin", margin_BS), ("top1_token", top1_BS)):
+                if cp_size > 1:
+                    tensor = context_parallel_unshard(self.cp_mesh, [tensor], [1])[0]
+                if self.sequence_parallel_size > 1:
+                    dim = tensor.ndim - 1
+                    tensor = gather_outputs_and_unpad(tensor, gather_dim=dim, unpad_dim=dim, padding_size=pad_size)
+                if self.use_sample_packing:
+                    tensor = flash_pad_input(
+                        tensor.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
+                    ).squeeze(-1)
+                output[key] = tensor
+
         # Stage 4 (FSDP2 CP): strip the right-pad added for the 2*cp divisibility
         # (G4) so the per-token tensors return to the original [B, S] length and
         # the action slice below lands on the real response tokens. The pad region
@@ -1181,8 +1208,9 @@ class HFModelWrapper(nn.Module):
         # ⇒ cp_pad_size==0, this block is a no-op (G1).
         if cp_size > 1 and cp_pad_size > 0:
             log_probs = log_probs[:, : log_probs.size(1) - cp_pad_size]
-            if compute_entropy:
-                output["entropy"] = output["entropy"][:, : output["entropy"].size(1) - cp_pad_size]
+            for key in _PER_TOKEN_OUTPUT_KEYS:
+                if key in output:
+                    output[key] = output[key][:, : output[key].size(1) - cp_pad_size]
 
         # Stage 5b (FSDP2 CP): if we LEFT-rolled the inputs to right-align a
         # left-padded batch (cp_left_shifts set above), INVERT the roll now so
@@ -1199,8 +1227,9 @@ class HFModelWrapper(nn.Module):
             arange_S = torch.arange(S, device=log_probs.device).unsqueeze(0)
             inv_idx = (arange_S - cp_left_shifts.unsqueeze(1)) % S
             log_probs = torch.gather(log_probs, 1, inv_idx)
-            if compute_entropy:
-                output["entropy"] = torch.gather(output["entropy"], 1, inv_idx)
+            for key in _PER_TOKEN_OUTPUT_KEYS:
+                if key in output:
+                    output[key] = torch.gather(output[key], 1, inv_idx)
 
         if isinstance(num_actions, list):
             if len(num_actions) == 1:

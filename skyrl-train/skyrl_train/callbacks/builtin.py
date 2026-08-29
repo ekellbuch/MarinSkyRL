@@ -20,6 +20,7 @@ Supports two configuration styles:
 
 import asyncio
 import dataclasses
+import importlib
 import os
 from typing import Any, Dict, List, Optional, Type
 
@@ -991,12 +992,17 @@ def create_callback_from_config(callback_config: Dict[str, Any]) -> TrainerCallb
         raise ValueError(f"Callback config missing 'type' key: {callback_config}")
 
     callback_type = callback_config["type"]
-    if callback_type not in CALLBACK_REGISTRY:
+    if ":" in callback_type:
+        # An experiment-owned callback: "package.module:ClassName", the same
+        # form the Harbor agent_import_path uses.
+        module_name, _, class_name = callback_type.partition(":")
+        callback_cls = getattr(importlib.import_module(module_name), class_name)
+    elif callback_type in CALLBACK_REGISTRY:
+        callback_cls = CALLBACK_REGISTRY[callback_type]
+    else:
         available = ", ".join(CALLBACK_REGISTRY.keys())
         raise ValueError(f"Unknown callback type '{callback_type}'. Available types: {available}")
 
-    # Get the callback class and instantiate with remaining params
-    callback_cls = CALLBACK_REGISTRY[callback_type]
     params = {k: v for k, v in callback_config.items() if k != "type"}
 
     try:

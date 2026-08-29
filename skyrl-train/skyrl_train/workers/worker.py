@@ -45,6 +45,7 @@ from skyrl_train.utils.importance_ratio_diagnostics import (
     LogRatioMonitor,
 )
 from skyrl_train.utils.policy_losses import LossScaling, compute_policy_objective
+from skyrl_train.utils.token_stats import TOKEN_STATS_METADATA_KEY, concat_token_stats, select_micro_batch_tokens
 from skyrl_train.dataset.replay_buffer import Experience
 from skyrl_train.training_batch import (
     GLOBAL_LOSS_DENOM_METADATA_KEY,
@@ -1106,6 +1107,8 @@ class PolicyWorkerBase(Worker):
             )
 
         for epoch in range(self.cfg.trainer.update_epochs_per_batch):
+            # Token stats describe the batch's last update epoch: earlier epochs' shards are dropped.
+            self._token_stats_shards = []
             pbar = tqdm(
                 dataloader,
                 desc=f"Policy Train epoch [{epoch + 1}/{self.cfg.trainer.update_epochs_per_batch}]",
@@ -1168,6 +1171,11 @@ class PolicyWorkerBase(Worker):
         # should return an `TrainingOutputBatch`
         output = TrainingOutputBatch()
         output.metadata = {"train_status": status_mean}
+        if self.cfg.trainer.token_stats.enabled:
+            output.metadata[TOKEN_STATS_METADATA_KEY] = concat_token_stats(
+                self._token_stats_shards, global_step=global_step
+            )
+            self._token_stats_shards = []
         return output
 
     def training_step(
@@ -1209,6 +1217,9 @@ class PolicyWorkerBase(Worker):
 
         # TODO (sumanthrh): don't think this does anything for deepspeed or fsdp rn because autocast happens internally
         _phase_diagnostics.start_phase(_phase_diagnostics.CollectivePhase.MODEL_FORWARD_ENTER)
+        token_stats_enabled = bool(self.cfg.trainer.token_stats.enabled)
+        # Only the HF wrapper knows the kwarg; validate_cfg keeps token stats off megatron.
+        token_stats_kwargs = {"compute_top1_margin": True} if token_stats_enabled else {}
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
             action_log_probs, output = self.model(
@@ -1220,11 +1231,28 @@ class PolicyWorkerBase(Worker):
                 compute_entropy=True,
                 entropy_requires_grad=self.cfg.trainer.algorithm.use_entropy_loss,
                 rollout_routed_experts=rollout_routed_experts,
+                **token_stats_kwargs,
             )
             if grug_capture_started:
                 assert grug_query_bias_window is not None
                 grug_query_bias_window.observe_microbatch()
             token_entropy = output["entropy"][:, -num_actions - 1 : -1]
+            if token_stats_enabled:
+                self._token_stats_shards.append(
+                    select_micro_batch_tokens(
+                        global_step=global_step,
+                        sequences=sequences,
+                        num_actions=num_actions,
+                        loss_mask=loss_mask,
+                        learner_logprobs=action_log_probs,
+                        rollout_logprobs=rollout_action_logprobs,
+                        entropy=token_entropy,
+                        top1_margin=output["top1_margin"][:, -num_actions - 1 : -1],
+                        top1_token=output["top1_token"][:, -num_actions - 1 : -1],
+                        advantages=advantages,
+                        sample_offset=local_step * self.cfg.trainer.micro_train_batch_size_per_gpu,
+                    )
+                )
             objective = compute_policy_objective(
                 action_log_probs=action_log_probs,
                 old_action_log_probs=old_action_log_probs,

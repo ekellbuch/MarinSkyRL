@@ -296,6 +296,10 @@ trainer:
   logger: "wandb"
   tracker_commit_each_step: false
   dump_data_batch: false
+  # Keep per-token learner/rollout scalars of every optimizer step on
+  # trainer.last_token_stats for callbacks (skyrl_train.utils.token_stats).
+  token_stats:
+    enabled: false
   dump_eval_results: true
   log_level: "INFO"
 

@@ -125,3 +125,31 @@ def test_environment_kwargs_reach_the_backend_constructor():
     assert trial_config.environment.kwargs["region"] == "asia-northeast3"
     # The schema-named field keeps precedence over the passthrough dict.
     assert trial_config.environment.kwargs["cpu"] == 4
+
+
+def test_custom_agent_import_path_and_kwargs_reach_harbor():
+    trial_config = _trial_config(
+        {
+            "name": "terminus-2",
+            "agent_import_path": "overfit_tbench.agents.terminus_2_edit:Terminus2Edit",
+            "agent_kwargs": {
+                "prompt_variant": "task_completion_discouraged",
+                "prompt_options": {"require_evidence": True},
+                "api_base": "http://wrong.example/v1",
+                "max_turns": 99,
+            },
+            "max_turns": 12,
+        }
+    )
+
+    assert trial_config.agent.name is None
+    assert trial_config.agent.import_path == "overfit_tbench.agents.terminus_2_edit:Terminus2Edit"
+    assert trial_config.agent.kwargs["prompt_variant"] == "task_completion_discouraged"
+    assert trial_config.agent.kwargs["prompt_options"] == {"require_evidence": True}
+    # Runtime-owned and schema-named kwargs keep precedence over the passthrough dict.
+    assert trial_config.agent.kwargs["api_base"] == "http://localhost:8000/v1"
+    assert trial_config.agent.kwargs["max_turns"] == 12
+
+
+def test_registered_agent_name_is_kept_without_import_path():
+    assert _trial_config({"name": "terminus-2"}).agent.name == "terminus-2"

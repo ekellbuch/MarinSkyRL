@@ -90,6 +90,7 @@ AGENT_SCHEMA = SectionSchema(
     fields={
         # Direct fields on AgentConfig
         "name": FieldMapping("name", default="terminus-2"),  # Maps to AgentConfig.name (Harbor AgentName)
+        "agent_import_path": FieldMapping("import_path"),  # Custom agent class, e.g. "pkg.module:Agent"
         # Agent-log push-back control (direct field on AgentConfig, read by Trial._upload_agent_logs).
         # DEFAULT True (preserves current behavior). Set false to SKIP the best-effort re-upload of
         # host-side agent logs BACK into the (non-mounted) sandbox after the agent phase — those pushed-back
@@ -504,7 +505,7 @@ class HarborConfigBuilder:
     # (so the schema validator doesn't flag them as "unknown"). PRM lives here
     # because it's consumed directly by _build_prm_turn_callback to construct
     # a turn_callback, not by the schema-based field-mapping pipeline.
-    SKYRL_EXTENSION_KEYS = frozenset({"environment_kwargs", "prm"})
+    SKYRL_EXTENSION_KEYS = frozenset({"agent_kwargs", "environment_kwargs", "prm"})
 
     def _validate_config(self) -> None:
         """Validate config and issue warnings for unknown/unsupported fields."""
@@ -572,6 +573,11 @@ class HarborConfigBuilder:
                     kwargs_fields[mapping.harbor_field] = value
                 else:
                     direct_fields[mapping.harbor_field] = value
+
+        # Generic agent_kwargs passthrough for custom agents whose constructor
+        # arguments the schema does not name. Schema-named kwargs win on collision.
+        for key, value in dict(self._harbor_cfg.get("agent_kwargs") or {}).items():
+            kwargs_fields.setdefault(key, value)
 
         return direct_fields, kwargs_fields
 
@@ -902,9 +908,12 @@ class HarborConfigBuilder:
         if self._turn_callback is not None:
             agent_kwargs["turn_callback"] = self._turn_callback
 
-        # Get agent name from harbor config (defaults to "terminus-2")
-        # This is the Harbor AgentName value directly (e.g., "terminus-2", "oracle")
+        # Harbor accepts either a registered name or an import path. Callers still
+        # read the YAML name to classify the in-process runtime, so the name is
+        # dropped only here, at the Harbor boundary, when an import path is set.
         agent_name = agent_direct_fields.pop("name", "terminus-2")
+        if "import_path" in agent_direct_fields:
+            agent_name = None
 
         # Apply timeout override if provided (e.g., for eval runs)
         if timeout_override_sec is not None:

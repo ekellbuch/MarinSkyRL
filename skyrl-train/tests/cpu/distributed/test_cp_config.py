@@ -107,6 +107,7 @@ ADDITIVE_TEACHER_FIELDS = {
 }
 ADDITIVE_POLICY_MODEL_FIELDS = {
     "lm_head_compute_dtype": None,
+    "logprob_chunk_size": None,
     "source_uri": None,
     "source_identity": None,
 }

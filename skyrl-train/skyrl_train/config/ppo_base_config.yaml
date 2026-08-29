@@ -64,6 +64,9 @@ trainer:
       source_uri: null
       source_identity: null
       lm_head_compute_dtype: null
+      # Sequence chunk (tokens) for per-token log-probabilities and entropy computed
+      # inside the output projection; null keeps the full-vocabulary logits path.
+      logprob_chunk_size: null
       lora:
           rank: 0
           alpha: 16

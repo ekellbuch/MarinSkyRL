@@ -584,6 +584,15 @@ def test_validate_cfg_rejects_unsupported_lm_head_compute_dtype():
         validate_cfg(cfg)
 
 
+@pytest.mark.parametrize("chunk_size", [0, -1, True])
+def test_validate_cfg_rejects_non_positive_logprob_chunk_size(chunk_size):
+    cfg = _validatable_dummy_config()
+    cfg.trainer.policy.model.logprob_chunk_size = chunk_size
+
+    with pytest.raises(ValueError, match="logprob_chunk_size"):
+        validate_cfg(cfg)
+
+
 def test_validate_cfg_rejects_gspo_without_sequence_mean_reduction():
     cfg = _validatable_dummy_config()
     cfg.trainer.algorithm.policy_loss_type = "gspo"

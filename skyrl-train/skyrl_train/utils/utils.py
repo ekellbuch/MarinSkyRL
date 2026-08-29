@@ -738,6 +738,9 @@ def validate_cfg(cfg: DictConfig):
     lm_head_compute_dtype = cfg.trainer.policy.model.lm_head_compute_dtype
     if lm_head_compute_dtype not in (None, "float32"):
         raise ValueError("trainer.policy.model.lm_head_compute_dtype must be null or 'float32'")
+    logprob_chunk_size = cfg.trainer.policy.model.get("logprob_chunk_size", None)
+    if logprob_chunk_size is not None and (isinstance(logprob_chunk_size, bool) or int(logprob_chunk_size) <= 0):
+        raise ValueError("trainer.policy.model.logprob_chunk_size must be null or a positive integer")
 
     if cfg.trainer.algorithm.use_tis:
         if cfg.trainer.algorithm.tis_imp_ratio_cap <= 0:

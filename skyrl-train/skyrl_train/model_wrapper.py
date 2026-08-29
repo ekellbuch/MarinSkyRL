@@ -35,6 +35,7 @@ from skyrl_train.models.grug_moe import (
     validate_grug_training_strategy,
 )
 from skyrl_train.models.layers.moe_checkpoint import moe_recompute_context_fn
+from skyrl_train.models.chunked_logprobs import ChunkedLogprobHead, unpack_per_token
 from skyrl_train.models.lm_head_precision import configure_hf_lm_head_compute_dtype
 from skyrl_train.utils.flash_attention import (
     flash_pad_input,
@@ -390,6 +391,7 @@ class HFModelWrapper(nn.Module):
         model_load_retry=None,
         gdn_backend: str = "torch",
         lm_head_compute_dtype: str | None = None,
+        logprob_chunk_size: int | None = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -622,6 +624,12 @@ class HFModelWrapper(nn.Module):
 
         _enable_native_grug_grouping(self.model, use_grouped_mm)
         configure_hf_lm_head_compute_dtype(self.model, lm_head_compute_dtype)
+        # Sequence-chunked per-token statistics inside the projection, so the
+        # full-vocabulary logits of one chunk are the only ones ever alive.
+        # Installed after the precision patch so each chunk goes through it.
+        self._chunked_head = (
+            ChunkedLogprobHead.install(self.model, logprob_chunk_size) if logprob_chunk_size is not None else None
+        )
 
         # CP mask contract probe (computed once): does this HF model's forward
         # accept the per-layer-type mask DICT escape hatch? Dense Qwen3 does;
@@ -1009,9 +1017,21 @@ class HFModelWrapper(nn.Module):
         else:
             cp_ctx = maybe_cp_context(1, None, None, buffers=[], seq_dims=[])
 
+        # With a chunked head the projection returns packed per-token scalars
+        # for `sequences_rolled` instead of logits; see chunked_logprobs.py.
+        if self._chunked_head is not None:
+            head_ctx = self._chunked_head.request(
+                sequences_rolled,
+                temperature=temperature,
+                compute_entropy=compute_entropy,
+                entropy_requires_grad=entropy_requires_grad,
+                compute_top1_margin=compute_top1_margin,
+            )
+        else:
+            head_ctx = contextlib.nullcontext()
         defer_teardown = False
         try:
-            with cp_ctx:
+            with head_ctx, cp_ctx:
                 # NOTE (sumanthrh): Once we have position_ids, we don't need attention mask with flash attention.
                 if self.use_sample_packing and self.attn_implementation == "flash_attention_2":
                     # NOTE (sumanthrh): Don't use attention mask. position_ids is enough.
@@ -1090,18 +1110,27 @@ class HFModelWrapper(nn.Module):
             cp_size > 1 and torch.is_grad_enabled() and output["logits"].requires_grad
         )
 
-        logits_BSV = output["logits"]
-        logits_BSV.div_(temperature)
+        packed_entropy = packed_margin = packed_top1 = None
+        if self._chunked_head is not None:
+            # The projection already reduced each chunk against `sequences_rolled`
+            # (temperature included) in the same sharded/packed layout as logits.
+            logits_BSV = None
+            log_probs, packed_entropy, packed_margin, packed_top1 = unpack_per_token(
+                output["logits"], entropy_requires_grad=entropy_requires_grad
+            )
+        else:
+            logits_BSV = output["logits"]
+            logits_BSV.div_(temperature)
 
-        # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
-        # Under CP `logits_BSV` is sequence-sharded `[B, S/cp, V]` and
-        # `sequences_rolled` was co-sharded by the SAME zigzag balancer, so this
-        # per-token compute is token-for-token aligned on the local shard.
-        log_probs = logprobs_from_logits(
-            logits_BSV,
-            sequences_rolled,
-            inplace_backward=True,
-        )
+            # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
+            # Under CP `logits_BSV` is sequence-sharded `[B, S/cp, V]` and
+            # `sequences_rolled` was co-sharded by the SAME zigzag balancer, so this
+            # per-token compute is token-for-token aligned on the local shard.
+            log_probs = logprobs_from_logits(
+                logits_BSV,
+                sequences_rolled,
+                inplace_backward=True,
+            )
 
         # Stage 5 (FSDP2 CP) — THE correctness seam: unshard the per-token
         # `[B, S/cp]` logprobs back to natural-order `[B, S]` via the inverse of
@@ -1155,15 +1184,24 @@ class HFModelWrapper(nn.Module):
             # shard, `context_parallel_unshard` it to natural-order `[B, S]`, THEN
             # apply the full mask. This yields the SAME masked entropy as cp=1.
             if cp_size > 1:
-                entropy_BS = self.chunked_entropy_from_logits_fn(
-                    logits_BSV, requires_grad=entropy_requires_grad, attention_mask=None
-                )
+                if packed_entropy is not None:
+                    entropy_BS = packed_entropy
+                else:
+                    entropy_BS = self.chunked_entropy_from_logits_fn(
+                        logits_BSV, requires_grad=entropy_requires_grad, attention_mask=None
+                    )
                 # Stage 6: grad-safe unshard when entropy carries grad (entropy can
                 # appear in the loss via an entropy bonus); else the stock no_grad unshard.
                 if torch.is_grad_enabled() and entropy_BS.requires_grad:
                     entropy_BS = cp_unshard_grad_safe(self.cp_mesh, entropy_BS, 1)
                 else:
                     entropy_BS = context_parallel_unshard(self.cp_mesh, [entropy_BS], [1])[0]
+                if entropy_mask is not None:
+                    entropy_BS = entropy_BS * entropy_mask.to(entropy_BS.dtype)
+            elif packed_entropy is not None:
+                # Chunked entropy is unmasked; masking afterwards is the same
+                # value and gradient as masking inside the entropy kernel.
+                entropy_BS = packed_entropy
                 if entropy_mask is not None:
                     entropy_BS = entropy_BS * entropy_mask.to(entropy_BS.dtype)
             else:
@@ -1187,7 +1225,10 @@ class HFModelWrapper(nn.Module):
             # Same no-grad layout restoration as entropy: CP unshard, Ulysses gather,
             # and packing pad. Padding positions are sliced away by the caller's
             # action slice, so no mask is applied here.
-            margin_BS, top1_BS = top1_margin_from_logits(logits_BSV)
+            if packed_margin is not None:
+                margin_BS, top1_BS = packed_margin, packed_top1
+            else:
+                margin_BS, top1_BS = top1_margin_from_logits(logits_BSV)
             for key, tensor in (("top1_margin", margin_BS), ("top1_token", top1_BS)):
                 if cp_size > 1:
                     tensor = context_parallel_unshard(self.cp_mesh, [tensor], [1])[0]

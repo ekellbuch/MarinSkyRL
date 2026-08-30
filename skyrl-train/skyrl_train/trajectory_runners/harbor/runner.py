@@ -19,6 +19,7 @@ from loguru import logger
 from uuid import uuid4
 from skyrl_train.trajectory_runners.base import TrajectoryRunner, TrajectoryRequestBatch, TrajectoryBatch, TrajectoryID
 from skyrl_train.trajectory_runners.projections import project_loss_mask
+from skyrl_train.trajectory_runners.rollout_logprobs import gather_rollout_logprobs
 from skyrl_train.metric_names import TIS_LCS_FALLBACK_ALERT_METRIC, TIS_METRIC_PREFIX
 from skyrl_train.trajectory_runners.trajectory_processing import (
     BATCH_ERROR_METRIC_PREFIX,
@@ -1258,58 +1259,20 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             f"{num_masked_trajectories} masked (excluded from baseline)"
         )
 
-        # Collect rollout_logprobs if any outputs have them.
-        # For zeroed/failed trajectories, use [0.0] to match response_ids length.
-        #
-        # Skip logprobs for eval: policy objectives do not run during evaluation.
-        # compute gradients, so logprobs are unnecessary. Skipping them avoids issues
-        # where failed trials (e.g., DaytonaRateLimitError) block eval progress.
-        #
-        # EDGE CASE (training only): When TIS is enabled but some trajectories have no logprobs
-        # (e.g., due to ContextLengthExceededError mid-turn where Harbor couldn't
-        # collect logprobs before the error), we need to handle this gracefully:
-        # - If ALL trajectories have None logprobs → return None (TIS will fail upstream)
-        # - If SOME have logprobs → fill missing with zeros (TIS can still train on valid ones)
-        # - Log a warning when trajectories are missing logprobs for debugging
+        # Collect rollout_logprobs, aligned with response_ids for every trajectory.
+        # Skipped for eval: policy objectives do not run during evaluation, and a
+        # failed eval trial (e.g. DaytonaRateLimitError) must not block progress.
+        # Training: a trainable trajectory without logprobs is masked out of the
+        # loss rather than failing the run (see rollout_logprobs.py).
         rollout_logprobs_list = None
-
-        if is_eval:
-            # Skip logprobs processing for eval - TIS only applies to training
-            pass
-        else:
-            has_any_logprobs = any(output.evidence.behavior_logprobs is not None for output in all_outputs)
-            missing_logprobs_count = sum(1 for output in all_outputs if output.evidence.behavior_logprobs is None)
-
-            if has_any_logprobs:
-                rollout_logprobs_list = []
-                for output in all_outputs:
-                    if output.evidence.behavior_logprobs is not None:
-                        rollout_logprobs_list.append(list(output.evidence.behavior_logprobs))
-                    else:
-                        if self._rollout_logprobs_required and any(output.loss_mask):
-                            raise ValueError("rollout_logprobs are required for every trainable trajectory")
-                        # Failed trajectories are fully masked, so aligned placeholders
-                        # cannot affect the objective.
-                        rollout_logprobs_list.append([0.0] * len(output.evidence.response_token_ids))
-
-                if missing_logprobs_count > 0 and self._collect_rollout_details:
-                    # Only warn about missing logprobs if TIS is expected (collect_rollout_details=true)
-                    logger.warning(
-                        f"Rollout-logprob mode: {missing_logprobs_count}/{num_trials} trajectories missing logprobs "
-                        f"(likely due to context length errors). Filled with zeros. "
-                        f"These trajectories will have no gradient contribution from TIS."
-                    )
-            elif self._rollout_logprobs_required and any(any(output.loss_mask) for output in all_outputs):
-                raise ValueError("rollout_logprobs are required for every trainable trajectory")
-            elif missing_logprobs_count > 0 and self._collect_rollout_details:
-                # All trajectories missing logprobs - this is a problem for TIS
-                # Only log error if TIS is expected (collect_rollout_details=true)
-                logger.error(
-                    f"Rollout-logprob mode: ALL {num_trials} trajectories missing logprobs. "
-                    f"This batch cannot use a behavior-referenced policy objective. "
-                    f"Check if Harbor is collecting rollout_details (collect_rollout_details=true) "
-                    f"and if context length errors are preventing logprob collection."
-                )
+        if not is_eval:
+            rollout_logprobs_list = gather_rollout_logprobs(
+                all_outputs,
+                required=self._rollout_logprobs_required,
+                expect_logprobs=self._collect_rollout_details,
+                group_label=" for instances "
+                + ", ".join(sorted({str(tid.instance_id) for tid in input_batch["trajectory_ids"]})),
+            )
 
         # Collect routed_experts (Stage 1 MoE router-replay capture rail). Mirrors
         # the rollout_logprobs gather and mixed-presence handling. Gated on

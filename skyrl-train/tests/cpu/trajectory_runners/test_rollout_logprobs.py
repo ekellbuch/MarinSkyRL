@@ -5,9 +5,12 @@ from types import SimpleNamespace
 from skyrl_gym.verification import TrainingDisposition
 
 from skyrl_train.trajectory_runners.projections import project_loss_mask
+import pytest
+
 from skyrl_train.trajectory_runners.rollout_logprobs import (
     MISSING_ROLLOUT_LOGPROBS_REASON,
     gather_rollout_logprobs,
+    require_rollout_details_collection,
 )
 
 
@@ -79,3 +82,13 @@ def test_not_required_partial_presence_zero_fills_without_masking():
 
     assert gathered == [[-0.3], [0.0, 0.0]]
     assert lost.loss_mask == [1, 1] and lost.disposition.loss_eligible is True
+
+
+def test_required_logprobs_without_collection_fails_at_startup():
+    with pytest.raises(ValueError, match="collect_rollout_details=true"):
+        require_rollout_details_collection(required=True, collect=False)
+
+
+@pytest.mark.parametrize("required,collect", [(True, True), (False, False), (False, True)])
+def test_collection_check_passes_when_consistent(required, collect):
+    require_rollout_details_collection(required=required, collect=collect)

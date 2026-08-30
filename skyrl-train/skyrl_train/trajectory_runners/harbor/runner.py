@@ -19,7 +19,10 @@ from loguru import logger
 from uuid import uuid4
 from skyrl_train.trajectory_runners.base import TrajectoryRunner, TrajectoryRequestBatch, TrajectoryBatch, TrajectoryID
 from skyrl_train.trajectory_runners.projections import project_loss_mask
-from skyrl_train.trajectory_runners.rollout_logprobs import gather_rollout_logprobs
+from skyrl_train.trajectory_runners.rollout_logprobs import (
+    gather_rollout_logprobs,
+    require_rollout_details_collection,
+)
 from skyrl_train.metric_names import TIS_LCS_FALLBACK_ALERT_METRIC, TIS_METRIC_PREFIX
 from skyrl_train.trajectory_runners.trajectory_processing import (
     BATCH_ERROR_METRIC_PREFIX,
@@ -469,6 +472,9 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         # TIS (Truncated Importance Sampling) config
         # Only show TIS-related warnings when collect_rollout_details is enabled
         self._collect_rollout_details = self._harbor_config_builder.get_collect_rollout_details()
+        require_rollout_details_collection(
+            required=self._rollout_logprobs_required, collect=self._collect_rollout_details
+        )
 
         # Tracked exception types for per-step error counters.
         # Sourced from the retry config's exclude_exceptions (the terminal failures

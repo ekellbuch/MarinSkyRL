@@ -1034,3 +1034,15 @@ def test_tis_diagnostics_all_masked_batch_emits_zeros_not_nan():
     assert out["tis/imp_ratio_mean"] == 0.0
     assert out["tis/imp_ratio_capped_fraction"] == 0.0
     assert out["tis/log_ratio_abs_mean"] == 0.0
+
+
+def test_validate_cfg_rejects_dppo_when_harbor_does_not_collect_rollout_details():
+    cfg = _validatable_dummy_config()
+    cfg.trainer.algorithm.policy_loss_type = "dppo"
+    cfg.trainer.algorithm.use_kl_loss = False
+    cfg.trainer.policy.model.lm_head_compute_dtype = "float32"
+    OmegaConf.set_struct(cfg, False)
+    cfg.terminal_bench_config = {"harbor": {"collect_rollout_details": False}}
+
+    with pytest.raises(ValueError, match="collect_rollout_details is not true"):
+        validate_cfg(cfg)

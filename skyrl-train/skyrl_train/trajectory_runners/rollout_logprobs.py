@@ -24,6 +24,24 @@ from loguru import logger
 MISSING_ROLLOUT_LOGPROBS_REASON = "missing_rollout_logprobs"
 
 
+def require_rollout_details_collection(*, required: bool, collect: bool) -> None:
+    """Fail at startup when the objective needs behavior logprobs the agent will never record.
+
+    ``collect`` is Harbor's ``collect_rollout_details`` agent setting: only when it is
+    on does the agent ask vLLM for token ids and record per-turn logprobs. The
+    engine-side ``sampling_params.logprobs`` setting alone does not do that, so a
+    behavior-referenced loss with ``collect`` off masks every trajectory and never
+    trains — silently, because the TIS warnings are gated on the same flag.
+    """
+    if required and not collect:
+        raise ValueError(
+            "The policy loss requires rollout logprobs but the Harbor agent is not collecting "
+            "them: set terminal_bench.harbor.collect_rollout_details=true (the engine-side "
+            "generator.sampling_params.logprobs setting alone leaves the agent without token "
+            "ids, so every trajectory would be masked)."
+        )
+
+
 def mask_missing_rollout_logprobs(output: Any) -> None:
     """Exclude one trajectory from the loss because its rollout logprobs are absent."""
     output.loss_mask = [0] * len(output.evidence.response_token_ids)

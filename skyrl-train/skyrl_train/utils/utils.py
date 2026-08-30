@@ -773,6 +773,16 @@ def validate_cfg(cfg: DictConfig):
             raise NotImplementedError(
                 f"{cfg.trainer.algorithm.policy_loss_type} requires rollout logprobs; use the vLLM generator backend"
             )
+        # The Terminal-Bench Harbor agent records per-turn logprobs only when its own
+        # collect_rollout_details setting is on; the engine-side logprobs setting does
+        # not turn it on. Check it here when the Harbor config is part of the cfg.
+        harbor_cfg = (cfg.get("terminal_bench_config") or {}).get("harbor") if hasattr(cfg, "get") else None
+        if harbor_cfg is not None and not bool(harbor_cfg.get("collect_rollout_details", False)):
+            raise ValueError(
+                f"trainer.algorithm.policy_loss_type={cfg.trainer.algorithm.policy_loss_type} requires rollout "
+                "logprobs, but terminal_bench_config.harbor.collect_rollout_details is not true: the Harbor "
+                "agent would never request token ids and every trajectory would be masked."
+            )
 
     if cfg.trainer.policy.model.lora.rank > 0:
         # LoRA enabled

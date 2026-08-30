@@ -252,6 +252,14 @@ def _failure_evidence() -> RolloutEvidence:
     )
 
 
+def exception_type_for_log(result: Any) -> Optional[str]:
+    """Exception type name recorded on a Harbor trial result, for diagnostics."""
+    info = getattr(result, "exception_info", None)
+    if info is None:
+        return None
+    return getattr(info, "exception_type", None) or type(info).__name__
+
+
 def _zero_reward() -> RewardResult:
     return RewardResult(unshaped_reward=None, optimization_reward=0.0)
 
@@ -1931,6 +1939,24 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         # populated (terminus native), the flag is off, or no proxy log is present.
         rollout_details = self._maybe_correlate_opencode_rollout_details(result, rollout_details)
         assistant_logprobs = extract_logprobs_from_rollout_details(rollout_details)
+        if assistant_logprobs is None and self._collect_rollout_details:
+            # Diagnostic for whole groups arriving without behavior logprobs (stage-04
+            # v12/v13: tasks whose every trial lacked them while the raw vLLM responses
+            # carried logprobs and token ids). Records what Harbor actually handed over
+            # so the drop can be located: which per-turn lists exist and their lengths.
+            main = rollout_details[0] if rollout_details else None
+            summary = (
+                {key: (len(value) if isinstance(value, list) else type(value).__name__) for key, value in main.items()}
+                if isinstance(main, dict)
+                else type(main).__name__
+            )
+            metadata = getattr(result.agent_result, "metadata", None) or {}
+            logger.warning(
+                f"Trajectory {trajectory_id}: no behavior logprobs in rollout_details "
+                f"(details={len(rollout_details) if rollout_details else 0}, main={summary}, "
+                f"n_episodes={metadata.get('n_episodes')}, stop_reason={metadata.get('stop_reason')}, "
+                f"rollback_info={metadata.get('rollback_info')}, exception={exception_type_for_log(result)})"
+            )
         # Exact-alignment ids: Harbor's per-turn completion_token_ids, index-aligned
         # with assistant_logprobs. Enables the exact (no re-tokenization guess) TIS path.
         assistant_token_ids = extract_token_ids_from_rollout_details(rollout_details)

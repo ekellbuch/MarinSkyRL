@@ -75,15 +75,16 @@ async def test_coordinator_rpc_returns_trajectory_batch():
 
 
 @pytest.mark.asyncio
-async def test_coordinator_rpc_timeout_does_not_cancel_remote_work(ray_init):
+async def test_coordinator_rpc_timeout_cancels_remote_work(ray_init):
     actor = _BlockingCoordinator.remote()
     dispatcher = _dispatcher(actor, timeout=0.1)
 
     with pytest.raises(RolloutCoordinatorRPCTimeoutError):
         await dispatcher.run({"prompts": ["task"]})
 
-    await actor.release.remote()
-    assert await actor.wait_for_completion.remote() is False
+    # The coordinator never returns, so nothing releases it: reaching
+    # wait_for_completion at all means the cancellation unwound it.
+    assert await actor.wait_for_completion.remote() is True
 
 
 @pytest.mark.asyncio

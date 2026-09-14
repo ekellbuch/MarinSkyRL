@@ -56,6 +56,26 @@ class GenerationStalledError(RuntimeError):
     """Raised when generation cannot make progress (no active producers, or dataset exhausted)."""
 
 
+def _epoch_completed(global_step: int, epoch: int, num_steps_per_epoch: int) -> bool:
+    """Whether the step loop finished `epoch` rather than being cut short.
+
+    The loop exits three ways: the epoch's steps run out, `max_steps` is
+    reached, or a callback asks to stop. Only the first has finished an epoch,
+    and `global_step` is post-increment, so a completed epoch has advanced past
+    that epoch's last step.
+
+    This decides whether `on_epoch_end` fires, which is load-bearing:
+    `DataTrackingCallback.on_epoch_end_async` clears the epoch-scoped consumed
+    UID set and advances the epoch counter, and `_finalize_training` then writes
+    the final checkpoint from that tracker. Firing it after a `max_steps` stop
+    persists `consumed_uids_in_epoch=[]` beside a non-zero
+    `total_samples_consumed` -- and that final checkpoint is the one
+    `resume_mode=latest` loads, after which `_AsyncDataloader` rewinds to row 0
+    with nothing to skip and retrains prompts the previous run already trained.
+    """
+    return global_step > (1 + epoch) * num_steps_per_epoch
+
+
 def _drain_queue(queue: asyncio.Queue[_QueueItem]) -> List[_QueueItem]:
     """Remove and return every item currently available without yielding."""
     items = []
@@ -827,12 +847,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     break
 
             # 12. Per-epoch epilogue.
-            # Call on_epoch_end callbacks
-            epoch_state = self._create_trainer_state(epoch=epoch)
-            self._control.reset()
-            self._control = await self.callback_handler.call_event_async(
-                "on_epoch_end", epoch_state, self._control, trainer=self
-            )
+            # Call on_epoch_end callbacks, but only when the epoch actually
+            # ended -- see _epoch_completed. The rest of the epilogue still runs
+            # on the way out of a max_steps stop; it is only the callbacks that
+            # must not, because they clear state the final checkpoint is about
+            # to be written from.
+            if _epoch_completed(self.global_step, epoch, self.num_steps_per_epoch):
+                epoch_state = self._create_trainer_state(epoch=epoch)
+                self._control.reset()
+                self._control = await self.callback_handler.call_event_async(
+                    "on_epoch_end", epoch_state, self._control, trainer=self
+                )
 
             # Handle ref model update at epoch end (via RefModelUpdateCallback or direct config)
             ref_callback = self._get_ref_update_callback()

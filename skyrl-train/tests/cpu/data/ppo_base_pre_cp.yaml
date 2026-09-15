@@ -3,6 +3,14 @@ data:
   - ${oc.env:HOME}/data/gsm8k/train.parquet
   val_data:
   - ${oc.env:HOME}/data/gsm8k/validation.parquet
+checkpoint_export:
+  step: null
+  checkpoint_path: null
+  export_root: null
+  hf_hub_repo_id: null
+  hf_hub_private: false
+  hf_hub_revision: main
+  hf_upload_mode: latest
 trainer:
   placement:
     colocate_all: true
@@ -19,6 +27,7 @@ trainer:
   sequence_parallel_backend: ulysses
   strategy: fsdp2
   policy:
+    grug_query_bias_update_mode: frozen
     model:
       path: Qwen/Qwen2.5-1.5B-Instruct
       lora:
@@ -148,6 +157,11 @@ trainer:
     sequence_parallel_size: 1
   algorithm:
     advantage_estimator: grpo
+    group_advantage_min_size: null
+    resolved_group_advantage:
+      kind: exact_physical
+      physical_group_size: ${generator.n_samples_per_prompt}
+      minimum_group_size: null
     kl_ctrl:
       type: fixed
       kl_target: 0.1
@@ -164,9 +178,7 @@ trainer:
     value_head_prefix: value_head
     policy_loss_type: regular
     loss_reduction: token_mean
-    global_loss_denom: null
     grpo_norm_by_std: true
-    rloo_n_min_group_size: 4
     rloo_n_filter_zero_reward_groups: true
     lambd: 1.0
     gamma: 1.0
@@ -216,6 +228,7 @@ trainer:
   fully_async:
     max_staleness_steps: 4
     num_parallel_generation_workers: 768
+    admission_stall_timeout: 21600
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
   seed: 42
@@ -223,10 +236,10 @@ trainer:
   resume_path: null
   ckpt_path: ${oc.env:HOME}/ckpts/
   max_ckpts_to_keep: -1
-  ckpt_interval: 10
-  hf_save_interval: 5
+  ckpt_interval: 5
+  hf_save_interval: ${trainer.ckpt_interval}
   hf_upload_mode: latest
-  export_path: ${oc.env:HOME}/exports/
+  export_path: ${oc.env:HOME}/exports
   bf16: true
   epochs: 1
   max_steps: null
@@ -242,7 +255,7 @@ trainer:
   eval_before_train: true
   eval_interval: 5
   max_prompt_length: 512
-  flash_attn: true
+  flash_attn: false
   disable_fast_tokenizer: false
   target_modules: null
   exclude_modules: null
@@ -318,7 +331,48 @@ generator:
     logprobs: null
     stop: null
   eval_n_samples_per_prompt: 1
-  zero_reward_on_non_stop: false
+  trajectory_reward_shaping:
+    schema_version: 2
+    enabled: false
+    loop:
+      max_period_tokens: 64
+      tail_tokens: 256
+      minimum_occurrences: 4
+      advantage_penalty_per_token: 0.0
+      max_advantage_penalty: 0.2
+    non_termination:
+      penalty: 0.0
+      accepted_stop_reasons: [stop, complete, eos, end_turn]
+    overlong:
+      l_max: ${generator.sampling_params.max_generate_length}
+      l_cache: 0
+    successful_length:
+      free_tokens: 0
+      penalty_per_token: 0.0
+      max_penalty: 0.2
+  trajectory_retention:
+    enabled: true
+    output_path: ${trainer.export_path}/training_trajectories
+    run_id: ${trainer.run_name}
+    phases: [train]
+    sample_count_per_step: 1
+    sample_fraction: 0.0
+    always_retain_failures: true
+    always_retain_non_terminating: true
+    always_retain_loops: true
+    accepted_stop_reasons: ${generator.trajectory_reward_shaping.non_termination.accepted_stop_reasons}
+    reward_below: null
+    reward_above: null
+    max_bytes_per_step: 8388608
+    max_bytes_per_run: 268435456
+    required: false
+    publish_timeout_seconds: 120
+    shutdown_timeout_seconds: 30
+    redact_fields: []
+    model_path: ${trainer.policy.model.path}
+    model_source_identity: ${trainer.policy.model.source_identity}
+    resume_path: ${trainer.resume_path}
+    inference_backend: ${generator.backend}
   apply_overlong_filtering: false
   rope_scaling: ${trainer.rope_scaling}
   rope_theta: ${trainer.rope_theta}
@@ -337,11 +391,11 @@ environment:
   skyrl_gym:
     max_env_workers: 32
     aime:
+      evaluation_token_budget: 8192
       length_penalty_weight: 0.0
       target_length: 768
       truncated_penalty: -2.0
       min_response_length: 16
-      end_think_token: <|end_think|>
       max_gen_length: 0
     text2sql:
       db_path: /home/ray/default/sql_data
@@ -358,6 +412,7 @@ rollout:
     enabled: true
     num_coordinators: 4
     cpus_per_coordinator: 8
+    coordinator_rpc_timeout: 21600
 deepspeed_config:
   train:
     zero_optimization:

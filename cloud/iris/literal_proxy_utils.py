@@ -1,7 +1,7 @@
 """literal_proxy_utils.py — co-located RecordProxy wiring for literal-token capture.
 
 Drives harbor's LITERAL-TOKEN trace machinery (``harbor.literal.proxy.RecordProxy``)
-from the OT-Agent launch path. When ``--record_literal`` is set, the RL / datagen
+from the RL launch path. When ``--record_literal`` is set, the RL / datagen
 launchers co-locate a :class:`~harbor.literal.proxy.RecordProxy` alongside the
 on-cluster vLLM server and route the agent's inference endpoint THROUGH the proxy.
 The proxy transparently injects ``return_token_ids=True`` / ``logprobs=True`` into
@@ -43,7 +43,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 # NOTE (MarinSkyRL port): ``upath`` (universal_pathlib) is imported LAZILY inside the two
 # remote-URI helpers below rather than at module scope. Those paths only run on iris where
-# ``experiments_dir`` is a ``gs://…`` URI; there ``upath`` is provided by the gpu-rl image
+# ``experiments_dir`` is a ``gs://…`` URI; there ``upath`` is provided by the locked environment
 # (a harbor/fsspec dependency), exactly as ``harbor`` itself is. Keeping it lazy leaves the
 # module import-clean + unit-testable on a plain checkout (local experiments_dir needs no
 # upload) without adding an unresolvable dep to the MarinSkyRL lock. The registration/mint

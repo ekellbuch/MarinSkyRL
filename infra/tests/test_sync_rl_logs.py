@@ -80,7 +80,7 @@ def test_discover_run_returns_none_when_no_run_dirs():
 # ---------------------------------------------------------------------------
 
 
-def test_key_prefix_normalizes_every_uri_form():
+def test_object_key_prefix_normalizes_every_uri_form():
     forms = [
         "s3://marin-us-east-02a/iris/rl-rdv/myjob",
         "gs://some-bucket/iris/rl-rdv/myjob",
@@ -90,7 +90,13 @@ def test_key_prefix_normalizes_every_uri_form():
         "  s3://marin-us-east-02a/iris/rl-rdv/myjob/  ",
     ]
     for f in forms:
-        assert srl._key_prefix_from_rendezvous(f) == "iris/rl-rdv/myjob", f
+        assert srl._object_key_prefix(f) == "iris/rl-rdv/myjob", f
+
+
+def test_object_key_prefix_preserves_lifecycle_managed_object_key():
+    rendezvous = "s3://marin-us-east-02a/tmp/ttl=14d/skyrl/users/alice/job/rendezvous"
+
+    assert srl._object_key_prefix(rendezvous) == "tmp/ttl=14d/skyrl/users/alice/job/rendezvous"
 
 
 def test_rendezvous_dir_short_circuits_without_s3():
@@ -100,6 +106,22 @@ def test_rendezvous_dir_short_circuits_without_s3():
         s3, SLUG, run=None, rendezvous_dir="s3://marin-us-east-02a/iris/rl-rdv/myjob", finelog_path=None
     )
     assert prefix == f"iris/rl-rdv/myjob/{srl.RAY_SUBDIR}/"
+    assert label == "myjob"
+    assert s3.calls == 0
+
+
+def test_ray_log_dir_short_circuits_without_s3():
+    s3 = FakeS3(RUNS)
+    prefix, label = srl.resolve_ray_prefix(
+        s3,
+        SLUG,
+        run=None,
+        rendezvous_dir=None,
+        finelog_path=None,
+        ray_log_dir="s3://marin-us-east-02a/marin/users/alice/skyrl/myjob/ray_session_logs",
+    )
+
+    assert prefix == "marin/users/alice/skyrl/myjob/ray_session_logs/"
     assert label == "myjob"
     assert s3.calls == 0
 
@@ -115,19 +137,46 @@ def test_finelog_derive_from_rendezvous_banner(tmp_path):
     assert label == "delphi-rl-d1"
 
 
+def test_finelog_derive_from_ray_log_banner(tmp_path):
+    finelog = tmp_path / "finelog.log"
+    finelog.write_text(
+        "[rl-iris] Ray logs:   s3://marin-us-east-02a/marin/users/alice/skyrl/delphi-rl-d1/ray_session_logs\n"
+    )
+
+    prefix, label = srl.resolve_ray_prefix(FakeS3([]), SLUG, None, None, str(finelog))
+
+    assert prefix == "marin/users/alice/skyrl/delphi-rl-d1/ray_session_logs/"
+    assert label == "delphi-rl-d1"
+
+
+def test_ray_log_banner_wins_over_historical_agentic_run(tmp_path):
+    finelog = tmp_path / "finelog.log"
+    finelog.write_text(
+        "[rl-iris] Ray logs:   s3://marin-us-east-02a/marin/users/alice/skyrl/current-job/ray_session_logs\n"
+    )
+
+    prefix, label = srl.resolve_ray_prefix(FakeS3(RUNS), SLUG, RUNS[0], None, str(finelog))
+
+    assert prefix == "marin/users/alice/skyrl/current-job/ray_session_logs/"
+    assert label == "current-job"
+
+
 def test_finelog_derive_from_bare_session_uri(tmp_path):
     """Fallback also works off a raw ray_session_logs URI the controller logged, not just the banner."""
     finelog = tmp_path / "finelog.log"
     finelog.write_text("uploading to s3://marin-us-east-02a/iris/rl-rdv/jobx/ray_session_logs/worker-0.out\n")
-    assert srl._derive_rendezvous_from_finelog(str(finelog)) == "iris/rl-rdv/jobx"
+
+    _, legacy_prefix = srl._ray_prefixes_from_finelog(str(finelog))
+
+    assert legacy_prefix == "iris/rl-rdv/jobx/ray_session_logs/"
 
 
 def test_finelog_derive_missing_or_unmatched_is_none(tmp_path):
-    assert srl._derive_rendezvous_from_finelog(None) is None
-    assert srl._derive_rendezvous_from_finelog(str(tmp_path / "nope.log")) is None
+    assert srl._ray_prefixes_from_finelog(None) == (None, None)
+    assert srl._ray_prefixes_from_finelog(str(tmp_path / "nope.log")) == (None, None)
     empty = tmp_path / "finelog.log"
     empty.write_text("nothing rendezvous-shaped here\n")
-    assert srl._derive_rendezvous_from_finelog(str(empty)) is None
+    assert srl._ray_prefixes_from_finelog(str(empty)) == (None, None)
 
 
 def test_unresolvable_returns_none(tmp_path):
@@ -140,13 +189,36 @@ def test_unresolvable_returns_none(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Store/creds resolution defaults — the object-store + kubeconfig wiring is untouched
+# Store and credential resolution
 # ---------------------------------------------------------------------------
 
 
-def test_store_and_kubeconfig_defaults_unchanged():
-    assert srl.BUCKET == "marin-us-east-02a"
-    assert srl.ENDPOINT == "https://cwobject.com"
-    assert srl.EAST_KUBECONFIG.endswith("coreweave-iris-gpu")
-    assert srl.RAY_SUBDIR == "ray_session_logs"
-    assert srl.KCFG == {"cw-us-east-02a": "~/.kube/coreweave-iris-gpu", "cw-rno2a": "~/.kube/coreweave-iris"}
+def test_cli_accepts_east08_cluster():
+    args = srl.argument_parser().parse_args(["/operator/job", "--cluster", "cw-us-east-08a"])
+
+    assert args.cluster == "cw-us-east-08a"
+
+
+def test_trace_batches_limit_total_download_bytes_and_report_oversized_non_logs():
+    objects = [
+        ("iris/job/trace_jobs/a/result.json", 40),
+        ("iris/job/trace_jobs/a/agent/trajectory.json", 40),
+        ("iris/job/trace_jobs/a/large.bin", 101),
+    ]
+
+    batches, skipped = srl.trace_object_batches(objects, batch_bytes=64, max_non_log_bytes=100)
+
+    assert batches == [
+        [("iris/job/trace_jobs/a/result.json", 40)],
+        [("iris/job/trace_jobs/a/agent/trajectory.json", 40)],
+    ]
+    assert skipped == [{"key": "iris/job/trace_jobs/a/large.bin", "size": 101, "reason": "non_log_size_limit"}]
+
+
+def test_trace_batches_keep_large_log_objects_when_non_log_guard_is_enabled():
+    objects = [("iris/job/trace_jobs/a/opencode.txt", 120)]
+
+    batches, skipped = srl.trace_object_batches(objects, batch_bytes=64, max_non_log_bytes=100)
+
+    assert batches == [[("iris/job/trace_jobs/a/opencode.txt", 120)]]
+    assert skipped == []

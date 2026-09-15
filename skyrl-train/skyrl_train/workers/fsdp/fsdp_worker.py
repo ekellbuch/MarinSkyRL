@@ -1,5 +1,8 @@
 import asyncio
 import os
+import socket
+from collections import Counter
+from dataclasses import dataclass
 
 from loguru import logger
 from skyrl_train.utils.trainer_utils import get_rope_scaling_config, get_rope_theta_config
@@ -18,18 +21,128 @@ except ImportError:
     from torch.distributed._tensor import DTensor
 
 from skyrl_train.model_wrapper import HFModelWrapper, get_llm_for_sequence_regression
+from skyrl_train.models.grug_moe import (
+    GRUG_MOE_MODEL_TYPE,
+    validate_grug_expert_parallel_options,
+)
 from skyrl_train.distributed.fsdp_strategy import FSDPStrategy
-from skyrl_train.utils import get_physical_gpu_id, str_to_torch_dtype
+from skyrl_train.utils import get_physical_gpu_id, str_to_torch_dtype, torch_dtype_to_str
+from skyrl_train.numa_policy import MemoryPolicy, cpu_numa_topology, current_memory_policy
+from skyrl_train.utils.numa import memory_nodes_for_range
 from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
-from skyrl_train.distributed.fsdp_utils import fsdp_version, get_init_weight_context_manager
-from skyrl_train.distributed import collective_count_diag as _ccdiag
+from skyrl_train.distributed.fsdp_utils import DEFAULT_EP_COMM_BACKEND, fsdp_version, get_init_weight_context_manager
+from skyrl_train.distributed import collective_phase_diagnostics as _phase_diagnostics
 from skyrl_train.workers.worker import (
     PolicyWorkerBase,
     CriticWorkerBase,
     RefWorkerBase,
 )
 from skyrl_train.weight_sync import WeightExtractor, WeightChunk
+from skyrl_train.weight_sync.weight_extractor import (
+    prepare_weight_sync_tensor,
+    validate_weight_sync_mode,
+    weight_sync_dtype,
+)
 from skyrl_train.weight_sync.weight_extractor_utils import yield_module_grouped_chunks
+from skyrl_train.utils.fd_monitor import start_fd_monitor
+
+
+def _fsdp_moe_model_kwargs(fsdp_config) -> dict[str, bool]:
+    """Translate one role's FSDP MoE settings into ``HFModelWrapper`` options.
+
+    Expert parallelism operates on the grouped model structure created by the wrapper, so every FSDP role
+    must derive these options from the same role-specific config that its ``FSDPStrategy`` consumes.
+    """
+    return {
+        "moe_router_replay": bool(fsdp_config.get("moe_router_replay", False)),
+        "moe_grouped_gemm": bool(fsdp_config.get("moe_grouped_gemm", False)),
+        "use_grouped_mm": bool(fsdp_config.get("use_grouped_mm", False)),
+    }
+
+
+@dataclass(frozen=True)
+class GrugValidationSnapshot:
+    """Test-only snapshot of one policy rank's loaded Grug state."""
+
+    rank: int
+    attention_backend: str
+    weights: dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class FSDPCpuOffloadNumaDiagnostics:
+    """Observed placement of persistent FSDP2 CPU-offload tensors."""
+
+    rank: int
+    host: str
+    cpu_nodes: tuple[int, ...]
+    cpu_affinity: tuple[int, ...]
+    affinity_nodes: tuple[int, ...]
+    memory_policy: MemoryPolicy
+    page_nodes: dict[int, int]
+    sampled_pages: int
+    sampled_tensors: int
+    sampled_bytes: int
+
+
+@dataclass(frozen=True)
+class _ParameterPageSample:
+    page_nodes: dict[int, int]
+    tensor_count: int
+    byte_count: int
+
+
+def _pinned_cpu_parameters_by_size(model: torch.nn.Module) -> list[torch.Tensor]:
+    parameters = []
+    for parameter in model.parameters():
+        local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+        if local_parameter.device.type == "cpu" and local_parameter.is_pinned() and local_parameter.numel() > 0:
+            parameters.append(local_parameter)
+    return sorted(parameters, key=lambda parameter: parameter.numel() * parameter.element_size(), reverse=True)
+
+
+def _sample_parameter_page_nodes(parameters: list[torch.Tensor], max_pages: int) -> _ParameterPageSample:
+    page_nodes: Counter[int] = Counter()
+    sampled_tensors = 0
+    sampled_bytes = 0
+    remaining_pages = max_pages
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    for parameter in parameters:
+        if remaining_pages == 0:
+            break
+        tensor_page_nodes = memory_nodes_for_range(
+            parameter.data_ptr(),
+            parameter.numel() * parameter.element_size(),
+            max_pages=min(64, remaining_pages),
+        )
+        page_nodes.update(tensor_page_nodes)
+        sampled_tensors += 1
+        sampled_page_count = sum(tensor_page_nodes.values())
+        sampled_bytes += sampled_page_count * page_size
+        remaining_pages -= sampled_page_count
+    return _ParameterPageSample(
+        page_nodes=dict(sorted(page_nodes.items())),
+        tensor_count=sampled_tensors,
+        byte_count=sampled_bytes,
+    )
+
+
+def _build_cpu_offload_numa_diagnostics(rank: int, page_sample: _ParameterPageSample) -> FSDPCpuOffloadNumaDiagnostics:
+    topology = cpu_numa_topology()
+    cpu_affinity = tuple(sorted(os.sched_getaffinity(0)))
+    affinity_nodes = tuple(sorted(node for node, cpus in topology.items() if set(cpu_affinity).intersection(cpus)))
+    return FSDPCpuOffloadNumaDiagnostics(
+        rank=rank,
+        host=socket.gethostname(),
+        cpu_nodes=tuple(sorted(topology)),
+        cpu_affinity=cpu_affinity,
+        affinity_nodes=affinity_nodes,
+        memory_policy=current_memory_policy(),
+        page_nodes=page_sample.page_nodes,
+        sampled_pages=sum(page_sample.page_nodes.values()),
+        sampled_tensors=page_sample.tensor_count,
+        sampled_bytes=page_sample.byte_count,
+    )
 
 
 class FSDPWeightExtractor(WeightExtractor):
@@ -37,13 +150,16 @@ class FSDPWeightExtractor(WeightExtractor):
 
     Args:
         model: FSDP model to extract weights from
-        group_by_module: If True, group parameters by module (e.g., for FlashRL QKV fusion)
+        group_by_module: If True, group parameters by module (e.g., for FlashRL QKV fusion).
+            Grug always uses separate chunks to preserve its FP32 router-bias buffers.
         batch_size_threshold_gb: If > 0, batch complete modules together until threshold is reached
         moe_grouped_gemm: If True, the model was grouped-swapped (Stage 3b) so its MoE
             blocks are ``GroupedMoEShim`` instances holding grouped ``experts.w1/w2/w3``
             tensors. The extracted state dict is then name/shape-remapped back to the
             per-expert HF layout the inference engine expects (Stage 4b). Default False
             keeps the path byte-identical to the non-grouped (a3-production) extractor.
+        fuse_weights: Whether the inference engine expects fused FP8 weight transfer.
+            Unsupported model types fail during extractor initialization.
     """
 
     def __init__(
@@ -52,9 +168,9 @@ class FSDPWeightExtractor(WeightExtractor):
         group_by_module: bool = False,
         batch_size_threshold_gb: float = 0.0,
         moe_grouped_gemm: bool = False,
+        fuse_weights: bool = False,
     ):
         self.model = model
-        self.group_by_module = group_by_module
         self.batch_size_threshold_gb = batch_size_threshold_gb
         self.moe_grouped_gemm = moe_grouped_gemm
         # Per-arch inference-engine (vLLM) weight-NAME translation. Most grouped-MoE
@@ -64,6 +180,9 @@ class FSDPWeightExtractor(WeightExtractor):
         # ``translate_moe_name_to_vllm`` renames ONLY Mixtral keys (see moe_weight_remap).
         _cfg = getattr(model, "config", None)
         self._model_type = getattr(_cfg, "model_type", "") or "" if _cfg is not None else ""
+        validate_weight_sync_mode(self._model_type, fuse_weights=fuse_weights)
+        self.fuse_weights = fuse_weights
+        self.group_by_module = group_by_module and self._model_type != GRUG_MOE_MODEL_TYPE
         # Qwen3.5/3.6 VLM-shell weight-sync (tmax Stage 2): the RL policy is the
         # unwrapped TEXT tower (``Qwen3_5MoeForCausalLM``, names ``model.*``) but the
         # vLLM rollout engine instantiates the multimodal SHELL
@@ -75,6 +194,9 @@ class FSDPWeightExtractor(WeightExtractor):
         from skyrl_train.models.qwen3_5_vlm import is_qwen3_5_text_tower
 
         self._is_qwen3_5_text_tower = is_qwen3_5_text_tower(_cfg)
+
+    def _target_dtype(self, name: str, default: torch.dtype) -> torch.dtype:
+        return weight_sync_dtype(self._model_type, name, default)
 
     def _translate_name(self, name: str) -> str:
         """Apply the per-arch inference-engine name translation (identity for all
@@ -134,11 +256,14 @@ class FSDPWeightExtractor(WeightExtractor):
         if not self.group_by_module:
             # Simple path: yield one chunk per parameter
             for name, param in params.items():
-                tensor = self._gather_tensor(param).to(dtype).detach().contiguous()
+                target_dtype = self._target_dtype(name, dtype)
+                tensor = self._gather_tensor(param)
+                tensor = prepare_weight_sync_tensor(self._model_type, name, tensor, target_dtype)
+                tensor = tensor.detach().contiguous()
                 name = self._translate_name(name)
                 yield WeightChunk(
                     names=[name],
-                    dtypes=[str(dtype)],
+                    dtypes=[torch_dtype_to_str(target_dtype)],
                     shapes=[list(tensor.shape)],
                     tensors=[tensor],
                 )
@@ -149,6 +274,7 @@ class FSDPWeightExtractor(WeightExtractor):
                 gather_tensor_fn=self._gather_tensor,
                 get_shape_fn=lambda name, param, tensor: list(tensor.shape),
                 batch_size_threshold_gb=self.batch_size_threshold_gb,
+                fuse_weights=self.fuse_weights,
             ):
                 yield chunk
 
@@ -166,7 +292,7 @@ class FSDPWeightExtractor(WeightExtractor):
         """
         from skyrl_train.distributed.fsdp_utils import gather_dtensor_strided_safe
 
-        device = torch.cuda.current_device()
+        device = torch.device("cuda", torch.cuda.current_device())
         if not isinstance(param, DTensor):
             return param
         out = gather_dtensor_strided_safe(param.to(device, non_blocking=True))
@@ -344,8 +470,13 @@ class FSDPWeightExtractor(WeightExtractor):
 
 
 class FSDPPolicyWorkerBase(PolicyWorkerBase):
+    def get_cpu_offload_numa_diagnostics(self, max_pages: int = 4096) -> FSDPCpuOffloadNumaDiagnostics:
+        """Report the physical placement of persistent FSDP2 CPU-offload tensors."""
+        parameters = _pinned_cpu_parameters_by_size(self.model.model)
+        page_sample = _sample_parameter_page_nodes(parameters, max_pages)
+        return _build_cpu_offload_numa_diagnostics(self._rank, page_sample)
+
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
         self.strategy.offload_to_cpu(
             self.model, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
         )
@@ -376,24 +507,50 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                     collected[name] = tensor.detach().to("cpu", dtype=torch.float32).contiguous()
         return collected
 
-    def diag_ep8_geometry(self):
-        """TEST-ONLY (EP=8 cross-node diag): return this rank's mesh geometry +
-        physical-node identity so the driver can PROVE an EP group straddles >=2
-        nodes. No collectives, no gather — pure introspection.
+    def grug_validation_snapshot(self, names=()):
+        """Return the calling rank and requested Grug weights gathered on rank 0.
+
+        Every rank must call this with the same names because DTensor
+        materialization is collective. The result includes the rank, loaded
+        attention backend, and requested ``weights``; the weights mapping is
+        empty on nonzero ranks.
+        """
+        config = getattr(self.model.model, "config", None)
+        if getattr(config, "model_type", None) != GRUG_MOE_MODEL_TYPE:
+            raise ValueError("grug_validation_snapshot is only valid for Grug models")
+        state = self.model.model.state_dict()
+        missing = set(names).difference(state)
+        if missing:
+            raise KeyError(f"missing Grug state entries: {sorted(missing)}")
+        is_rank0 = torch.distributed.get_rank() == 0
+        weights = {}
+        for name in names:
+            tensor = self.weight_extractor._gather_tensor(state[name])
+            if is_rank0:
+                weights[name] = tensor.detach().to("cpu", dtype=torch.float32).contiguous()
+        return GrugValidationSnapshot(
+            rank=torch.distributed.get_rank(),
+            attention_backend=config._attn_implementation,
+            weights=weights,
+        )
+
+    def diag_ep_geometry(self):
+        """TEST-ONLY: return this rank's EP mesh geometry and node identity.
+
+        The driver can use this to prove that an EP group spans multiple nodes.
+        No collectives or gathers are issued.
 
         Returns a dict with global rank, hostname, mesh shape/dim-names, this rank's
         per-mesh-dim coordinate, and the EP submesh coordinate (the index of this rank
-        within its 8-rank EP group).
+        within its EP group).
         """
-        import socket
-
         mesh = self.strategy.device_mesh
         dim_names = list(mesh.mesh_dim_names)
         shape = tuple(mesh.shape)
         coord = list(mesh.get_coordinate())
         ep_dim = dim_names.index("ep") if "ep" in dim_names else None
         # The EP-group identity = the coord with the ep dim removed (all ranks sharing
-        # this tuple form one 8-way EP group). The ep coord = position within the group.
+        # this tuple form one EP group). The ep coord = position within the group.
         group_key = tuple(c for i, c in enumerate(coord) if i != ep_dim)
         return {
             "rank": int(torch.distributed.get_rank()),
@@ -431,8 +588,6 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         """
         import hashlib
         import json
-        import os
-        import socket
 
         rank = int(torch.distributed.get_rank())
         host = socket.gethostname()
@@ -608,20 +763,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         )
         return out
 
-    def init_model(self, model_path, num_training_steps: int = None):
-        assert self.cfg.trainer.strategy in ("fsdp", "fsdp2")
-        strategy = FSDPStrategy(
-            fsdp_config=self.cfg.trainer.policy.fsdp_config,
-            optimizer_config=self.cfg.trainer.policy.optimizer_config,
-            model_config=self.cfg.trainer.policy.model,
-            fsdp_strategy=self.cfg.trainer.strategy,
-            seed=self.cfg.trainer.seed,
-            micro_train_batch_size_per_gpu=self.cfg.trainer.micro_train_batch_size_per_gpu,
-            num_training_steps=num_training_steps,
-        )
-        strategy.setup_distributed()
-        self.strategy = strategy
-
+    def _build_policy_model(self, strategy: FSDPStrategy, model_path: str) -> HFModelWrapper:
         # Stage 3: surface the CP submesh/group on the worker so the Stage-4 forward wrap
         # can read it. cp_size==1 leaves both None (flag-off path untouched).
         self.cp_mesh = getattr(strategy, "cp_mesh", None)
@@ -633,6 +775,12 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         self._normalize_mini_batch_size()
 
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        validate_grug_expert_parallel_options(
+            getattr(model_config, "model_type", None),
+            expert_model_parallel_size=strategy.ep_size,
+            use_grouped_mm=bool(self.cfg.trainer.policy.fsdp_config.get("use_grouped_mm", False)),
+            ep_comm_backend=str(self.cfg.trainer.policy.fsdp_config.get("ep_comm_backend", DEFAULT_EP_COMM_BACKEND)),
+        )
         init_context = get_init_weight_context_manager(
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
         )
@@ -640,9 +788,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             wrapped_model = HFModelWrapper(
                 model_path,
                 use_flash_attention_2=self.cfg.trainer.flash_attn,
-                # NOTE (sumanthrh): Model initialization should always be in fp32
-                # during training
-                bf16=True,
+                bf16=strategy.parameter_storage_dtype == torch.bfloat16,
                 lora_rank=self.cfg.trainer.policy.model.lora.rank,
                 lora_alpha=self.cfg.trainer.policy.model.lora.alpha,
                 lora_dropout=self.cfg.trainer.policy.model.lora.dropout,
@@ -653,15 +799,19 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 use_torch_compile=self.cfg.trainer.policy.use_torch_compile,
                 rope_scaling=get_rope_scaling_config(self.cfg.trainer),
                 rope_theta=get_rope_theta_config(self.cfg.trainer),
-                moe_router_replay=bool(self.cfg.trainer.policy.fsdp_config.get("moe_router_replay", False)),
-                moe_grouped_gemm=bool(self.cfg.trainer.policy.fsdp_config.get("moe_grouped_gemm", False)),
-                use_grouped_mm=bool(self.cfg.trainer.policy.fsdp_config.get("use_grouped_mm", False)),
+                **_fsdp_moe_model_kwargs(self.cfg.trainer.policy.fsdp_config),
                 attn_backend=self.cfg.trainer.get("attn_backend", "auto"),
                 context_parallel_size=int(self.cfg.trainer.policy.fsdp_config.get("context_parallel_size", 1)),
                 # Stage 4: surface the CP submesh + rotate method so the forward
                 # enters torch-native context_parallel (ring SDPA). None at cp=1.
                 cp_mesh=self.cp_mesh,
                 cp_rotate_method=str(self.cfg.trainer.policy.fsdp_config.get("cp_rotate_method", "allgather")),
+                training_strategy=self.cfg.trainer.strategy,
+                model_load_retry=self.cfg.trainer.model_load_retry,
+                gdn_backend=str(self.cfg.generator.gdn_backend),
+                lm_head_compute_dtype=self.cfg.trainer.policy.model.lm_head_compute_dtype,
+                use_liger_kernel=self.cfg.trainer.policy.model.get("use_liger_kernel", False),
+                logprob_chunk_size=self.cfg.trainer.policy.model.get("logprob_chunk_size", None),
             )
             # in-place patch
             self._seq_parallel_monkey_patch(model=wrapped_model.model)
@@ -672,6 +822,28 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                         "use_reentrant": self.cfg.trainer.gradient_checkpointing_use_reentrant
                     }
                 )
+
+        return wrapped_model
+
+    def _create_strategy(self, *, num_training_steps: int | None = None) -> FSDPStrategy:
+        strategy = FSDPStrategy(
+            fsdp_config=self.cfg.trainer.policy.fsdp_config,
+            optimizer_config=self.cfg.trainer.policy.optimizer_config,
+            model_config=self.cfg.trainer.policy.model,
+            fsdp_strategy=self.cfg.trainer.strategy,
+            seed=self.cfg.trainer.seed,
+            micro_train_batch_size_per_gpu=self.cfg.trainer.micro_train_batch_size_per_gpu,
+            num_training_steps=num_training_steps,
+            collective_timeout_seconds=self.cfg.trainer.distributed.worker_collective_timeout_seconds,
+        )
+        strategy.setup_distributed()
+        self.strategy = strategy
+        return strategy
+
+    def init_model(self, model_path, num_training_steps: int = None):
+        assert self.cfg.trainer.strategy in ("fsdp", "fsdp2")
+        strategy = self._create_strategy(num_training_steps=num_training_steps)
+        wrapped_model = self._build_policy_model(strategy, model_path)
 
         self.model, self.optimizer, self.scheduler = strategy.prepare(
             (wrapped_model, None, None),
@@ -691,9 +863,18 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 self.cfg.generator.weight_transfer_threshold_cuda_ipc_GB if self.use_cuda_ipc else 0.0
             ),
             moe_grouped_gemm=bool(self.cfg.trainer.policy.fsdp_config.get("moe_grouped_gemm", False)),
+            fuse_weights=bool(self.cfg.generator.fuse_weights),
         )
 
         self._maybe_start_host_ram_monitor()
+
+    def init_model_for_export(self, model_path: str) -> None:
+        """Initialize policy structure without training or rollout state."""
+        assert self.cfg.trainer.strategy in ("fsdp", "fsdp2")
+        strategy = self._create_strategy()
+        wrapped_model = self._build_policy_model(strategy, model_path)
+        self.model = strategy.prepare(wrapped_model)
+        self.model.eval()
 
     def _maybe_start_host_ram_monitor(self):
         """Start the periodic host-RAM / cgroup-mem reporter on the POLICY worker.
@@ -708,21 +889,18 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         Gating (low-overhead, best-effort, never raises into init_model):
           * ONE rank per node only (``self._local_rank == 0``) — node mem/cgroup
             is shared across the 8 ranks on a node, so 8x logging would be spam.
-          * env ``SKYRL_POLICY_HOST_RAM_MONITOR`` (default "1"; set "0" to disable).
-          * env ``SKYRL_POLICY_HOST_RAM_MONITOR_INTERVAL`` seconds (default 60 —
+          * ``trainer.policy.host_memory_monitor.enabled`` (default true).
+          * ``trainer.policy.host_memory_monitor.interval_seconds`` (default 60 —
             tighter than the fd-monitor's 120s default so the fast GDN-scan peak
             is sampled; <=0 disables).
         """
         try:
-            if int(os.environ.get("SKYRL_POLICY_HOST_RAM_MONITOR", "1")) == 0:
+            monitor = self.cfg.trainer.policy.host_memory_monitor
+            if not bool(monitor.enabled):
                 return
             if getattr(self, "_local_rank", None) != 0:
                 return
-            interval = int(os.environ.get("SKYRL_POLICY_HOST_RAM_MONITOR_INTERVAL", "60"))
-            import socket
-
-            from examples.terminal_bench.fd_monitor import start_fd_monitor
-
+            interval = int(monitor.interval_seconds)
             logger.info(
                 f"[policy-host-ram-monitor] starting on rank={self._rank} "
                 f"host={socket.gethostname()} interval={interval}s"
@@ -790,9 +968,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             return
 
         # Extract weights using the initialized extractor
-        import os
-
-        _fuse_weights = os.environ.get("SKYRL_FUSE_WEIGHTS", "0") == "1"
+        _fuse_weights = bool(self.cfg.generator.fuse_weights)
 
         # #1685 fix (FlashInfer-CUTLASS w13 swap skipped on RL update -> MoE token-salad):
         # bracket the WHOLE multi-chunk sync with vLLM's layerwise reload so per-chunk
@@ -800,10 +976,8 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         # process_weights_after_loading (re-applying swap_w13_to_w31) EXACTLY once. PROVEN
         # by the disagg kernel-format diag: without this the engine holds checkpoint
         # [gate;up] while the FlashInfer CUTLASS kernel reads [up;gate]. Inert (swap-wise)
-        # on triton/dense backends, so byte-identical there. Gated by env for safety.
-        _w13_bracket = (
-            not self.use_cuda_ipc and not _fuse_weights and os.environ.get("SKYRL_W13_RELOAD_BRACKET", "1") == "1"
-        )
+        # on triton/dense backends, so byte-identical there.
+        _w13_bracket = not self.use_cuda_ipc and not _fuse_weights
 
         if not self.use_cuda_ipc:
             # Signal engines to start accumulating weights (for FP8 batched quantization)
@@ -829,7 +1003,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                         inference_engine_client.update_named_weights(
                             {
                                 "names": [name],
-                                "dtypes": [self.cfg.generator.model_dtype],
+                                "dtypes": chunk.dtypes,
                                 "shapes": [list(tensor.shape)],
                             }
                         )
@@ -867,7 +1041,9 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 # Process all parameters in this batch
                 # TODO(haochen): Pack tensors into contiguous buffer before creating IPC handle
                 # (like Megatron does) to reduce number of IPC handles and file descriptors
-                for name, tensor, shape in zip(chunk.names, chunk.tensors, chunk.shapes):
+                for name, dtype_str, tensor, shape in zip(
+                    chunk.names, chunk.dtypes, chunk.tensors, chunk.shapes, strict=True
+                ):
                     # Create IPC handle for tensor
                     ipc_handle = reduce_tensor(tensor)
                     ipc_handle = {get_physical_gpu_id(): ipc_handle}
@@ -880,7 +1056,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                             ipc_handles.update(d)
 
                         weights_update_request["names"].append(name)
-                        weights_update_request["dtypes"].append(self.cfg.generator.model_dtype)
+                        weights_update_request["dtypes"].append(dtype_str)
                         weights_update_request["shapes"].append(shape)
                         weights_update_request["extras"].append({"ipc_handles": ipc_handles})
 
@@ -914,16 +1090,12 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         OFF -> byte-identical to the old sync `forward`) or off the event-loop thread
         via `asyncio.to_thread` from the async `forward` entry (flag ON).
         """
-        # Collective-count diagnostic (default OFF): mark this forward region so the
-        # MoE-EP boundary logs only its FIRST all-to-all, and record the default-PG
-        # count BEFORE the root-module unshard all_gather (the gs1 wedge site).
-        _ccdiag.begin_forward_region()
-        _ccdiag.log_phase("forward_impl_enter", rank=self._rank)
+        _phase_diagnostics.start_phase(_phase_diagnostics.CollectivePhase.FORWARD_IMPL_ENTER)
         output = super().forward(data)
         # unshard the root FSDP module (https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes)
         if self._world_size > 1 and fsdp_version(self.model.model) == 1:
             self.model.model._handle.reshard(True)
-        _ccdiag.log_phase("forward_impl_exit", rank=self._rank)
+        _phase_diagnostics.log_phase(_phase_diagnostics.CollectivePhase.FORWARD_IMPL_EXIT)
         return output
 
     async def forward(
@@ -978,35 +1150,36 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         Ray transparently awaits async actor methods, so the driver's `ray.get(refs)`
         still returns the `TrainingOutputBatch` unchanged -> no driver-side change.
 
-        Gated behind SKYRL_FORWARD_DISPATCH_FIX (default ON). Flag OFF -> the sync body
-        runs INLINE -> byte-identical to the pre-fix forward (still an async method, but
-        no yield / no thread hop, so a single-rank / non-racy run is unaffected).
+        This cooperative scheduling is the required forward path.
         """
         # UNGATED per-rank rendezvous marker: we MUST see this on all 32 ranks on the
         # next run (mirrors WORKER_FORWARD_ENTER, which fires deeper inside the sync
         # body). Pre-fix only rank 0 reached the forward; with this fix every dispatched
         # rank's coroutine task is scheduled, so all 32 must log this.
         logger.info(f"WORKER_FORWARD_DISPATCH_RDV rank={self._rank}")
-        # Collective-count diagnostic (default OFF): bracket the whole forward so a
-        # per-rank default-PG count is logged at entry AND exit — the enter/exit diff
-        # localizes an EP-group that issues an extra/fewer default-PG collective.
-        _ccdiag.log_phase("forward_enter", rank=self._rank)
-        try:
-            if os.environ.get("SKYRL_FORWARD_DISPATCH_FIX", "1") != "1":
-                return self._forward_impl(data)
-            # Yield so this dispatched coroutine is guaranteed a loop turn and is scheduled
-            # even if it arrived while the loop was mid-cycle servicing another coroutine.
-            await asyncio.sleep(0)
-            # Run the heavy sync FSDP forward off the event-loop thread so the blocking
-            # unshard collective cannot re-occupy the loop (head-of-line-block a peer).
-            return await asyncio.to_thread(self._forward_impl, data)
-        finally:
-            _ccdiag.log_phase("forward_exit", rank=self._rank)
+        metadata = data.metadata or {}
+        diagnostic_metadata = _phase_diagnostics.CollectiveRegionMetadata(global_step=metadata.get("global_step"))
+        diagnostic_mesh = self.strategy.device_mesh if _phase_diagnostics.enabled() else None
+        with _phase_diagnostics.region(
+            diagnostic_mesh,
+            kind=_phase_diagnostics.CollectiveRegionKind.POLICY_INFERENCE_FORWARD,
+            rank=self._rank,
+            metadata=diagnostic_metadata,
+        ):
+            _phase_diagnostics.log_phase(_phase_diagnostics.CollectivePhase.FORWARD_ENTER)
+            try:
+                # Yield so this dispatched coroutine is guaranteed a loop turn and is scheduled
+                # even if it arrived while the loop was mid-cycle servicing another coroutine.
+                await asyncio.sleep(0)
+                # Run the heavy sync FSDP forward off the event-loop thread so the blocking
+                # unshard collective cannot re-occupy the loop (head-of-line-block a peer).
+                return await asyncio.to_thread(self._forward_impl, data)
+            finally:
+                _phase_diagnostics.log_phase(_phase_diagnostics.CollectivePhase.FORWARD_EXIT)
 
 
 class FSDPCriticWorkerBase(CriticWorkerBase):
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
         self.strategy.offload_to_cpu(
             self.model, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
         )
@@ -1022,6 +1195,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             fsdp_strategy=self.cfg.trainer.strategy,
             seed=self.cfg.trainer.seed,
             micro_train_batch_size_per_gpu=self.cfg.trainer.micro_train_batch_size_per_gpu,
+            collective_timeout_seconds=self.cfg.trainer.distributed.worker_collective_timeout_seconds,
             num_training_steps=num_training_steps,
         )
         strategy.setup_distributed()
@@ -1043,9 +1217,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
                 model_path,
                 "critic",
                 use_flash_attention_2=self.cfg.trainer.flash_attn,
-                # NOTE (sumanthrh): Model initialization should always be in fp32
-                # during training
-                bf16=True,
+                bf16=strategy.parameter_storage_dtype == torch.bfloat16,
                 lora_rank=self.cfg.trainer.critic.model.lora.rank,
                 lora_alpha=self.cfg.trainer.critic.model.lora.alpha,
                 lora_dropout=self.cfg.trainer.critic.model.lora.dropout,
@@ -1093,20 +1265,16 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
         Identical mechanism/justification to FSDPPolicyWorkerBase.forward (see its
         docstring): async entry + `await asyncio.sleep(0)` yield + `asyncio.to_thread`
         of the sync body so the dispatched forward task on this Ray async actor cannot
-        be head-of-line-blocked by a concurrently-running coroutine. Inference-only body
-        (no autograd graph). Gated SKYRL_FORWARD_DISPATCH_FIX (default ON); flag OFF ->
-        inline sync body (byte-identical to pre-fix).
+        be head-of-line-blocked by a concurrently-running coroutine. The body is
+        inference-only and builds no autograd graph.
         """
         logger.info(f"WORKER_FORWARD_DISPATCH_RDV rank={self._rank}")
-        if os.environ.get("SKYRL_FORWARD_DISPATCH_FIX", "1") != "1":
-            return self._forward_impl(data)
         await asyncio.sleep(0)
         return await asyncio.to_thread(self._forward_impl, data)
 
 
 class FSDPRefWorkerBase(RefWorkerBase):
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, **kwargs):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
         self.strategy.offload_to_cpu(self.model, None, pin_memory, non_blocking)
 
     def backload_to_gpu(self, non_blocking=True, **kwargs):
@@ -1119,6 +1287,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
             fsdp_strategy=self.cfg.trainer.strategy,
             seed=self.cfg.trainer.seed,
             micro_train_batch_size_per_gpu=self.cfg.trainer.micro_train_batch_size_per_gpu,
+            collective_timeout_seconds=self.cfg.trainer.distributed.worker_collective_timeout_seconds,
         )
         strategy.setup_distributed()
         self.strategy = strategy
@@ -1128,6 +1297,12 @@ class FSDPRefWorkerBase(RefWorkerBase):
         self.cp_group = getattr(strategy, "cp_group", None)
 
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        validate_grug_expert_parallel_options(
+            getattr(model_config, "model_type", None),
+            expert_model_parallel_size=strategy.ep_size,
+            use_grouped_mm=bool(self.cfg.trainer.ref.fsdp_config.get("use_grouped_mm", False)),
+            ep_comm_backend=str(self.cfg.trainer.ref.fsdp_config.get("ep_comm_backend", DEFAULT_EP_COMM_BACKEND)),
+        )
         init_context = get_init_weight_context_manager(
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
         )
@@ -1141,12 +1316,17 @@ class FSDPRefWorkerBase(RefWorkerBase):
                 use_sample_packing=self.cfg.trainer.use_sample_packing,
                 rope_scaling=get_rope_scaling_config(self.cfg.trainer),
                 rope_theta=get_rope_theta_config(self.cfg.trainer),
+                **_fsdp_moe_model_kwargs(self.cfg.trainer.ref.fsdp_config),
                 attn_backend=self.cfg.trainer.get("attn_backend", "auto"),
                 context_parallel_size=int(self.cfg.trainer.ref.fsdp_config.get("context_parallel_size", 1)),
                 # Stage 4: ref-logprob forward must CP-shard identically to the
                 # policy so KL aligns post-unshard (G3). None at cp=1.
                 cp_mesh=self.cp_mesh,
                 cp_rotate_method=str(self.cfg.trainer.ref.fsdp_config.get("cp_rotate_method", "allgather")),
+                training_strategy=self.cfg.trainer.strategy,
+                model_load_retry=self.cfg.trainer.model_load_retry,
+                gdn_backend=str(self.cfg.generator.gdn_backend),
+                logprob_chunk_size=self.cfg.trainer.policy.model.get("logprob_chunk_size", None),
             )
             self._seq_parallel_monkey_patch(model=wrapped_model.model)
 
@@ -1169,12 +1349,9 @@ class FSDPRefWorkerBase(RefWorkerBase):
 
         Identical mechanism/justification to FSDPPolicyWorkerBase.forward (see its
         docstring): async entry + `await asyncio.sleep(0)` yield + `asyncio.to_thread`
-        of the sync body. Inference-only body. Gated SKYRL_FORWARD_DISPATCH_FIX
-        (default ON); flag OFF -> inline sync body (byte-identical to pre-fix).
+        of the sync body. The body is inference-only.
         """
         logger.info(f"WORKER_FORWARD_DISPATCH_RDV rank={self._rank}")
-        if os.environ.get("SKYRL_FORWARD_DISPATCH_FIX", "1") != "1":
-            return self._forward_impl(data)
         await asyncio.sleep(0)
         return await asyncio.to_thread(self._forward_impl, data)
 

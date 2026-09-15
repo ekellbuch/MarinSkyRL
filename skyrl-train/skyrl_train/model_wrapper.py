@@ -4,7 +4,6 @@
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/model.py
 
 import contextlib
-import os
 import threading
 from typing import Any, Dict, Optional, Tuple, Union
 from copy import deepcopy
@@ -26,46 +25,36 @@ from skyrl_train.distributed.cp_utils import (
     cp_sdpa_dispatcher_span,
     cp_load_balance_indices,
 )
+from skyrl_train.utils.token_stats import top1_margin_from_logits
 from skyrl_train.utils.torch_utils import chunked_entropy_from_logits, logprobs_from_logits
+from skyrl_train.models.grug_moe import (
+    GRUG_MOE_MODEL_TYPE,
+    GRUG_SUPPORTED_ATTENTION_BACKENDS,
+    GrugMoeForCausalLM,
+    enable_grug_grouped_mm,
+    validate_grug_training_strategy,
+)
+from skyrl_train.models.layers.moe_checkpoint import moe_recompute_context_fn
+from skyrl_train.models.chunked_logprobs import ChunkedLogprobHead, unpack_per_token
+from skyrl_train.models.lm_head_precision import configure_hf_lm_head_compute_dtype
+from skyrl_train.utils.flash_attention import (
+    flash_pad_input,
+    flash_unpad_input,
+)
 from packaging.version import Version
+from marinskyrl.runtime_options import GDNBackend
 
-# --- Stage 2 (FSDP2 CP): guarded flash-attn import ---------------------------
-# The CP path runs through SDPA ring attention, not flash-attn varlen, so the
-# environment that loads the model need NOT have flash-attn installed. Previously
-# `from flash_attn.bert_padding import pad_input, unpad_input` was an
-# unconditional module-level import that broke `import model_wrapper` in any
-# env without flash-attn. We make it lazy: try the import; if it fails, bind
-# `pad_input`/`unpad_input` to shims that raise ONLY if actually called (every
-# call site is gated on `attn_implementation == "flash_attention_2"` or
-# `use_sample_packing`, both of which are off on the sdpa/CP path). `_HAS_FLASH`
-# records availability for tests / diagnostics.
-try:
-    from flash_attn.bert_padding import pad_input, unpad_input  # noqa: F401
-
-    _HAS_FLASH = True
-except ImportError:  # flash-attn not installed (e.g. the CP/sdpa-only env)
-    _HAS_FLASH = False
-
-    def _flash_missing(*args, **kwargs):
-        raise ImportError(
-            "flash_attn is not installed but a flash-attn-only code path "
-            "(sample packing / pad_input / unpad_input) was invoked. Install "
-            "flash-attn, or use attn_backend='sdpa'/'flex' with "
-            "use_sample_packing=false (the CP path)."
-        )
-
-    def pad_input(*args, **kwargs):  # noqa: F811
-        return _flash_missing(*args, **kwargs)
-
-    def unpad_input(*args, **kwargs):  # noqa: F811
-        return _flash_missing(*args, **kwargs)
-
+# Per-token `[B, S]` outputs that share the logprob tensor's layout restoration.
+_PER_TOKEN_OUTPUT_KEYS = ("entropy", "top1_margin", "top1_token")
 
 # Rank-0 HF weight-index resolution retry (transient EOF flake). The helper now
 # lives in skyrl_train.utils.hf_load_retry (dependency-light) so the Megatron
 # worker can share it without importing this heavy module. Re-exported under the
 # original private names to keep this module's call sites + any importers stable.
 from skyrl_train.utils.hf_load_retry import (  # noqa: E402
+    DEFAULT_BACKOFF_BASE_SECONDS,
+    DEFAULT_BACKOFF_CAP_SECONDS,
+    DEFAULT_MAX_RETRIES,
     load_pretrained_with_retry as _load_pretrained_with_retry,
 )
 
@@ -107,6 +96,50 @@ def resolve_attn_implementation(
             "supported under context parallel (G2)."
         )
     return impl
+
+
+def validate_grug_training_options(
+    *,
+    model_type: str | None,
+    attn_implementation: str,
+    use_sample_packing: bool,
+    lora_rank: int,
+    load_in_4bit: bool,
+    sequence_parallel_size: int,
+    context_parallel_size: int,
+    moe_router_replay: bool,
+    moe_grouped_gemm: bool,
+    use_liger_kernel: bool,
+) -> None:
+    """Validate the deliberately narrow supported Grug training surface."""
+
+    if model_type != GRUG_MOE_MODEL_TYPE:
+        return
+    unsupported = {
+        "attention backend": attn_implementation not in GRUG_SUPPORTED_ATTENTION_BACKENDS,
+        "sample packing": use_sample_packing,
+        "LoRA": lora_rank > 0,
+        "4-bit loading": load_in_4bit,
+        "sequence parallelism": sequence_parallel_size > 1,
+        "context parallelism": context_parallel_size > 1,
+        "router replay/R3": moe_router_replay,
+        "generic grouped MoE swap": moe_grouped_gemm,
+        "Liger kernels": use_liger_kernel,
+    }
+    enabled = [name for name, is_enabled in unsupported.items() if is_enabled]
+    if enabled:
+        raise ValueError("Grug FSDP2 training does not support: " + ", ".join(enabled))
+
+
+def _enable_native_grug_grouping(model: nn.Module, use_grouped_mm: bool) -> None:
+    """Enable native grouped execution when the loaded model is Grug."""
+
+    if not use_grouped_mm or not isinstance(model, GrugMoeForCausalLM):
+        return
+    num_grug_moe_blocks = enable_grug_grouped_mm(model)
+    if num_grug_moe_blocks == 0:
+        raise RuntimeError("use_grouped_mm=true selected Grug native grouping but found no Grug MoE blocks")
+    logger.info(f"[Grug-MoE] enabled native grouped_mm on {num_grug_moe_blocks} blocks")
 
 
 def _cp_mask_dict_supported(model) -> bool:
@@ -303,20 +336,6 @@ def _model_is_gdn_arch(pretrain_or_model) -> bool:
     return False
 
 
-def _gdn_mask_fla_enabled(pretrain_or_model) -> bool:
-    """Resolve whether to force the pure-torch GDN path (mask the broken fla wheel).
-
-    Footgun default (deslop stage 2): ON, AUTO-derived from the model arch. The
-    ``SKYRL_GDN_MASK_FLA`` env var is the override (set ``0`` to force off, ``1`` to
-    force on); UNSET auto-enables ONLY for GDN archs (Qwen3-Next), so it is a strict
-    no-op on dense / full-attention models (which never import fla) — byte-identical
-    to today, where dense configs left it unset and GDN configs set it ``1``."""
-    val = os.environ.get("SKYRL_GDN_MASK_FLA")
-    if val is not None:
-        return val in ("1", "true", "True")
-    return _model_is_gdn_arch(pretrain_or_model)
-
-
 class HFModelWrapper(nn.Module):
     """
     Base class for wrapped HF models in reinforcement learning.
@@ -368,6 +387,11 @@ class HFModelWrapper(nn.Module):
         context_parallel_size: int = 1,
         cp_mesh=None,
         cp_rotate_method: str = "allgather",
+        training_strategy: str | None = None,
+        model_load_retry=None,
+        gdn_backend: str = "torch",
+        lm_head_compute_dtype: str | None = None,
+        logprob_chunk_size: int | None = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -399,14 +423,28 @@ class HFModelWrapper(nn.Module):
             )
 
         if isinstance(pretrain_or_model, str):
+            local_config = AutoConfig.from_pretrained(pretrain_or_model, trust_remote_code=True)
+            model_type = getattr(local_config, "model_type", None)
+            validate_grug_training_strategy(model_type, training_strategy)
+            validate_grug_training_options(
+                model_type=model_type,
+                attn_implementation=self.attn_implementation,
+                use_sample_packing=use_sample_packing,
+                lora_rank=lora_rank,
+                load_in_4bit=load_in_4bit,
+                sequence_parallel_size=sequence_parallel_size,
+                context_parallel_size=context_parallel_size,
+                moe_router_replay=moe_router_replay,
+                moe_grouped_gemm=moe_grouped_gemm,
+                use_liger_kernel=use_liger_kernel,
+            )
+
             # Qwen3-Next GatedDeltaNet kernel routing (Stage 7/8): when the fla
             # overlay is mounted, the broken fla-0.5.0 wheel would crash the
             # qwen3_next modeling import — mask fla off BEFORE from_pretrained so
             # transformers uses its pure-torch (or, opt-in, FlashQLA) GDN path.
-            # Footgun default ON, auto-derived from arch (no-op on dense); the
-            # SKYRL_GDN_MASK_FLA env var is the override. Computed ONCE, reused for
-            # the FlashQLA gate below.
-            _gdn_mask = _gdn_mask_fla_enabled(pretrain_or_model)
+            # The architecture determines whether the broken FLA surface is masked.
+            _gdn_mask = _model_is_gdn_arch(pretrain_or_model)
             if _gdn_mask:
                 from skyrl_train.models.qwen3_next_gdn import mask_fla
 
@@ -454,7 +492,7 @@ class HFModelWrapper(nn.Module):
             # IncompleteRead / dropped connection / spurious "no .safetensors"),
             # which previously killed the whole gang. Retries only the transient
             # classes; a genuinely-missing repo/file still surfaces. See
-            # _load_pretrained_with_retry above (SKYRL_HF_LOAD_MAX_RETRIES knob).
+            # _load_pretrained_with_retry above (trainer.model_load_retry).
             self.model = _load_pretrained_with_retry(
                 lambda: model_class.from_pretrained(
                     pretrain_or_model,
@@ -466,6 +504,13 @@ class HFModelWrapper(nn.Module):
                     **rope_scaling_kwargs,
                 ),
                 model_id=pretrain_or_model,
+                max_retries=int(model_load_retry.max_retries) if model_load_retry is not None else DEFAULT_MAX_RETRIES,
+                backoff_base=float(model_load_retry.backoff_base_seconds)
+                if model_load_retry is not None
+                else DEFAULT_BACKOFF_BASE_SECONDS,
+                backoff_cap=float(model_load_retry.backoff_cap_seconds)
+                if model_load_retry is not None
+                else DEFAULT_BACKOFF_CAP_SECONDS,
             )
 
             # Qwen3.5/3.6 multimodal shell -> text CausalLM (tmax-aligned: "load
@@ -479,15 +524,18 @@ class HFModelWrapper(nn.Module):
             # ``self.model.config``), ``count_moe_layers``, and the vLLM
             # weight-sync prefix. We re-point the already-loaded text tower +
             # lm_head into a plain ``Qwen3_5MoeForCausalLM`` (no re-download; the
-            # text weights map 1:1) and drop vision/MTP. Gated on
-            # SKYRL_QWEN3_5_VLM_UNWRAP (default on).
+            # text weights map 1:1) and drop vision/MTP.
             from skyrl_train.models.qwen3_5_vlm import (
+                is_qwen3_5_text_tower,
                 is_qwen3_5_vlm_shell,
+                remove_vision_no_split_modules,
                 unwrap_to_text_causal_lm,
             )
 
             if is_qwen3_5_vlm_shell(self.model.config):
                 self.model = unwrap_to_text_causal_lm(self.model)
+            if is_qwen3_5_text_tower(self.model.config):
+                remove_vision_no_split_modules(self.model)
 
             # gpt oss
             if Version(transformers.__version__) >= Version("4.56.2"):
@@ -562,17 +610,26 @@ class HFModelWrapper(nn.Module):
             self.model.config.use_cache = False
 
             # Qwen3-Next: opt-in FlashQLA fused GDN kernel (Stage 8). No-op unless
-            # SKYRL_GDN_FLASHQLA=1 and the fla_tilelang overlay is mounted; rebinds
+            # generator.gdn_backend=flashqla and the fla_tilelang overlay is mounted; rebinds
             # each Qwen3NextGatedDeltaNet.chunk_gated_delta_rule to the fused
             # tilelang kernel. Falls back to pure-torch (warning) if unavailable.
             # Gated on the same resolved GDN-arch decision as mask_fla above
-            # (engage_flashqla is itself a no-op unless SKYRL_GDN_FLASHQLA=1).
+            # (engage_flashqla is itself a no-op unless explicitly enabled).
             if _gdn_mask:
                 from skyrl_train.models.qwen3_next_gdn import engage_flashqla
 
-                engage_flashqla(self.model)
+                engage_flashqla(self.model, enabled=gdn_backend == GDNBackend.FLASHQLA)
         else:
             self.model = pretrain_or_model
+
+        _enable_native_grug_grouping(self.model, use_grouped_mm)
+        configure_hf_lm_head_compute_dtype(self.model, lm_head_compute_dtype)
+        # Sequence-chunked per-token statistics inside the projection, so the
+        # full-vocabulary logits of one chunk are the only ones ever alive.
+        # Installed after the precision patch so each chunk goes through it.
+        self._chunked_head = (
+            ChunkedLogprobHead.install(self.model, logprob_chunk_size) if logprob_chunk_size is not None else None
+        )
 
         # CP mask contract probe (computed once): does this HF model's forward
         # accept the per-layer-type mask DICT escape hatch? Dense Qwen3 does;
@@ -726,8 +783,14 @@ class HFModelWrapper(nn.Module):
         compute_entropy=False,
         entropy_requires_grad=True,
         rollout_routed_experts: Optional[torch.Tensor] = None,
+        compute_top1_margin=False,
     ) -> torch.Tensor:
-        """Returns action log probs"""
+        """Returns action log probs.
+
+        With ``compute_top1_margin`` the returned output also carries
+        ``top1_margin`` (top-1 minus runner-up logit) and ``top1_token`` per
+        position, in the same ``[B, S]`` layout as ``entropy``.
+        """
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
 
@@ -741,10 +804,12 @@ class HFModelWrapper(nn.Module):
                 # max_seqlen); >= 2.7 adds a 5th `seqused`. We only consume the
                 # first two, so star the tail to stay version-agnostic (the SIF
                 # ships flash_attn 2.6.3 -> 4-tuple).
-                sequences_fwd, nnz_indices, *_ = unpad_input(sequences.unsqueeze(-1), attention_mask=attention_mask)
+                sequences_fwd, nnz_indices, *_ = flash_unpad_input(
+                    sequences.unsqueeze(-1), attention_mask=attention_mask
+                )
                 # (nnz, 1) -> (1, nnz)
                 sequences_fwd = sequences_fwd.transpose(0, 1)
-                position_ids_fwd, *_ = unpad_input(position_ids.unsqueeze(-1), attention_mask)
+                position_ids_fwd, *_ = flash_unpad_input(position_ids.unsqueeze(-1), attention_mask)
                 # (nnz, 1) -> (1, nnz)
                 position_ids_fwd = position_ids_fwd.transpose(0, 1)
                 attention_mask_fwd = None  # no attention mask with FA 2
@@ -793,15 +858,8 @@ class HFModelWrapper(nn.Module):
             # tokens first, pads trailing). The roll is recorded in
             # `cp_left_shifts` and INVERTED on the per-token outputs (Stage 5b)
             # so the returned logprobs/entropy are in the ORIGINAL column order —
-            # byte-identical alignment to the cp=1 path. Gated by
-            # SKYRL_CP_REQUIRE_RIGHT_ALIGN (default "1"); set "0" only if the
-            # caller has independently guaranteed right-alignment and wants to
-            # skip the per-step realignment. cp_size==1 never reaches here (G1).
-            if attention_mask_fwd is not None and os.environ.get("SKYRL_CP_REQUIRE_RIGHT_ALIGN", "1") not in (
-                "0",
-                "false",
-                "False",
-            ):
+            # byte-identical alignment to the cp=1 path. cp_size==1 never reaches here.
+            if attention_mask_fwd is not None:
                 am = attention_mask_fwd.to(torch.bool)
                 _, S = am.shape
                 # `first_real`: index of the FIRST real (mask==1) token per row.
@@ -959,9 +1017,21 @@ class HFModelWrapper(nn.Module):
         else:
             cp_ctx = maybe_cp_context(1, None, None, buffers=[], seq_dims=[])
 
+        # With a chunked head the projection returns packed per-token scalars
+        # for `sequences_rolled` instead of logits; see chunked_logprobs.py.
+        if self._chunked_head is not None:
+            head_ctx = self._chunked_head.request(
+                sequences_rolled,
+                temperature=temperature,
+                compute_entropy=compute_entropy,
+                entropy_requires_grad=entropy_requires_grad,
+                compute_top1_margin=compute_top1_margin,
+            )
+        else:
+            head_ctx = contextlib.nullcontext()
         defer_teardown = False
         try:
-            with cp_ctx:
+            with head_ctx, cp_ctx:
                 # NOTE (sumanthrh): Once we have position_ids, we don't need attention mask with flash attention.
                 if self.use_sample_packing and self.attn_implementation == "flash_attention_2":
                     # NOTE (sumanthrh): Don't use attention mask. position_ids is enough.
@@ -1040,18 +1110,27 @@ class HFModelWrapper(nn.Module):
             cp_size > 1 and torch.is_grad_enabled() and output["logits"].requires_grad
         )
 
-        logits_BSV = output["logits"]
-        logits_BSV.div_(temperature)
+        packed_entropy = packed_margin = packed_top1 = None
+        if self._chunked_head is not None:
+            # The projection already reduced each chunk against `sequences_rolled`
+            # (temperature included) in the same sharded/packed layout as logits.
+            logits_BSV = None
+            log_probs, packed_entropy, packed_margin, packed_top1 = unpack_per_token(
+                output["logits"], entropy_requires_grad=entropy_requires_grad
+            )
+        else:
+            logits_BSV = output["logits"]
+            logits_BSV.div_(temperature)
 
-        # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
-        # Under CP `logits_BSV` is sequence-sharded `[B, S/cp, V]` and
-        # `sequences_rolled` was co-sharded by the SAME zigzag balancer, so this
-        # per-token compute is token-for-token aligned on the local shard.
-        log_probs = logprobs_from_logits(
-            logits_BSV,
-            sequences_rolled,
-            inplace_backward=True,
-        )
+            # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
+            # Under CP `logits_BSV` is sequence-sharded `[B, S/cp, V]` and
+            # `sequences_rolled` was co-sharded by the SAME zigzag balancer, so this
+            # per-token compute is token-for-token aligned on the local shard.
+            log_probs = logprobs_from_logits(
+                logits_BSV,
+                sequences_rolled,
+                inplace_backward=True,
+            )
 
         # Stage 5 (FSDP2 CP) — THE correctness seam: unshard the per-token
         # `[B, S/cp]` logprobs back to natural-order `[B, S]` via the inverse of
@@ -1086,7 +1165,7 @@ class HFModelWrapper(nn.Module):
             # add padding back - postprocess logprobs to be compatible with original tensor
             batch_size, seqlen = attention_mask.shape
             # (1, nnz-1) -> (batch_size, seqlen). Pad token ID used by flash attention is 0.
-            log_probs = pad_input(
+            log_probs = flash_pad_input(
                 log_probs.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
             ).squeeze(-1)
 
@@ -1105,15 +1184,24 @@ class HFModelWrapper(nn.Module):
             # shard, `context_parallel_unshard` it to natural-order `[B, S]`, THEN
             # apply the full mask. This yields the SAME masked entropy as cp=1.
             if cp_size > 1:
-                entropy_BS = self.chunked_entropy_from_logits_fn(
-                    logits_BSV, requires_grad=entropy_requires_grad, attention_mask=None
-                )
+                if packed_entropy is not None:
+                    entropy_BS = packed_entropy
+                else:
+                    entropy_BS = self.chunked_entropy_from_logits_fn(
+                        logits_BSV, requires_grad=entropy_requires_grad, attention_mask=None
+                    )
                 # Stage 6: grad-safe unshard when entropy carries grad (entropy can
                 # appear in the loss via an entropy bonus); else the stock no_grad unshard.
                 if torch.is_grad_enabled() and entropy_BS.requires_grad:
                     entropy_BS = cp_unshard_grad_safe(self.cp_mesh, entropy_BS, 1)
                 else:
                     entropy_BS = context_parallel_unshard(self.cp_mesh, [entropy_BS], [1])[0]
+                if entropy_mask is not None:
+                    entropy_BS = entropy_BS * entropy_mask.to(entropy_BS.dtype)
+            elif packed_entropy is not None:
+                # Chunked entropy is unmasked; masking afterwards is the same
+                # value and gradient as masking inside the entropy kernel.
+                entropy_BS = packed_entropy
                 if entropy_mask is not None:
                     entropy_BS = entropy_BS * entropy_mask.to(entropy_BS.dtype)
             else:
@@ -1127,11 +1215,31 @@ class HFModelWrapper(nn.Module):
                     entropy_BS, gather_dim=dim, unpad_dim=dim, padding_size=pad_size
                 )  # shape can be (1, nnz) - with packing or (B,S) - without packing
             if self.use_sample_packing:
-                entropy_BS = pad_input(
+                entropy_BS = flash_pad_input(
                     entropy_BS.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
                 ).squeeze(-1)  # (1, nnz) -> (B, S)
 
             output["entropy"] = entropy_BS
+
+        if compute_top1_margin:
+            # Same no-grad layout restoration as entropy: CP unshard, Ulysses gather,
+            # and packing pad. Padding positions are sliced away by the caller's
+            # action slice, so no mask is applied here.
+            if packed_margin is not None:
+                margin_BS, top1_BS = packed_margin, packed_top1
+            else:
+                margin_BS, top1_BS = top1_margin_from_logits(logits_BSV)
+            for key, tensor in (("top1_margin", margin_BS), ("top1_token", top1_BS)):
+                if cp_size > 1:
+                    tensor = context_parallel_unshard(self.cp_mesh, [tensor], [1])[0]
+                if self.sequence_parallel_size > 1:
+                    dim = tensor.ndim - 1
+                    tensor = gather_outputs_and_unpad(tensor, gather_dim=dim, unpad_dim=dim, padding_size=pad_size)
+                if self.use_sample_packing:
+                    tensor = flash_pad_input(
+                        tensor.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
+                    ).squeeze(-1)
+                output[key] = tensor
 
         # Stage 4 (FSDP2 CP): strip the right-pad added for the 2*cp divisibility
         # (G4) so the per-token tensors return to the original [B, S] length and
@@ -1141,8 +1249,9 @@ class HFModelWrapper(nn.Module):
         # ⇒ cp_pad_size==0, this block is a no-op (G1).
         if cp_size > 1 and cp_pad_size > 0:
             log_probs = log_probs[:, : log_probs.size(1) - cp_pad_size]
-            if compute_entropy:
-                output["entropy"] = output["entropy"][:, : output["entropy"].size(1) - cp_pad_size]
+            for key in _PER_TOKEN_OUTPUT_KEYS:
+                if key in output:
+                    output[key] = output[key][:, : output[key].size(1) - cp_pad_size]
 
         # Stage 5b (FSDP2 CP): if we LEFT-rolled the inputs to right-align a
         # left-padded batch (cp_left_shifts set above), INVERT the roll now so
@@ -1159,8 +1268,9 @@ class HFModelWrapper(nn.Module):
             arange_S = torch.arange(S, device=log_probs.device).unsqueeze(0)
             inv_idx = (arange_S - cp_left_shifts.unsqueeze(1)) % S
             log_probs = torch.gather(log_probs, 1, inv_idx)
-            if compute_entropy:
-                output["entropy"] = torch.gather(output["entropy"], 1, inv_idx)
+            for key in _PER_TOKEN_OUTPUT_KEYS:
+                if key in output:
+                    output[key] = torch.gather(output[key], 1, inv_idx)
 
         if isinstance(num_actions, list):
             if len(num_actions) == 1:
@@ -1365,7 +1475,10 @@ class HFModelWrapper(nn.Module):
 
         return per_layer_targets, replay_mask
 
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={"use_reentrant": False}):
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        gradient_checkpointing_kwargs = dict(gradient_checkpointing_kwargs or {"use_reentrant": False})
+        if self.moe_grouped_gemm and not gradient_checkpointing_kwargs.get("use_reentrant", True):
+            gradient_checkpointing_kwargs["context_fn"] = moe_recompute_context_fn
         self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
 
     def gradient_checkpointing_disable(self):
@@ -1443,10 +1556,12 @@ def _get_critic_model(
                 with torch.no_grad():
                     # remove padding. `unpad_input` expects 3 dimensional tensor
                     # version-agnostic unpack (flash_attn 2.6 -> 4-tuple, 2.7+ -> 5-tuple)
-                    input_ids_fwd, nnz_indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask=attention_mask)
+                    input_ids_fwd, nnz_indices, *_ = flash_unpad_input(
+                        input_ids.unsqueeze(-1), attention_mask=attention_mask
+                    )
                     # (nnz, 1) -> (1, nnz)
                     input_ids_fwd = input_ids_fwd.transpose(0, 1)
-                    position_ids_fwd, *_ = unpad_input(position_ids.unsqueeze(-1), attention_mask=attention_mask)
+                    position_ids_fwd, *_ = flash_unpad_input(position_ids.unsqueeze(-1), attention_mask=attention_mask)
                     # (nnz, 1) -> (1, nnz)
                     position_ids_fwd = position_ids_fwd.transpose(0, 1)
                     # don't use attention mask with FA2
@@ -1582,7 +1697,9 @@ def _get_critic_model(
                 # add padding back - postprocess logits to be compatible with original tensors
                 batch_size, seqlen = attention_mask.shape
                 # (1, nnz, 1) -> (nnz, 1) -> (batch_size, seqlen, 1)
-                values_BSH = pad_input(values_BSH.squeeze(0), indices=nnz_indices, batch=batch_size, seqlen=seqlen)
+                values_BSH = flash_pad_input(
+                    values_BSH.squeeze(0), indices=nnz_indices, batch=batch_size, seqlen=seqlen
+                )
 
             # Stage 4: strip the CP right-pad so values return to [B, S] before the
             # :-1 trim and action slice land on the real response tokens (no-op cp=1).

@@ -13,16 +13,378 @@ Usage::
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import base64
+import binascii
+import copy
+import fsspec
+import json
+import math
+import os
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Protocol
 
 import yaml
 
 from cloud.iris.paths import resolve_paths_in_dict
+from marinskyrl.resource_locator import join_resource_path, model_source_for_path
 
 # Directory containing the bundled example RL config YAML files.
 SKYRL_CONFIG_DIR = Path(__file__).parent / "configs"
+RL_CONFIG_TASK_DIR = "/tmp/marin-rl-configs"
+RL_CONFIG_PAYLOAD_ENV = "MARIN_RL_CONFIG_B64"
+
+
+class RLEntrypoint(StrEnum):
+    """Execution modes supported by Iris RL configurations."""
+
+    FULLY_ASYNC = "fully_async"
+    GENERATE = "generate"
+    MINI_SWE = "mini_swe"
+    STANDARD = "standard"
+    TERMINAL_BENCH = "terminal_bench"
+    TERMINAL_BENCH_GENERATE = "terminal_bench_generate"
+    TERMINAL_BENCH_TEACHER_LOGITS = "terminal_bench_teacher_logits"
+
+
+RL_ENTRYPOINT_MODULES = {
+    RLEntrypoint.FULLY_ASYNC: "skyrl_train.entrypoints.fully_async",
+    RLEntrypoint.GENERATE: "skyrl_train.entrypoints.main_generate",
+    RLEntrypoint.MINI_SWE: "skyrl_train.entrypoints.mini_swe",
+    RLEntrypoint.STANDARD: "skyrl_train.entrypoints.main_base",
+    RLEntrypoint.TERMINAL_BENCH: "skyrl_train.entrypoints.terminal_bench",
+    RLEntrypoint.TERMINAL_BENCH_GENERATE: "skyrl_train.entrypoints.terminal_bench_generate",
+    RLEntrypoint.TERMINAL_BENCH_TEACHER_LOGITS: "skyrl_train.entrypoints.terminal_bench_teacher_logits",
+}
+
+
+def resolve_rl_entrypoint(value: str | None, *, config_path: Path) -> str:
+    """Resolve one supported RL execution mode to its packaged module."""
+    name = RLEntrypoint.STANDARD if value is None else value
+    try:
+        entrypoint = RLEntrypoint(name)
+    except ValueError as error:
+        choices = ", ".join(item.value for item in RLEntrypoint)
+        raise ValueError(
+            f"{config_path}: entrypoint must be a registered name ({choices}); got {name!r}. "
+            "Python module paths are not accepted in RL configs."
+        ) from error
+
+    return RL_ENTRYPOINT_MODULES[entrypoint]
+
+
+class HPCGeometry(Protocol):
+    """Hardware geometry required while translating a launch configuration."""
+
+    gpus_per_node: int
+
+
+_REQUIRED_CONTEXT_BUDGET_FIELDS = frozenset(
+    {
+        "request_window_tokens",
+        "max_new_tokens_per_turn",
+        "max_turns",
+    }
+)
+_CONTEXT_BUDGET_FRACTION_FIELDS = frozenset({"generated_budget_fraction", "overlong_cache_fraction"})
+_CONTEXT_BUDGET_FIELDS = _REQUIRED_CONTEXT_BUDGET_FIELDS | _CONTEXT_BUDGET_FRACTION_FIELDS
+_DEFAULT_GENERATED_BUDGET_FRACTION = 0.5
+_DEFAULT_OVERLONG_CACHE_FRACTION = 0.25
+
+_DERIVED_CONTEXT_FIELDS = (
+    ("trainer", "max_prompt_length"),
+    ("generator", "max_input_length"),
+    ("generator", "max_turns"),
+    ("generator", "sampling_params", "max_generate_length"),
+    ("generator", "engine_init_kwargs", "max_model_len"),
+    ("terminal_bench", "harbor", "max_episodes"),
+    ("terminal_bench", "harbor", "max_turns"),
+    ("terminal_bench", "model_info", "max_input_tokens"),
+    ("terminal_bench", "model_info", "max_output_tokens"),
+    ("generator", "trajectory_reward_shaping", "overlong", "l_max"),
+    ("generator", "trajectory_reward_shaping", "overlong", "l_cache"),
+)
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    """One coherent token budget for an Iris RL rollout request."""
+
+    request_window_tokens: int
+    max_new_tokens_per_turn: int
+    max_turns: int
+    generated_budget_fraction: float = _DEFAULT_GENERATED_BUDGET_FRACTION
+    overlong_cache_fraction: float = _DEFAULT_OVERLONG_CACHE_FRACTION
+
+    @property
+    def max_input_tokens(self) -> int:
+        """Return the input allowance after reserving one complete response."""
+        return self.request_window_tokens - self.max_new_tokens_per_turn
+
+    @property
+    def opencode_limit_output(self) -> int:
+        """OpenCode's per-request output cap (mirrors harbor ``_resolve_model_limit``)."""
+        return min(self.max_new_tokens_per_turn, max(1, self.max_input_tokens - 1))
+
+    @property
+    def opencode_limit_context(self) -> int:
+        """OpenCode's sliding-window / compaction-trigger size.
+
+        Mirrors the formula in ``harbor/src/harbor/agents/installed/opencode.py``
+        ``_resolve_model_limit``: ``context = window - output - margin`` where
+        ``margin`` reserves a small safety band so ``context + output`` stays
+        strictly below the engine's prompt cap.
+        """
+        output = self.opencode_limit_output
+        margin = min(1024, max(0, self.max_input_tokens - output - 1))
+        return max(1, self.max_input_tokens - output - margin)
+
+    @property
+    def generated_tokens_per_trajectory(self) -> int:
+        """Return the generated-token allowance used by trajectory-level shaping."""
+        if self.max_turns == 1:
+            return self.max_new_tokens_per_turn
+        return max(1, int(self.request_window_tokens * self.generated_budget_fraction))
+
+    @property
+    def overlong_cache_tokens(self) -> int:
+        """Return the soft-overlong transition width."""
+        return int(self.generated_tokens_per_trajectory * self.overlong_cache_fraction)
+
+    def as_dict(self) -> Dict[str, int | float]:
+        """Return the persisted representation, including derived client input."""
+        return {
+            "request_window_tokens": self.request_window_tokens,
+            "max_new_tokens_per_turn": self.max_new_tokens_per_turn,
+            "max_turns": self.max_turns,
+            "generated_budget_fraction": self.generated_budget_fraction,
+            "overlong_cache_fraction": self.overlong_cache_fraction,
+            "max_input_tokens": self.max_input_tokens,
+            "generated_tokens_per_trajectory": self.generated_tokens_per_trajectory,
+            "overlong_cache_tokens": self.overlong_cache_tokens,
+            "opencode_limit_context": self.opencode_limit_context,
+            "opencode_limit_output": self.opencode_limit_output,
+        }
+
+
+def _path_is_declared(mapping: Dict[str, Any], path: tuple[str, ...]) -> bool:
+    value: Any = mapping
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return False
+        value = value[key]
+    return True
+
+
+def _validate_no_derived_context_fields(raw: Dict[str, Any], config_path: Path) -> None:
+    declared = [".".join(path) for path in _DERIVED_CONTEXT_FIELDS if _path_is_declared(raw, path)]
+    if declared:
+        raise ValueError(
+            f"{config_path} declares derived context fields: {', '.join(declared)}. "
+            "Declare only context_budget instead."
+        )
+
+
+def _remove_derived_context_fields(raw: Dict[str, Any]) -> None:
+    for path in _DERIVED_CONTEXT_FIELDS:
+        parent: Any = raw
+        for key in path[:-1]:
+            if not isinstance(parent, dict) or key not in parent:
+                parent = None
+                break
+            parent = parent[key]
+        if isinstance(parent, dict):
+            parent.pop(path[-1], None)
+
+
+def _require_positive_integer(value: Any, field_name: str, config_path: Path) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{config_path}: context_budget.{field_name} must be a positive integer, got {value!r}")
+    return value
+
+
+def _require_fraction(value: Any, field_name: str, config_path: Path, *, allow_zero: bool) -> float:
+    valid = False
+    if not isinstance(value, bool) and isinstance(value, (int, float)):
+        lower_bound_satisfied = value >= 0 if allow_zero else value > 0
+        valid = math.isfinite(value) and lower_bound_satisfied and value <= 1
+    if not valid:
+        interval = "[0, 1]" if allow_zero else "(0, 1]"
+        raise ValueError(f"{config_path}: context_budget.{field_name} must be in {interval}, got {value!r}")
+    return float(value)
+
+
+def resolve_context_budget(raw: Dict[str, Any], config_path: Path) -> ContextBudget:
+    """Validate and resolve the single public context budget declaration.
+
+    The request window includes the prompt and the current response. The derived
+    client input limit therefore reserves the complete per-turn output allowance.
+    """
+    _validate_no_derived_context_fields(raw, config_path)
+    config = raw.get("context_budget")
+    if not isinstance(config, dict):
+        raise ValueError(f"{config_path}: context_budget must be a mapping")
+
+    unknown = set(config) - _CONTEXT_BUDGET_FIELDS
+    if unknown:
+        raise ValueError(f"{config_path}: unknown context_budget fields: {', '.join(sorted(unknown))}")
+    missing = _REQUIRED_CONTEXT_BUDGET_FIELDS - set(config)
+    if missing:
+        raise ValueError(f"{config_path}: missing context_budget fields: {', '.join(sorted(missing))}")
+
+    budget = ContextBudget(
+        request_window_tokens=_require_positive_integer(
+            config["request_window_tokens"], "request_window_tokens", config_path
+        ),
+        max_new_tokens_per_turn=_require_positive_integer(
+            config["max_new_tokens_per_turn"], "max_new_tokens_per_turn", config_path
+        ),
+        max_turns=_require_positive_integer(config["max_turns"], "max_turns", config_path),
+        generated_budget_fraction=_require_fraction(
+            config.get("generated_budget_fraction", _DEFAULT_GENERATED_BUDGET_FRACTION),
+            "generated_budget_fraction",
+            config_path,
+            allow_zero=False,
+        ),
+        overlong_cache_fraction=_require_fraction(
+            config.get("overlong_cache_fraction", _DEFAULT_OVERLONG_CACHE_FRACTION),
+            "overlong_cache_fraction",
+            config_path,
+            allow_zero=True,
+        ),
+    )
+    if budget.max_input_tokens <= 0:
+        raise ValueError(
+            f"{config_path}: request_window_tokens ({budget.request_window_tokens}) must exceed "
+            f"max_new_tokens_per_turn ({budget.max_new_tokens_per_turn})"
+        )
+    return budget
+
+
+def _materialize_context_budget(
+    raw: Dict[str, Any], budget: ContextBudget
+) -> tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Return SkyRL sections populated from one resolved context budget."""
+    trainer = copy.deepcopy(raw.get("trainer", {}))
+    generator = copy.deepcopy(raw.get("generator", {}))
+    terminal_bench = copy.deepcopy(raw.get("terminal_bench"))
+    materialized_raw = copy.deepcopy(raw)
+
+    trainer["max_prompt_length"] = budget.max_input_tokens
+    generator["max_input_length"] = budget.max_input_tokens
+    generator["max_turns"] = budget.max_turns
+    generator.setdefault("sampling_params", {})["max_generate_length"] = budget.max_new_tokens_per_turn
+    generator.setdefault("engine_init_kwargs", {})["max_model_len"] = budget.request_window_tokens
+    generator.setdefault("trajectory_reward_shaping", {})["overlong"] = {
+        "l_max": budget.generated_tokens_per_trajectory,
+        "l_cache": budget.overlong_cache_tokens,
+    }
+
+    if terminal_bench is not None:
+        terminal_bench.setdefault("harbor", {})["max_turns"] = budget.max_turns
+        model_info = terminal_bench.get("model_info") or {}
+        model_info["max_input_tokens"] = budget.max_input_tokens
+        model_info["max_output_tokens"] = budget.max_new_tokens_per_turn
+        terminal_bench["model_info"] = model_info
+
+    materialized_raw["context_budget"] = budget.as_dict()
+    materialized_raw["trainer"] = copy.deepcopy(trainer)
+    materialized_raw["generator"] = copy.deepcopy(generator)
+    if terminal_bench is not None:
+        materialized_raw["terminal_bench"] = copy.deepcopy(terminal_bench)
+    return trainer, generator, terminal_bench, materialized_raw
+
+
+def _override_key(override: str) -> str:
+    key, separator, _value = override.lstrip("+").partition("=")
+    if not separator:
+        raise ValueError(f"Invalid SkyRL override {override!r}; expected KEY=VALUE")
+    return key
+
+
+def apply_context_budget_overrides(
+    parsed: "ParsedRLConfig", overrides: List[str]
+) -> tuple["ParsedRLConfig", List[str]]:
+    """Resolve high-level context overrides and reject derived-field overrides.
+
+    `--skyrl_override` is the existing user-facing launcher mechanism. Context
+    values are consumed here instead of reaching Hydra, whose schema deliberately
+    has no `context_budget` node.
+    """
+    values = parsed.context_budget.as_dict()
+    passthrough: List[str] = []
+    derived_names = {".".join(path) for path in _DERIVED_CONTEXT_FIELDS}
+
+    for override in overrides:
+        key = _override_key(override)
+        if key.startswith("context_budget."):
+            field_name = key.removeprefix("context_budget.")
+            if field_name not in _CONTEXT_BUDGET_FIELDS:
+                raise ValueError(f"Unsupported context budget override {key!r}")
+            raw_value = override.partition("=")[2]
+            try:
+                if field_name in _CONTEXT_BUDGET_FRACTION_FIELDS:
+                    values[field_name] = float(raw_value)
+                else:
+                    values[field_name] = int(raw_value)
+            except ValueError as error:
+                expected_type = "a number" if field_name in _CONTEXT_BUDGET_FRACTION_FIELDS else "an integer"
+                raise ValueError(f"{key} must be {expected_type}, got {raw_value!r}") from error
+            continue
+        if key in derived_names:
+            raise ValueError(
+                f"{key} is derived from context_budget and cannot be overridden directly. "
+                "Override context_budget.request_window_tokens, context_budget.max_new_tokens_per_turn, "
+                "context_budget.max_turns, context_budget.generated_budget_fraction, or "
+                "context_budget.overlong_cache_fraction instead."
+            )
+        passthrough.append(override)
+
+    raw = copy.deepcopy(parsed.raw)
+    raw["trainer"] = copy.deepcopy(parsed.trainer)
+    raw["generator"] = copy.deepcopy(parsed.generator)
+    if parsed.terminal_bench is not None:
+        raw["terminal_bench"] = copy.deepcopy(parsed.terminal_bench)
+    _remove_derived_context_fields(raw)
+    raw["context_budget"] = {field: values[field] for field in _CONTEXT_BUDGET_FIELDS}
+    budget = resolve_context_budget(raw, parsed.config_path)
+    trainer, generator, terminal_bench, materialized_raw = _materialize_context_budget(raw, budget)
+    return (
+        replace(
+            parsed,
+            raw=materialized_raw,
+            trainer=trainer,
+            generator=generator,
+            terminal_bench=terminal_bench,
+            context_budget=budget,
+            tensor_parallel_size=generator.get("inference_engine_tensor_parallel_size", 1),
+        ),
+        passthrough,
+    )
+
+
+def write_resolved_context_budget(budget: ContextBudget, destination: Path | str, config_path: Path) -> Path | str:
+    """Persist the resolved context contract for an Iris RL launch."""
+    payload = (
+        json.dumps(
+            {
+                "config_path": str(config_path),
+                "context_budget": budget.as_dict(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    if isinstance(destination, Path):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(payload)
+        return destination
+    with fsspec.open(destination, "w") as artifact:
+        artifact.write(payload)
+    return destination
+
 
 # =============================================================================
 # SkyRL Internal Engine Kwargs - DO NOT SET IN YAML CONFIGS
@@ -113,6 +475,7 @@ class ParsedRLConfig:
 
     config_path: Path
     raw: Dict[str, Any]
+    context_budget: ContextBudget
     entrypoint: str
     config_groups: Dict[str, str] = field(default_factory=dict)
     trainer: Dict[str, Any] = field(default_factory=dict)
@@ -126,6 +489,15 @@ class ParsedRLConfig:
     # RLVR: an HF id / .parquet is passed through to PromptDataset, NOT task-extracted).
     # Launcher-only (popped out of the `data` section so it never reaches Hydra).
     data_kind: str = "tasks"
+
+
+@dataclass(frozen=True)
+class ParsedCheckpointExportConfig:
+    """Policy configuration needed to reconstruct a checkpoint for conversion."""
+
+    config_path: Path
+    config_groups: Dict[str, str]
+    trainer: Dict[str, Any]
 
 
 def validate_tp_divides_heads(
@@ -182,6 +554,27 @@ def resolve_rl_config_path(raw_path: str) -> Path:
     )
 
 
+def materialize_rl_config(
+    config_path: str,
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Materialize a launcher-forwarded RL config inside the task container."""
+    environment = os.environ if environment is None else environment
+    payload = environment.get(RL_CONFIG_PAYLOAD_ENV)
+    if payload is None:
+        return config_path
+
+    try:
+        contents = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError(f"Invalid base64 in {RL_CONFIG_PAYLOAD_ENV}") from error
+
+    destination = Path(config_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(contents)
+    return str(destination)
+
+
 def parse_rl_config(
     config_path: str,
     model_override: Optional[str] = None,
@@ -197,13 +590,13 @@ def parse_rl_config(
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
 
-    entrypoint = raw.get("entrypoint", "skyrl_train.entrypoints.main_base")
+    context_budget = resolve_context_budget(raw, path)
+
+    entrypoint = resolve_rl_entrypoint(raw.get("entrypoint"), config_path=path)
     config_groups = raw.get("config_groups", {})
-    trainer = raw.get("trainer", {})
-    generator = raw.get("generator", {})
+    trainer, generator, terminal_bench, materialized_raw = _materialize_context_budget(raw, context_budget)
     data = dict(raw.get("data", {}))
     environment = raw.get("environment", {})
-    terminal_bench = raw.get("terminal_bench")
     teacher = raw.get("teacher")
 
     # data.kind is a launcher-only routing key (parquet vs. terminal_bench tasks); pop it
@@ -231,7 +624,8 @@ def parse_rl_config(
 
     return ParsedRLConfig(
         config_path=path,
-        raw=raw,
+        raw=materialized_raw,
+        context_budget=context_budget,
         entrypoint=entrypoint,
         config_groups=config_groups,
         trainer=trainer,
@@ -242,6 +636,24 @@ def parse_rl_config(
         teacher=teacher,
         tensor_parallel_size=tensor_parallel_size,
         data_kind=data_kind,
+    )
+
+
+def parse_checkpoint_export_config(
+    config_path: str,
+    model_override: str,
+) -> ParsedCheckpointExportConfig:
+    """Read policy configuration without validating or materializing rollout settings."""
+    path = resolve_rl_config_path(config_path)
+    with path.open() as source:
+        raw = yaml.safe_load(source) or {}
+
+    trainer = resolve_paths_in_dict(copy.deepcopy(raw.get("trainer", {})), skip_keys={"policy.model.path"})
+    trainer.setdefault("policy", {}).setdefault("model", {})["path"] = model_override
+    return ParsedCheckpointExportConfig(
+        config_path=path,
+        config_groups=dict(raw.get("config_groups", {})),
+        trainer=trainer,
     )
 
 
@@ -317,7 +729,7 @@ def _quote_for_hydra(s: str) -> str:
     return f"'{escaped}'"
 
 
-def _format_hydra_arg(key: str, value: Any, prefix: str = "") -> str:
+def format_hydra_arg(key: str, value: Any, prefix: str = "") -> str:
     """Format a single Hydra CLI argument.
 
     ``prefix`` selects the Hydra override mode: "" overrides an existing key, "+"
@@ -355,10 +767,87 @@ def _format_hydra_arg(key: str, value: Any, prefix: str = "") -> str:
         return f"{prefix}{key}={value}"
 
 
+_OPTIONAL_HYDRA_PATTERNS = {
+    ".engine_init_kwargs",
+    ".hf_hub_",
+    ".enable_db_registration",
+    ".optimizer_kwargs",
+    ".rope_scaling",
+    ".wrap_policy",
+    ".transformer_config_kwargs",
+}
+
+
+def _apply_policy_model_source(trainer: Dict[str, Any], exp_args: Dict[str, Any]) -> str | None:
+    """Apply the task-visible policy path and its replayable source identity."""
+    model_path = exp_args.get("model_path")
+    if not model_path:
+        return None
+    policy_model = trainer.setdefault("policy", {}).setdefault("model", {})
+    policy_model["path"] = model_path
+    model_source = model_source_for_path(
+        model_path,
+        exp_args.get("model_source_uri"),
+        exp_args.get("model_source_identity"),
+    )
+    if model_source:
+        policy_model["source_uri"] = model_source.uri
+        policy_model["source_identity"] = model_source.identity
+    return model_path
+
+
+def _role_gpus_per_node(
+    placement: Dict[str, Any],
+    key: str,
+    launch_gpus_per_node: int,
+    *,
+    preserve_smaller_value: bool,
+) -> int:
+    configured = placement.get(key)
+    if preserve_smaller_value and configured is not None and int(configured) <= launch_gpus_per_node:
+        return int(configured)
+    return launch_gpus_per_node
+
+
+def build_checkpoint_export_hydra_args(
+    parsed: ParsedCheckpointExportConfig,
+    exp_args: Dict[str, Any],
+    hpc: HPCGeometry,
+) -> List[str]:
+    """Build policy-only Hydra arguments for the standalone checkpoint converter."""
+    args = [f"+{group_name}={config_name}" for group_name, config_name in parsed.config_groups.items()]
+    trainer = copy.deepcopy(parsed.trainer)
+    placement = trainer.setdefault("placement", {})
+    num_nodes = int(exp_args.get("num_nodes", 1))
+    gpus_per_node = int(exp_args.get("gpus_per_node", hpc.gpus_per_node))
+    placement["policy_num_nodes"] = num_nodes
+    placement["policy_num_gpus_per_node"] = _role_gpus_per_node(
+        placement,
+        "policy_num_gpus_per_node",
+        gpus_per_node,
+        preserve_smaller_value=False,
+    )
+    _apply_policy_model_source(trainer, exp_args)
+
+    for key, value in _flatten_dict(trainer, "trainer").items():
+        prefix = "++" if any(pattern in key for pattern in _OPTIONAL_HYDRA_PATTERNS) else ""
+        args.append(format_hydra_arg(key, value, prefix=prefix))
+    return args
+
+
+def _apply_trajectory_retention_path(generator: Dict[str, Any], experiments_dir: str, job_name: str) -> None:
+    retention = dict(generator.get("trajectory_retention", {}))
+    configured_path = retention.get("output_path")
+    if not configured_path and experiments_dir and job_name:
+        retention["output_path"] = join_resource_path(experiments_dir, job_name, "trace_jobs", "training_trajectories")
+    if retention:
+        generator["trajectory_retention"] = retention
+
+
 def build_skyrl_hydra_args(
     parsed: ParsedRLConfig,
     exp_args: Dict[str, Any],
-    hpc: Any,
+    hpc: HPCGeometry,
 ) -> List[str]:
     """Convert a parsed config + exp_args into Hydra CLI argument strings.
 
@@ -385,15 +874,16 @@ def build_skyrl_hydra_args(
     if not trainer.get("run_name") and job_name:
         trainer["run_name"] = job_name
     if not trainer.get("export_path") and experiments_dir and job_name:
-        trainer["export_path"] = f"{experiments_dir}/{job_name}/exports"
+        trainer["export_path"] = join_resource_path(experiments_dir, job_name, "exports")
         print(f"Auto-set trainer.export_path: {trainer['export_path']}")
     if not trainer.get("ckpt_path") and experiments_dir and job_name:
-        trainer["ckpt_path"] = f"{experiments_dir}/{job_name}/checkpoints"
+        trainer["ckpt_path"] = join_resource_path(experiments_dir, job_name, "checkpoints")
         print(f"Auto-set trainer.ckpt_path: {trainer['ckpt_path']}")
+    _apply_trajectory_retention_path(generator, experiments_dir, job_name)
 
     # Derive placement from num_nodes.
     num_nodes = int(exp_args.get("num_nodes", 1))
-    gpus_per_node = int(exp_args.get("gpus_per_node", getattr(hpc, "gpus_per_node", 4)))
+    gpus_per_node = int(exp_args.get("gpus_per_node", hpc.gpus_per_node))
     placement = dict(trainer.get("placement", {}))
 
     policy_num_nodes = exp_args.get("policy_num_nodes")
@@ -408,13 +898,12 @@ def build_skyrl_hydra_args(
     # (reserved whole) node than the node physically has — spreading a fixed
     # policy-rank count over MORE nodes.
     def _resolve_gpus_per_node(key: str) -> int:
-        yaml_val = placement.get(key)
-        if yaml_val is None:
-            return gpus_per_node
-        if exp_args.get("gpus_per_node") and int(yaml_val) > gpus_per_node:
-            # A YAML value LARGER than the node has is a mis-size; clamp to CLI.
-            return gpus_per_node
-        return int(yaml_val)
+        return _role_gpus_per_node(
+            placement,
+            key,
+            gpus_per_node,
+            preserve_smaller_value=True,
+        )
 
     placement["policy_num_gpus_per_node"] = _resolve_gpus_per_node("policy_num_gpus_per_node")
     placement["ref_num_gpus_per_node"] = _resolve_gpus_per_node("ref_num_gpus_per_node")
@@ -449,10 +938,8 @@ def build_skyrl_hydra_args(
         data["val_data"] = val_data
 
     # Model path and served_model_name for Harbor/LiteLLM compatibility.
-    model_path = exp_args.get("model_path")
+    model_path = _apply_policy_model_source(trainer, exp_args)
     if model_path:
-        trainer.setdefault("policy", {}).setdefault("model", {})["path"] = model_path
-
         # served_model_name: strip the org prefix from "org/model" HF IDs, since
         # Harbor/LiteLLM requires model names with exactly one '/'.
         served_model_name = model_path.split("/")[-1] if "/" in model_path else model_path
@@ -495,16 +982,6 @@ def build_skyrl_hydra_args(
     # that node became a strict struct, so a plain "" override of a new subkey fails
     # ("Could not override ...transformer_config_kwargs.gradient_accumulation_fusion");
     # ++ force-adds the leaf while leaving the preset's other subkeys (recompute_*) intact.
-    optional_patterns = {
-        ".engine_init_kwargs",
-        ".hf_hub_",
-        ".enable_db_registration",
-        ".optimizer_kwargs",
-        ".rope_scaling",
-        ".wrap_policy",
-        ".transformer_config_kwargs",
-    }
-
     for section, values in [
         ("trainer", trainer),
         ("generator", generator),
@@ -512,16 +989,16 @@ def build_skyrl_hydra_args(
         ("environment", environment),
     ]:
         for key, val in _flatten_dict(values, section).items():
-            prefix = "++" if any(pattern in key for pattern in optional_patterns) else ""
-            args.append(_format_hydra_arg(key, val, prefix=prefix))
+            prefix = "++" if any(pattern in key for pattern in _OPTIONAL_HYDRA_PATTERNS) else ""
+            args.append(format_hydra_arg(key, val, prefix=prefix))
 
     # Teacher config (on-policy distillation) — all keys use ++ since the teacher
     # section doesn't exist in SkyRL's base Hydra config.
     if parsed.teacher:
         for key, val in _flatten_dict(parsed.teacher, "teacher").items():
-            args.append(_format_hydra_arg(key, val, prefix="++"))
+            args.append(format_hydra_arg(key, val, prefix="++"))
 
-    # Terminal bench with + prefix (new keys added by the config group).
+    # Terminal-Bench experiments may override packaged group keys or add new ones.
     if parsed.terminal_bench:
         terminal_bench = dict(parsed.terminal_bench)
 
@@ -530,7 +1007,7 @@ def build_skyrl_hydra_args(
             terminal_bench["trials_dir"] = f"{experiments_dir}/{job_name}/trace_jobs"
 
         for key, val in _flatten_dict(terminal_bench).items():
-            args.append(_format_hydra_arg(f"terminal_bench_config.{key}", val, prefix="+"))
+            args.append(format_hydra_arg(f"terminal_bench_config.{key}", val, prefix="++"))
 
     return args
 

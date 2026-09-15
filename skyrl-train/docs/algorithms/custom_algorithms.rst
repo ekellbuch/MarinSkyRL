@@ -16,11 +16,15 @@ You can register custom advantage estimators using either a decorator or the reg
 
 .. code-block:: python
 
-   from skyrl_train.utils.ppo_utils import register_advantage_estimator, AdvantageEstimatorRegistry
+   from skyrl_train.utils.algorithm_registry import (
+       AdvantageEstimatorRegistry,
+       NoGroupAdvantage,
+       register_advantage_estimator,
+   )
    import torch
 
    # Using the decorator
-   @register_advantage_estimator("simple_baseline")
+   @register_advantage_estimator("simple_baseline", group_contract=NoGroupAdvantage())
    def compute_simple_baseline_advantage(
         token_level_rewards: torch.Tensor, response_mask: torch.Tensor, index: np.ndarray, **kwargs
     ):
@@ -39,7 +43,9 @@ You can register custom advantage estimators using either a decorator or the reg
        # Implementation here
        pass
 
-   AdvantageEstimatorRegistry.register("direct_registration", another_estimator)
+   AdvantageEstimatorRegistry.register(
+       "direct_registration", another_estimator, group_contract=NoGroupAdvantage()
+   )
 
 Registering a Custom Policy Loss
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -48,14 +54,13 @@ Similarly, you can register custom policy loss functions:
 
 .. code-block:: python
 
-   from skyrl_train.utils.ppo_utils import register_policy_loss, PolicyLossRegistry
+   from skyrl_train.utils.algorithm_registry import register_policy_loss, PolicyLossRegistry
 
    @register_policy_loss("reinforce")
    def compute_reinforce_policy_loss(log_probs, old_log_probs, advantages, config, loss_mask=None, rollout_log_probs=None):
        # Your custom policy loss implementation (like REINFORCE)
        loss = (-log_probs * advantages).mean()
-       # return loss and clip ratio
-       return loss, 0.0
+       return loss, {}
 
 Registry Ray Distribution
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -65,7 +70,7 @@ The registry system handles Ray actor synchronization when Ray is initialized. F
 .. code-block:: python
 
    import ray
-   from skyrl_train.utils.ppo_utils import AdvantageEstimatorRegistry, sync_registries
+   from skyrl_train.utils.algorithm_registry import AdvantageEstimatorRegistry, sync_registries
 
    # Register a function on the main process
    def my_function(**kwargs):
@@ -97,11 +102,11 @@ We show the outline of creating a custom trainer below, and you can find a full 
 
     class CustomTrainer(RayPPOTrainer):
         @torch.no_grad()
-        def postprocess_generator_output(self, generator_output: GeneratorOutput, uids: List[str]) -> GeneratorOutput:
+        def postprocess_trajectory_batch(self, trajectory_batch: TrajectoryBatch, uids: List[str]) -> TrajectoryBatch:
             # apply custom reward penalties
             ...
             # use base class impl for metrics and per-token reward conversion
-            return super().postprocess_generator_output(generator_output, uids)
+            return super().postprocess_trajectory_batch(trajectory_batch, uids)
 
    class CustomExp(BasePPOExp):
        def get_trainer(self, *args, **kwargs):

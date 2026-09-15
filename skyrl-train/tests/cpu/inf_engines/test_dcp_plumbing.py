@@ -1,4 +1,4 @@
-"""Stage-1 plumbing/wiring test for vLLM Decode Context Parallel (DCP).
+"""Plumbing tests for vLLM engine configuration.
 
 Asserts the engine-launch wiring, with NO GPU and NO real Ray actor / vLLM init:
 
@@ -20,12 +20,13 @@ Asserts the engine-launch wiring, with NO GPU and NO real Ray actor / vLLM init:
 See notes/RL/skyrl/vllm_dcp_rollout_stages/stage1_vllm_support_and_plumbing_scope.md.
 
 Run:
-    uv run --isolated --extra dev pytest tests/cpu/inf_engines/test_dcp_plumbing.py -v
+    uv run --isolated --group dev --extra cpu pytest tests/cpu/inf_engines/test_dcp_plumbing.py -v
 """
 
 import sys
 import types
 import pytest
+from omegaconf import open_dict
 
 from skyrl_train.config.utils import get_default_config
 
@@ -33,8 +34,8 @@ DCP_KEY = "inference_engine_decode_context_parallel_size"
 
 
 # ===================================================================== seam / G5
-def test_from_config_forwards_dcp_value(monkeypatch):
-    """The config-assembly seam reads the DCP key and forwards it as a kwarg.
+def test_from_config_forwards_vllm_engine_options(monkeypatch):
+    """The config-assembly seam forwards typed vLLM engine options.
 
     Covers both entrypoints (BasePPOExp + TerminalBenchExp) since they share this seam.
     """
@@ -61,14 +62,21 @@ def test_from_config_forwards_dcp_value(monkeypatch):
     cfg = get_default_config()
     main_base.create_ray_wrapped_inference_engines_from_config(cfg, colocate_pg=None, tokenizer=None)
     assert captured["decode_context_parallel_size"] == 1
+    assert captured["vllm_attention_backend"] is None
+    assert "max_logprobs" not in captured
 
     # dcp=2 with admissible TP: forwarded as 2.
     captured.clear()
     cfg2 = get_default_config()
     cfg2.generator.inference_engine_tensor_parallel_size = 8
     cfg2.generator[DCP_KEY] = 2
+    cfg2.generator.vllm_attention_backend = "FLASH_ATTN"
+    with open_dict(cfg2.generator):
+        cfg2.generator.max_logprobs = 2
     main_base.create_ray_wrapped_inference_engines_from_config(cfg2, colocate_pg=None, tokenizer=None)
     assert captured["decode_context_parallel_size"] == 2
+    assert captured["vllm_attention_backend"] == "FLASH_ATTN"
+    assert captured["max_logprobs"] == 2
 
 
 # ===================================================== remote forwarding G1 + G4
@@ -103,7 +111,12 @@ class _RemoteCapture:
         return _Actor
 
 
-def _run_create(monkeypatch, dcp: int):
+def _run_create(
+    monkeypatch,
+    dcp: int,
+    attention_backend: str | None = None,
+    lm_head_compute_dtype: str | None = None,
+):
     """Drive the real create_ray_wrapped_inference_engines with Ray/PG/actor mocked.
 
     Uses tp=1, pp=1 (uni backend) so no real GPU/PG bundle reservation is needed; the
@@ -113,6 +126,7 @@ def _run_create(monkeypatch, dcp: int):
     import skyrl_train.inference_engines.ray_wrapped_inference_engine as rwie
 
     capture = _RemoteCapture()
+    monkeypatch.setattr(rwie, "_validate_installed_vllm_for_model", lambda _pretrain: None)
 
     # Stub the vllm import + actor classes (the module imports them lazily in the vllm branch).
     fake_vllm = types.ModuleType("vllm")
@@ -133,19 +147,21 @@ def _run_create(monkeypatch, dcp: int):
     monkeypatch.setattr(
         rwie, "placement_group", lambda bundles, strategy=None: ("PG", tuple(len(bundles) for _ in [0]))
     )
-    # Stub the helpers pulled from skyrl_train.utils inside the function body.
-    import skyrl_train.utils as skutils
-
-    monkeypatch.setattr(skutils, "ray_noset_visible_devices", lambda *a, **k: False, raising=False)
+    monkeypatch.setattr(rwie, "ray_noset_visible_devices", lambda *a, **k: False)
 
     fake_get_all = types.SimpleNamespace(remote=lambda: None)
-    monkeypatch.setattr(skutils, "get_all_env_variables", fake_get_all, raising=False)
-    monkeypatch.setattr(skutils, "get_ray_pg_ready_with_timeout", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(rwie, "get_all_env_variables", fake_get_all)
+    monkeypatch.setattr(rwie, "get_ray_pg_ready_with_timeout", lambda *a, **k: None)
 
     # ray.get(...) is called on get_all_env_variables.remote() — return a dummy env dict.
     monkeypatch.setattr(rwie.ray, "get", lambda *a, **k: {})
+    monkeypatch.setattr(rwie, "wait_for_inference_engine_startup", lambda *a, **k: None)
     # get_rendezvous_addr_port is only used for data_parallel_size>1; stub anyway.
-    monkeypatch.setattr(rwie, "get_rendezvous_addr_port", lambda pg, idx: ("127.0.0.1", 12345))
+    monkeypatch.setattr(
+        rwie,
+        "get_rendezvous_addr_port",
+        lambda pg, idx, excluded_ports=(): ("127.0.0.1", 12345),
+    )
     # The real RayWrappedInferenceEngine wrapper is trivial (it only stores the actor
     # handle as .inference_engine_actor), so use it unmocked — the readiness gate reads
     # engine.inference_engine_actor off it.
@@ -155,6 +171,7 @@ def _run_create(monkeypatch, dcp: int):
         tensor_parallel_size=1,
         model_dtype="bfloat16",
         pretrain="dummy/model",
+        lm_head_compute_dtype=lm_head_compute_dtype,
         seed=0,
         vllm_v1_disable_multiproc=True,
         enable_prefix_caching=False,
@@ -167,8 +184,15 @@ def _run_create(monkeypatch, dcp: int):
         inference_engine_enable_sleep=False,
         async_engine=False,
         backend="vllm",
+        vllm_attention_backend=attention_backend,
+        engine_init_timeout_seconds=60,
     )
     return capture
+
+
+def test_lm_head_compute_dtype_forwarded_to_vllm_actor(monkeypatch):
+    capture = _run_create(monkeypatch, dcp=1, lm_head_compute_dtype="float32")
+    assert capture.remote_calls[0]["lm_head_compute_dtype"] == "float32"
 
 
 def test_dcp_disabled_kwarg_absent_from_remote(monkeypatch):
@@ -210,3 +234,13 @@ def test_dcp_does_not_change_bundle_geometry(monkeypatch):
         }
 
     assert geometry(cap1) == geometry(cap2), "DCP must not change GPU/placement geometry (G4)"
+
+
+def test_attention_backend_absent_by_default(monkeypatch):
+    capture = _run_create(monkeypatch, dcp=1)
+    assert "attention_backend" not in capture.remote_calls[0]
+
+
+def test_attention_backend_forwarded_to_vllm_actor(monkeypatch):
+    capture = _run_create(monkeypatch, dcp=1, attention_backend="FLASH_ATTN")
+    assert capture.remote_calls[0]["attention_backend"] == "FLASH_ATTN"

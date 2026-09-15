@@ -1,7 +1,20 @@
 from skyrl_train.utils.torch_utils import chunked_cross_entropy_from_log_probs, chunked_entropy_from_logits
+from skyrl_train.utils.tensor_fingerprint import canonical_tensor_fingerprint
 import torch
 import pytest
 import math
+
+
+def test_canonical_tensor_fingerprint_is_chunk_and_source_dtype_invariant():
+    values = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+
+    whole = canonical_tensor_fingerprint(values, chunk_elements=values.numel())
+    chunked = canonical_tensor_fingerprint(values.to(torch.bfloat16).t().t(), chunk_elements=1)
+
+    assert whole == chunked
+    changed = values.clone()
+    changed[0, 0] = 1.5
+    assert canonical_tensor_fingerprint(changed)["sha256"] != whole["sha256"]
 
 
 def test_chunked_cross_entropy_from_logprobs():

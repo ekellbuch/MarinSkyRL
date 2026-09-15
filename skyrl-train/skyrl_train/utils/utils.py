@@ -17,13 +17,54 @@ from ray.util.placement_group import (
     placement_group_table,
 )
 
-from .constants import (
-    SKYRL_LD_LIBRARY_PATH_EXPORT,
-    SKYRL_RAY_PG_TIMEOUT_IN_S,
-    SKYRL_PYTHONPATH_EXPORT,
-    DEFAULT_WORKER_NCCL_TIMEOUT_IN_S,
-    get_worker_nccl_timeout_s,
+from skyrl_train.config.callbacks import has_explicit_callbacks, interval_hf_export_enabled
+from skyrl_train.config.query_bias import resolve_grug_query_bias_update
+from skyrl_train.callbacks.types import (
+    CHECKPOINT_CALLBACK_TYPE,
+    HF_MODEL_SAVE_CALLBACK_TYPE,
 )
+from skyrl_train.distributed_debug import apply_distributed_debug_mode
+from skyrl_train.trajectory_runners.trajectory_reward_shaping import parse_trajectory_reward_shaping_config
+from skyrl_train.trajectory_runners.trajectory_retention_config import parse_trajectory_retention_config
+from skyrl_train.numa_policy import NUMA_AFFINITY_ENV
+from skyrl_train.env_vars import EnvVarManager, EnvVarScope, write_process_manifest
+from skyrl_train.group_admission import resolve_group_advantage_invariant
+from skyrl_train.dynamic_sampling import resolve_dynamic_sampling_criteria
+from marinskyrl.runtime_options import GDNBackend, R3Transport
+
+from .constants import DEFAULT_RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS
+from .algorithm_registry import (
+    AdvantageEstimatorRegistry,
+    DPPODivergenceType,
+    PolicyLossRegistry,
+    PolicyLossType,
+    policy_loss_requires_rollout_logprobs,
+    sync_registries,
+)
+from .logging_utils import format_exception_text
+from .loss_reduction import SEQUENCE_MEAN_LOSS_REDUCTION, SUPPORTED_LOSS_REDUCTIONS
+from .nccl_environment import worker_nccl_environment
+from .placement_geometry import validate_colocated_engine_geometry
+
+MOE_ROUTER_REPLAY_STRATEGIES = frozenset({"fsdp", "fsdp2"})
+
+
+def moe_router_replay_requested(cfg: DictConfig) -> bool:
+    return bool(cfg.trainer.policy.fsdp_config.get("moe_router_replay", False))
+
+
+def moe_router_replay_enabled(cfg: DictConfig) -> bool:
+    return cfg.trainer.strategy in MOE_ROUTER_REPLAY_STRATEGIES and moe_router_replay_requested(cfg)
+
+
+def validate_moe_router_replay_config(cfg: DictConfig) -> None:
+    """Reject router replay on strategies that silently ignore captured routes."""
+    if moe_router_replay_requested(cfg) and cfg.trainer.strategy not in MOE_ROUTER_REPLAY_STRATEGIES:
+        supported = ", ".join(sorted(MOE_ROUTER_REPLAY_STRATEGIES))
+        raise ValueError(
+            f"trainer.policy.fsdp_config.moe_router_replay is not supported with "
+            f"trainer.strategy='{cfg.trainer.strategy}'; use one of: {supported}"
+        )
 
 
 def policy_strict_spread_eligible(cfg: DictConfig) -> bool:
@@ -228,24 +269,28 @@ class Timer:
         self.update_dict = update_dict
 
     def __enter__(self):
-        self.start_time = time.time()
+        self.start_time = time.monotonic()
         logger.opt(depth=1).info(f"Started: '{self.message}'")
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        logger.opt(depth=1).info(f"Finished: '{self.message}', time cost: {time.time() - self.start_time:.2f}s")
+    def _finish(self, exc_type) -> None:
+        duration = time.monotonic() - self.start_time
+        log = logger.opt(depth=2).info if exc_type is None else logger.opt(depth=2).error
+        outcome = "Finished" if exc_type is None else "Failed"
+        log(f"{outcome}: '{self.message}', time cost: {duration:.2f}s")
         if self.update_dict is not None:
-            self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + time.time() - self.start_time
+            self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + duration
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._finish(exc_type)
 
     async def __aenter__(self):
-        self.start_time = time.time()
+        self.start_time = time.monotonic()
         logger.opt(depth=1).info(f"Started: '{self.message}'")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        logger.opt(depth=1).info(f"Finished: '{self.message}', time cost: {time.time() - self.start_time:.2f}s")
-        if self.update_dict is not None:
-            self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + time.time() - self.start_time
+        self._finish(exc_type)
 
 
 def get_system_memory_metrics() -> dict:
@@ -489,16 +534,97 @@ def _validate_cp_cfg(cfg: DictConfig):
         )
 
 
+def validate_hf_export_config(cfg: DictConfig) -> None:
+    """Validate checkpoint and model-save callback interval alignment."""
+    callbacks = cfg.trainer.get("callbacks")
+    if has_explicit_callbacks(cfg):
+
+        def callback_intervals(callback_type: str) -> list[int]:
+            return [
+                int(callback.get("save_steps", -1))
+                for callback in callbacks
+                if callback.get("type") == callback_type and int(callback.get("save_steps", -1)) > 0
+            ]
+
+        checkpoint_intervals = callback_intervals(CHECKPOINT_CALLBACK_TYPE)
+        export_intervals = callback_intervals(HF_MODEL_SAVE_CALLBACK_TYPE)
+    else:
+        checkpoint_interval = int(cfg.trainer.get("ckpt_interval", -1))
+        checkpoint_intervals = [checkpoint_interval] if checkpoint_interval > 0 else []
+        export_intervals = [int(cfg.trainer.hf_save_interval)] if interval_hf_export_enabled(cfg) else []
+
+    for export_interval in export_intervals:
+        if not checkpoint_intervals or not any(
+            export_interval % checkpoint_interval == 0 for checkpoint_interval in checkpoint_intervals
+        ):
+            raise ValueError(
+                f"HF export interval {export_interval} must be a multiple of trainer.ckpt_interval "
+                f"or an explicit checkpoint callback interval; found {checkpoint_intervals or 'none'}"
+            )
+
+
 def validate_cfg(cfg: DictConfig):
-    # Validate generation config separately
+    resolve_dynamic_sampling_criteria(
+        cfg.trainer.algorithm.dynamic_sampling.informative_on,
+        float(cfg.trainer.algorithm.dynamic_sampling.min_reward_std),
+    )
+    if (
+        cfg.trainer.algorithm.policy_loss_type == PolicyLossType.GSPO
+        and cfg.trainer.algorithm.loss_reduction != SEQUENCE_MEAN_LOSS_REDUCTION
+    ):
+        raise ValueError(
+            f"GSPO requires trainer.algorithm.loss_reduction=sequence_mean; got {cfg.trainer.algorithm.loss_reduction}"
+        )
+    runtime_values = {
+        "trainer.distributed.placement_group_timeout_seconds": cfg.trainer.distributed.placement_group_timeout_seconds,
+        "trainer.distributed.worker_collective_timeout_seconds": cfg.trainer.distributed.worker_collective_timeout_seconds,
+        "trainer.policy.host_memory_monitor.interval_seconds": cfg.trainer.policy.host_memory_monitor.interval_seconds,
+        "trainer.model_load_retry.backoff_base_seconds": cfg.trainer.model_load_retry.backoff_base_seconds,
+        "trainer.model_load_retry.backoff_cap_seconds": cfg.trainer.model_load_retry.backoff_cap_seconds,
+        "trainer.progress.min_interval_seconds": cfg.trainer.progress.min_interval_seconds,
+        "trainer.progress.heartbeat_seconds": cfg.trainer.progress.heartbeat_seconds,
+        "trainer.progress.percent_step": cfg.trainer.progress.percent_step,
+        "trainer.progress.count_step": cfg.trainer.progress.count_step,
+        "generator.r3_dispatch_put_timeout_seconds": cfg.generator.r3_dispatch_put_timeout_seconds,
+        "generator.coordinator_executor_workers": cfg.generator.coordinator_executor_workers,
+        "trainer.policy.fsdp_config.expert_loader_chunk_rows": cfg.trainer.policy.fsdp_config.expert_loader_chunk_rows,
+    }
+    for path, value in runtime_values.items():
+        if value <= 0:
+            raise ValueError(f"{path} must be positive; got {value}")
+    if cfg.trainer.model_load_retry.max_retries < 0:
+        raise ValueError(
+            f"trainer.model_load_retry.max_retries must be non-negative; got {cfg.trainer.model_load_retry.max_retries}"
+        )
+    if cfg.trainer.algorithm.tis_lcs_alert_threshold < 0:
+        raise ValueError(
+            "trainer.algorithm.tis_lcs_alert_threshold must be non-negative; "
+            f"got {cfg.trainer.algorithm.tis_lcs_alert_threshold}"
+        )
+    if cfg.trainer.progress.mode not in {"auto", "tqdm", "logging"}:
+        raise ValueError(f"trainer.progress.mode must be one of auto, tqdm, logging; got {cfg.trainer.progress.mode!r}")
+    if cfg.generator.r3_transport not in set(R3Transport):
+        raise ValueError(
+            f"generator.r3_transport must be one of by_value, resident, decentral; got {cfg.generator.r3_transport!r}"
+        )
+    if cfg.generator.gdn_backend not in set(GDNBackend):
+        raise ValueError(f"generator.gdn_backend must be one of torch, flashqla; got {cfg.generator.gdn_backend!r}")
+    if cfg.trainer.token_stats.enabled and cfg.trainer.strategy == "megatron":
+        raise ValueError("trainer.token_stats.enabled requires an HF policy wrapper; megatron is not supported")
     validate_generator_cfg(cfg)
+    validate_batch_invariant_config(cfg)
+    validate_moe_router_replay_config(cfg)
+    validate_hf_export_config(cfg)
     # Validate context-parallel config (no-op when context_parallel_size == 1 for all roles)
     _validate_cp_cfg(cfg)
-    from .ppo_utils import AdvantageEstimatorRegistry, PolicyLossRegistry, repopulate_all_registries
-
     assert cfg.trainer.sequence_parallel_backend == "ulysses", (
         f"only ulysses is supported as of now, got {cfg.trainer.sequence_parallel_backend}"
     )
+
+    try:
+        resolve_grug_query_bias_update(cfg.trainer.policy)
+    except ValueError as error:
+        raise AssertionError(str(error)) from error
 
     # if advantage estimator is GAE, then critic path should be provided
     if cfg.trainer.algorithm.advantage_estimator == "gae":
@@ -509,6 +635,20 @@ def validate_cfg(cfg: DictConfig):
     assert not (cfg.trainer.algorithm.use_kl_in_reward and cfg.trainer.algorithm.use_kl_loss), (
         "use_kl_in_reward and use_kl_loss should be mutually exclusive"
     )
+
+    use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
+    colocate_ref = cfg.trainer.placement.colocate_all or cfg.trainer.placement.colocate_policy_ref
+    if (
+        cfg.trainer.strategy == "fsdp2"
+        and use_ref_model
+        and colocate_ref
+        and not cfg.trainer.ref.fsdp_config.cpu_offload
+    ):
+        logger.warning(
+            "Enabling trainer.ref.fsdp_config.cpu_offload for the colocated FSDP2 reference model. "
+            "Persistent FSDP2 CPU offload avoids reallocating the entire reference shard on every training step."
+        )
+        cfg.trainer.ref.fsdp_config.cpu_offload = True
 
     if cfg.trainer.strategy in ("fsdp", "fsdp2"):
         assert not (cfg.trainer.policy.fsdp_config.cpu_offload and cfg.trainer.strategy == "fsdp"), (
@@ -530,8 +670,6 @@ def validate_cfg(cfg: DictConfig):
             "`max_ckpts_to_keep` must be greater than 0 to keep the last N checkpoints or negative to keep all checkpoints"
         )
 
-    # TODO (devpatel): move to initializing ray and syncing registries codepath at startup
-    repopulate_all_registries()
     available_policy_losses = PolicyLossRegistry.list_available()
     assert available_policy_losses != [], "Policy loss registry is not populated."
 
@@ -544,18 +682,20 @@ def validate_cfg(cfg: DictConfig):
         f"invalid advantage_estimator: {cfg.trainer.algorithm.advantage_estimator}. Must be one of {available_advantage_estimators}"
     )
 
-    assert cfg.trainer.algorithm.loss_reduction in (
-        "token_mean",
-        "sequence_mean",
-        "seq_mean_token_sum_norm",
-        "seq_mean_token_sum_norm_global",
-    ), (
-        f"invalid loss_reduction: {cfg.trainer.algorithm.loss_reduction}. Must be one of `['token_mean', 'sequence_mean', 'seq_mean_token_sum_norm', 'seq_mean_token_sum_norm_global']`"
+    assert cfg.trainer.algorithm.loss_reduction in SUPPORTED_LOSS_REDUCTIONS, (
+        f"invalid loss_reduction: {cfg.trainer.algorithm.loss_reduction}. "
+        f"Must be one of {list(SUPPORTED_LOSS_REDUCTIONS)}"
     )
 
     # add field to algorithm config needed for loss functions
     # create a new config to make it modifiable
     algorithm_config = OmegaConf.create(cfg.trainer.algorithm)
+    group_advantage = resolve_group_advantage_invariant(
+        advantage_estimator=str(algorithm_config.advantage_estimator),
+        physical_group_size=int(cfg.generator.n_samples_per_prompt),
+        minimum_group_size=algorithm_config.group_advantage_min_size,
+    )
+    algorithm_config.resolved_group_advantage = group_advantage.to_config()
     # NOTE (erictang000): this is the max sequence length including the prompt, since max response length
     # per batch can be variable based on the prompt length. This is used to normalize the loss for
     # seq_mean_token_sum_norm loss reduction. Potentially revisit this if we update to use a
@@ -579,6 +719,29 @@ def validate_cfg(cfg: DictConfig):
             "`offload_after_step=False` is not supported for DeepSpeed, please set `offload_after_step` to `true` for both policy and critic"
         )
 
+    policy_loss_type = cfg.trainer.algorithm.policy_loss_type
+    dppo = policy_loss_type == PolicyLossType.DPPO
+    if policy_loss_requires_rollout_logprobs(policy_loss_type) and cfg.trainer.algorithm.use_tis:
+        raise ValueError(
+            f"trainer.algorithm.policy_loss_type={cfg.trainer.algorithm.policy_loss_type} cannot be combined with "
+            "use_tis=true; the selected loss already uses the full rollout importance ratio"
+        )
+
+    if dppo:
+        if cfg.trainer.algorithm.dppo_divergence_type not in DPPODivergenceType:
+            raise ValueError("trainer.algorithm.dppo_divergence_type must be 'tv' or 'kl'")
+        if cfg.trainer.algorithm.dppo_divergence_threshold <= 0:
+            raise ValueError("trainer.algorithm.dppo_divergence_threshold must be positive")
+        if cfg.trainer.algorithm.use_kl_loss:
+            raise ValueError("trainer.algorithm.policy_loss_type=dppo requires use_kl_loss=false for TMax parity")
+
+    lm_head_compute_dtype = cfg.trainer.policy.model.lm_head_compute_dtype
+    if lm_head_compute_dtype not in (None, "float32"):
+        raise ValueError("trainer.policy.model.lm_head_compute_dtype must be null or 'float32'")
+    logprob_chunk_size = cfg.trainer.policy.model.get("logprob_chunk_size", None)
+    if logprob_chunk_size is not None and (isinstance(logprob_chunk_size, bool) or int(logprob_chunk_size) <= 0):
+        raise ValueError("trainer.policy.model.logprob_chunk_size must be null or a positive integer")
+
     if cfg.trainer.algorithm.use_tis:
         if cfg.trainer.algorithm.tis_imp_ratio_cap <= 0:
             raise ValueError(
@@ -598,6 +761,29 @@ def validate_cfg(cfg: DictConfig):
             "dual_clip",
         ], "TIS is only implemented for regular and dual_clip policy loss types"
 
+    if policy_loss_requires_rollout_logprobs(policy_loss_type):
+        if cfg.generator.sampling_params.logprobs is None:
+            logger.warning(
+                f"`generator.sampling_params.logprobs` is `None` but {cfg.trainer.algorithm.policy_loss_type} "
+                "requires rollout logprobs. "
+                "Setting `logprobs` to 0."
+            )
+            cfg.generator.sampling_params.logprobs = 0
+        if cfg.generator.backend == "sglang":
+            raise NotImplementedError(
+                f"{cfg.trainer.algorithm.policy_loss_type} requires rollout logprobs; use the vLLM generator backend"
+            )
+        # The Terminal-Bench Harbor agent records per-turn logprobs only when its own
+        # collect_rollout_details setting is on; the engine-side logprobs setting does
+        # not turn it on. Check it here when the Harbor config is part of the cfg.
+        harbor_cfg = (cfg.get("terminal_bench_config") or {}).get("harbor") if hasattr(cfg, "get") else None
+        if harbor_cfg is not None and not bool(harbor_cfg.get("collect_rollout_details", False)):
+            raise ValueError(
+                f"trainer.algorithm.policy_loss_type={cfg.trainer.algorithm.policy_loss_type} requires rollout "
+                "logprobs, but terminal_bench_config.harbor.collect_rollout_details is not true: the Harbor "
+                "agent would never request token ids and every trajectory would be masked."
+            )
+
     if cfg.trainer.policy.model.lora.rank > 0:
         # LoRA enabled
         # Right now: assert generator backend must be vllm, training backend must be fsdp/fsdp2
@@ -615,6 +801,11 @@ def validate_cfg(cfg: DictConfig):
 
     # Validate placement
     if cfg.trainer.placement.colocate_all:
+        tp_pp_size = (
+            cfg.generator.inference_engine_tensor_parallel_size * cfg.generator.inference_engine_pipeline_parallel_size
+        )
+        gpus_per_node = cfg.trainer.placement.policy_num_gpus_per_node
+        validate_colocated_engine_geometry(tensor_pipeline_size=tp_pp_size, gpus_per_node=gpus_per_node)
         num_policy_gpus = cfg.trainer.placement.policy_num_gpus_per_node * cfg.trainer.placement.policy_num_nodes
         num_rollout_gpus = (
             cfg.generator.num_inference_engines
@@ -625,8 +816,8 @@ def validate_cfg(cfg: DictConfig):
         assert num_policy_gpus == num_rollout_gpus, (
             f"num_policy_gpus ({num_policy_gpus}) and num_rollout_gpus ({num_rollout_gpus}) must be the same when colocating all models"
         )
+
     else:
-        use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
         if cfg.trainer.placement.colocate_policy_ref and use_ref_model:
             assert cfg.trainer.placement.policy_num_nodes == cfg.trainer.placement.ref_num_nodes, (
                 f"policy_num_nodes ({cfg.trainer.placement.policy_num_nodes}) and ref_num_nodes ({cfg.trainer.placement.ref_num_nodes}) must be the same when colocate policy and ref model."
@@ -634,6 +825,23 @@ def validate_cfg(cfg: DictConfig):
             assert cfg.trainer.placement.policy_num_gpus_per_node == cfg.trainer.placement.ref_num_gpus_per_node, (
                 f"policy_num_gpus_per_node ({cfg.trainer.placement.policy_num_gpus_per_node}) and ref_num_gpus_per_node ({cfg.trainer.placement.ref_num_gpus_per_node}) must be the same when colocate policy and ref model."
             )
+
+    if cfg.generator.engine_init_timeout_seconds <= 0:
+        raise ValueError("generator.engine_init_timeout_seconds must be greater than zero")
+
+
+def validate_batch_invariant_config(cfg: DictConfig) -> None:
+    """Validate that trainer and rollout kernels are controlled together."""
+
+    if not cfg.trainer.algorithm.batch_invariant:
+        return
+    if cfg.generator.backend != "vllm":
+        raise ValueError("trainer.algorithm.batch_invariant=true requires generator.backend='vllm'")
+    if not cfg.generator.run_engines_locally:
+        raise ValueError(
+            "trainer.algorithm.batch_invariant=true cannot configure a remote inference server; "
+            "run the vLLM engines locally so both rollout and trainer activation is guaranteed"
+        )
 
 
 def validate_generator_cfg(cfg: DictConfig):
@@ -646,6 +854,9 @@ def validate_generator_cfg(cfg: DictConfig):
         NotImplementedError: if feature is not supported, such as sglang for multiturn generation
         ValueError: when cfg.generator.sampling_params.logprobs > 0
     """
+
+    parse_trajectory_reward_shaping_config(cfg.generator.get("trajectory_reward_shaping"))
+    parse_trajectory_retention_config(cfg.generator.get("trajectory_retention"))
 
     if cfg.generator.max_turns == 1:
         assert cfg.generator.max_input_length == cfg.trainer.max_prompt_length, (
@@ -932,7 +1143,8 @@ def _validate_dcp_cfg(cfg: DictConfig):
         )
     # (e) vLLM rejects DCP together with R3 router capture (enable_return_routed_experts).
     # R3 capture is configured at the generator level (direct flag or engine_init_kwargs),
-    # and the training-side replay is gated by trainer.policy.fsdp_config.moe_router_replay.
+    # Training-side replay also requires an FSDP/FSDP2 strategy; unsupported strategies
+    # reject the flag during top-level config validation.
     #
     # Opt-in bypass: VLLM_ALLOW_ROUTED_EXPERTS_DCP=1 lifts this guard, mirroring the
     # identical env-var-gated bypass in the patched vLLM fork
@@ -947,7 +1159,7 @@ def _validate_dcp_cfg(cfg: DictConfig):
     r3_capture = (
         bool(gen.get("enable_return_routed_experts", False))
         or bool(gen.get("engine_init_kwargs", {}).get("enable_return_routed_experts", False))
-        or bool(cfg.trainer.policy.fsdp_config.get("moe_router_replay", False))
+        or moe_router_replay_enabled(cfg)
     )
     allow_routed_experts_dcp = os.environ.get("VLLM_ALLOW_ROUTED_EXPERTS_DCP", "0") == "1"
     if r3_capture and allow_routed_experts_dcp:
@@ -1026,7 +1238,6 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     Returns:
         Dict[str, str]: Environment variables to be used in Ray runtime environment
     """
-    # TODO(sumanthrh): introduce a debug mode and add debugging flags like `CUDA_LAUNCH_BLOCKING` here
     env_vars = {}
 
     # Force CPython stock asyncio (epoll SelectorEventLoop), NOT uvloop, in EVERY
@@ -1050,6 +1261,12 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     # Actors are network-RTT-bound (vLLM/Daytona HTTP) so uvloop's throughput
     # edge is moot. See feedback_uvloop_libuv_019_pin.
     env_vars["RAY_USE_UVLOOP"] = "0"
+
+    # Ray's job runtime environment is the explicit contract for worker-wide
+    # settings. Forward NUMA placement when the launcher opts in so the early
+    # worker hook and actor constructors observe the same value as the driver.
+    if NUMA_AFFINITY_ENV in os.environ:
+        env_vars[NUMA_AFFINITY_ENV] = os.environ[NUMA_AFFINITY_ENV]
 
     # Disable libuv's io_uring backend in EVERY Ray actor/worker process.
     #
@@ -1077,75 +1294,15 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     # boot in case import ordering races the runtime-env injection.
     env_vars["UV_USE_IO_URING"] = "0"
 
-    # ---------------------------------------------------------------------
-    # NCCL flight-recorder + finite-timeout instrumentation (Option A diag).
-    #
-    # The 80B R3 router-replay run (job 673119, EP=8xFSDP=6, 48-GPU policy)
-    # HARD-deadlocked at the first policy_train backward micro-iteration on an
-    # EP all-to-all / router-replay-recompute MoE-backward collective and spun
-    # ~115 min with NO watchdog teardown. Root cause of the *silent* spin:
-    # without TORCH_NCCL_ASYNC_ERROR_HANDLING the NCCL watchdog never tears the
-    # process down on a stuck collective, and with no flight recorder there is
-    # no per-rank stuck-collective trace.
-    #
-    # These vars (1) enable the torch NCCL flight recorder so the next hang
-    # dumps the exact stuck collective name + ranks per worker, and (2) make
-    # the watchdog actually abort + dump on timeout. The *finite* timeout
-    # itself is plumbed below via SKYRL_WORKER_NCCL_TIMEOUT_IN_S, which is read
-    # by init_process_group in worker.py (and the EP/FSDP sub-meshes created by
-    # init_device_mesh inherit the default PG's timeout). We raise it to 20 min
-    # so a genuinely-stuck EP collective aborts with a flight-recorder dump
-    # instead of spinning silently for hours.
-    #
-    # These are propagated to EVERY Ray worker (policy/ref/inference) via the
-    # ray runtime env, the same path as RAY_USE_UVLOOP above. Pure diagnostic
-    # overhead; the model/training config is unchanged so the trace localizes
-    # the SAME deadlock. (NCCL_DEBUG / NCCL_DEBUG_SUBSYS are forced to INFO AFTER
-    # the launcher-env forwarding loop below -- see the override there -- because
-    # the OT-Agent launcher exports NCCL_DEBUG=WARN, which the forwarding loop
-    # would otherwise copy in and clobber an INFO set here.)
-    #
-    # Flight-recorder buffer size: torch 2.9 renamed TORCH_NCCL_TRACE_BUFFER_SIZE
-    # -> TORCH_FR_BUFFER_SIZE (old name still honored as a deprecated alias). Set
-    # both so the recorder is enabled regardless of the torch version in the SIF.
-    env_vars["TORCH_FR_BUFFER_SIZE"] = "20000"
-    env_vars["TORCH_NCCL_TRACE_BUFFER_SIZE"] = "20000"
-    env_vars["TORCH_NCCL_DUMP_ON_TIMEOUT"] = "1"
-    env_vars["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
-    # Flight-recorder dump-on-timeout target. This MUST resolve to a path that is
-    # WRITABLE inside the worker process (per-pod on CoreWeave; per-node scratch on
-    # Jupiter). It was previously a hardcoded Jupiter ABSOLUTE path
-    # (/e/data1/.../nccl_trace/673_relaunch_rank), which on the CoreWeave pods does
-    # NOT exist -> FlightRecorder.cpp:21 "Error opening file for writing Flight
-    # Recorder debug info" on EVERY rank => the next-repro pickle was never written
-    # (2026-06-28 MoE NCCL hang: both arms wedged, zero FR dump). Now derive it from
-    # the launcher/yaml env (the iris configs set TORCH_NCCL_DEBUG_INFO_TEMP_FILE /
-    # TORCH_FR_DUMP_TEMP_FILE in extra_env) and DEFAULT to an in-pod /tmp dir that is
-    # writable everywhere. torch 2.9 renamed the cvar TORCH_NCCL_DEBUG_INFO_TEMP_FILE
-    # -> TORCH_FR_DUMP_TEMP_FILE (old name deprecated-but-honored); set BOTH so the
-    # dump lands regardless of the torch version baked in the image.
-    _fr_dump_path = (
-        os.environ.get("TORCH_FR_DUMP_TEMP_FILE")
-        or os.environ.get("TORCH_NCCL_DEBUG_INFO_TEMP_FILE")
-        or "/tmp/nccl_fr_rank"
+    env_vars.update(EnvVarManager.from_config(cfg).environment_for(EnvVarScope.RAY_WORKER))
+    # Resolve the actual collective deadline last so the debug preset's heartbeat
+    # cannot exceed a shorter explicitly configured process-group timeout.
+    env_vars.update(
+        worker_nccl_environment(
+            base_environment=env_vars,
+            collective_timeout_seconds=int(cfg.trainer.distributed.worker_collective_timeout_seconds),
+        )
     )
-    env_vars["TORCH_FR_DUMP_TEMP_FILE"] = _fr_dump_path
-    env_vars["TORCH_NCCL_DEBUG_INFO_TEMP_FILE"] = _fr_dump_path
-    # Finite NCCL collective timeout, forwarded to the Ray workers. Resolved via
-    # the SINGLE canonical accessor (skyrl_train.utils.constants.
-    # get_worker_nccl_timeout_s: env override, else DEFAULT_WORKER_NCCL_TIMEOUT_IN_S
-    # = 1800). Read back by constants.SKYRL_WORKER_NCCL_TIMEOUT_IN_S and applied at
-    # torch.distributed.init_process_group(timeout=...) in worker.py; the EP / FSDP
-    # device-mesh sub-groups inherit this default-PG timeout. Raised (was constants
-    # default 600 / here a 1200 floor) to 1800 so a stuck EP all-to-all or a slow
-    # 80B first-step forward / rank-0 full-state-dict materialize aborts (with a
-    # flight recorder dump) rather than SIGABRTing on the old watchdog. A config
-    # that sets a larger value (extra_env) gets it — the env var is the override.
-    try:
-        _cfg_nccl_timeout = get_worker_nccl_timeout_s()
-    except (TypeError, ValueError):
-        _cfg_nccl_timeout = DEFAULT_WORKER_NCCL_TIMEOUT_IN_S
-    env_vars["SKYRL_WORKER_NCCL_TIMEOUT_IN_S"] = str(_cfg_nccl_timeout)
 
     # NOTE (charlie): See https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
     # and https://docs.vllm.ai/en/v0.9.2/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
@@ -1208,7 +1365,10 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
             ]
         )
     max_num_gpus_per_node = max(gpu_counts) if gpu_counts else 1
-    if not peer_access_supported(max_num_gpus_per_node=max_num_gpus_per_node):
+    if not peer_access_supported(
+        max_num_gpus_per_node=max_num_gpus_per_node,
+        placement_group_timeout_seconds=int(cfg.trainer.distributed.placement_group_timeout_seconds),
+    ):
         logger.info("Peer access is not supported on this node type, disabling NCCL P2P and SHM")
         env_vars["NCCL_P2P_DISABLE"] = "1"
         env_vars["NCCL_SHM_DISABLE"] = "1"
@@ -1249,9 +1409,17 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     # actually reach the policy/vLLM workers. Pure passthrough: a no-op unless
     # the var is set in the launcher environment, so the production/default path
     # is unchanged.
+    #
+    # GLOO_SOCKET_IFNAME is deliberately NOT in this list. runtime_env is
+    # job-level, so it pushes one value to every node, and gloo reads the value as
+    # a literal interface name with no `^exclude` form. NIC names are not uniform
+    # across a gang: job 20260729-102429-52af30 broadcast the head's `enp90s0np0`
+    # to a node naming its NIC `enp90s0f0np0` and megatron's gloo group creation
+    # there died with `Unable to find address for: enp90s0np0`. Set it per node
+    # instead (the iris controller derives it from each pod's own IP before that
+    # node's `ray start`, which the node's Ray workers inherit).
     for _net_env in (
         "NCCL_SOCKET_IFNAME",
-        "GLOO_SOCKET_IFNAME",
         "NCCL_IB_HCA",
         "NCCL_IB_DISABLE",
         "NCCL_NET",
@@ -1284,115 +1452,7 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
     # the config's extra_env -- the passthrough loop above forwards both.)
     env_vars.setdefault("NCCL_DEBUG", "WARN")
 
-    if SKYRL_LD_LIBRARY_PATH_EXPORT:
-        # export `LD_LIBRARY_PATH` to ray runtime env.
-        # For some reason the `LD_LIBRARY_PATH` is not exported to the worker with .env file.
-        logger.info(f"Exporting `LD_LIBRARY_PATH` to ray runtime env: {os.environ['LD_LIBRARY_PATH']}")
-        env_vars["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
-
-    if SKYRL_PYTHONPATH_EXPORT:
-        # allow pythonpath to be updated as a fall back for deps that are not shipped with UV
-        # not recommended since it can cause unexpected conflicts with UV packages, but keeping for backwards compatibility
-        logger.info(f"Exporting `PYTHONPATH` to ray runtime env: {os.environ['PYTHONPATH']}")
-        env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
-
     return env_vars
-
-
-def _force_stock_asyncio_in_worker() -> None:
-    """Ray ``worker_process_setup_hook``: force CPython stock asyncio in EVERY worker.
-
-    Runs ONCE at the very start of every Ray worker process (before any task/actor
-    is dispatched and before the C++ CoreWorker builds an actor's
-    concurrency-group event loop), so it is the earliest possible point to pin the
-    event-loop policy in the worker process.
-
-    WHY THIS EXISTS (the gap the two prior fixes missed):
-      * ``BasePPOExp.run()`` (main_base.py) resets the policy, but ONLY in the
-        driver/orchestrator process -- not in Ray actor processes.
-      * ``RAY_USE_UVLOOP=0`` in ``prepare_runtime_environment`` is supposed to make
-        Ray's ``try_install_uvloop`` a no-op, and the per-actor reset in
-        ``RolloutCoordinator.__init__`` is supposed to flip the policy before the
-        loop is built -- but BOTH were empirically INSUFFICIENT: job 927538 still
-        SIGABRT'd in a ``RolloutCoordinator`` under uvloop after ~85 min, with the
-        loop created by the C++
-        ``CoreWorker.initialize_eventloops_for_actor_concurrency_group`` (the
-        backtrace is ``uv__epoll_ctl_prep -> uvloop Loop._run -> run_forever ->
-        CoreWorker...concurrency_group -> Fatal Python error: Aborted``). The async
-        actor's concurrency-group loop is created by the CoreWorker independently of
-        ``__init__`` ordering and was NOT governed by the env var in this Ray build
-        (2.51.1). A ``worker_process_setup_hook`` runs strictly before any of that,
-        so resetting the policy here makes EVERY worker's loop a stock
-        ``SelectorEventLoop`` (epoll, no libuv) -- the one place that reliably
-        covers the actor concurrency-group loop.
-
-    This is the same idiom as the driver fix (``set_event_loop_policy`` ->
-    ``DefaultEventLoopPolicy``); it is process-global and idempotent. Actors are
-    network-RTT-bound (vLLM/Daytona HTTP), so uvloop's throughput edge is moot.
-
-    NOT ENOUGH ON ITS OWN (job 930208, the SSL re-abort): setting only the
-    POLICY left a different uvloop path live. 930208 SIGABRT'd in a
-    RolloutCoordinator at ``uvloop/sslproto.pyx:517
-    SSLProtocol._on_handshake_complete`` -- the litellm->Daytona HTTPS handshake
-    running on a uvloop.Loop(). ``uvloop.new_event_loop()`` builds ``uvloop.Loop()``
-    DIRECTLY and ignores the asyncio policy, so Ray's C++ CoreWorker (or
-    aiohttp) can still stand up a uvloop loop after this policy reset. We
-    therefore ALSO (1) export ``UV_USE_IO_URING=0`` into the worker env before
-    any libuv init (libuv 1.48.0 reads it via getenv at first use of
-    uv__use_io_uring() and caches it -> the buggy io_uring epoll-ctl path is
-    never armed; fixed-for-real in libuv 1.49.0), and (2) NEUTRALIZE uvloop
-    in-process so ``uvloop.install`` / ``uvloop.new_event_loop`` /
-    ``uvloop.EventLoopPolicy`` can no longer produce a uvloop loop -- they fall
-    back to stock asyncio. (1) keeps uvloop working on plain epoll if some loop
-    survives; (2) makes sure none does. Belt-and-suspenders covering the SSL
-    path that the bare policy reset missed.
-    """
-    import os
-
-    # (1) Kill the buggy libuv 1.48.0 io_uring epoll-ctl path FIRST, before any
-    # import of uvloop/libuv in this worker triggers uv__use_io_uring(). This is
-    # the same value set in the Ray runtime_env env_vars (prepare_runtime_environment);
-    # re-setting it here guards against any import-ordering race where libuv is
-    # touched before the runtime-env injection lands.
-    os.environ["UV_USE_IO_URING"] = "0"
-
-    import asyncio
-
-    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-
-    # (2) Neutralize uvloop in-process so nothing (Ray C++ CoreWorker, litellm,
-    # aiohttp) can construct a uvloop.Loop() that runs the SSL handshake on
-    # libuv. Guarded: if uvloop is not importable, there is nothing to do.
-    # Idempotent: re-aliasing to the stock equivalents is a no-op on re-entry.
-    try:
-        import uvloop  # noqa: F401
-    except Exception:
-        return
-
-    def _stock_new_event_loop():
-        # Stock asyncio loop (SelectorEventLoop on POSIX) -- never uvloop.Loop().
-        return asyncio.SelectorEventLoop()
-
-    def _stock_install():
-        # uvloop.install() normally sets uvloop's policy; force stock instead.
-        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-
-    try:
-        uvloop.new_event_loop = _stock_new_event_loop  # type: ignore[assignment]
-        uvloop.install = _stock_install  # type: ignore[assignment]
-        # Anything that does asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        # (e.g. ray aiohttp worker, or older code paths) now installs the stock
-        # policy instead of uvloop's.
-        uvloop.EventLoopPolicy = asyncio.DefaultEventLoopPolicy  # type: ignore[assignment]
-        if hasattr(uvloop, "Loop"):
-            # Constructing uvloop.Loop() directly (the lowest-level escape hatch)
-            # now yields a stock SelectorEventLoop.
-            uvloop.Loop = asyncio.SelectorEventLoop  # type: ignore[assignment]
-    except Exception:
-        # Best-effort: the policy reset + UV_USE_IO_URING=0 already cover the
-        # common paths; do not let an attribute-shape change in uvloop crash the
-        # worker boot hook.
-        pass
 
 
 def configure_ray_worker_logging() -> None:
@@ -1426,7 +1486,10 @@ def configure_ray_worker_logging() -> None:
                 level = logger.level(record.levelname).name
             except ValueError:
                 level = record.levelno
-            logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+            message = record.getMessage()
+            if record.exc_info is not None and record.exc_info[1] is not None:
+                message = f"{message}\n{format_exception_text(record.exc_info[1])}"
+            logger.opt(depth=6).log(level, message)
 
     logging.root.handlers = [_InterceptHandler()]
     level = getattr(logging, level_name, logging.INFO)
@@ -1440,22 +1503,23 @@ def initialize_ray(cfg: DictConfig):
     Args:
         cfg: Training config
     """
-    from .ppo_utils import (
-        sync_registries,
-    )
+    debug_environment = apply_distributed_debug_mode(cfg)
+    if debug_environment:
+        manifest = write_process_manifest("driver", environment=debug_environment)
+        logger.info(f"Distributed debug mode active; driver manifest: {manifest}")
 
     env_vars = prepare_runtime_environment(cfg)
     # worker_process_setup_hook runs ONCE at the start of every Ray worker process,
-    # BEFORE the C++ CoreWorker builds an async actor's concurrency-group event loop.
-    # It forces CPython stock asyncio (no uvloop/libuv) in EVERY worker -- the only
-    # reliable place to cover the RolloutCoordinator concurrency-group loop that
-    # SIGABRT'd job 927538 despite RAY_USE_UVLOOP=0 + the actor __init__ reset.
+    # BEFORE the C++ CoreWorker builds actor threads. It installs the inherited
+    # host-memory policy and forces CPython stock asyncio (no uvloop/libuv) in every
+    # worker -- the only reliable place to cover concurrency-group loops that are
+    # created before an actor constructor can reset their event-loop policy.
     # Referenced by fully-qualified name string (importable in every worker via the
     # editable skyrl_train install) so Ray does not have to cloudpickle it.
     ray.init(
         runtime_env={
             "env_vars": env_vars,
-            "worker_process_setup_hook": "skyrl_train.utils.utils._force_stock_asyncio_in_worker",
+            "worker_process_setup_hook": "skyrl_train.worker_setup.configure_worker_process",
         }
     )
 
@@ -1533,14 +1597,11 @@ def torch_dtype_to_str(dtype: torch.dtype) -> str:
 
 
 def str_to_torch_dtype(dtype: str) -> torch.dtype:
-    if dtype == "bfloat16":
-        return torch.bfloat16
-    elif dtype == "float16":
-        return torch.float16
-    elif dtype == "float32":
-        return torch.float32
-    else:
-        return torch.dtype(dtype)
+    name = dtype.removeprefix("torch.")
+    value = getattr(torch, name, None)
+    if not isinstance(value, torch.dtype):
+        raise ValueError(f"unsupported torch dtype: {dtype!r}")
+    return value
 
 
 def format_gib(mem_bytes: int) -> str:
@@ -1573,7 +1634,10 @@ def run_p2p_access_check():
     return True
 
 
-def peer_access_supported(max_num_gpus_per_node: int):
+def peer_access_supported(
+    max_num_gpus_per_node: int,
+    placement_group_timeout_seconds: int = DEFAULT_RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS,
+):
     # whatever the max num gpus per node is, we can check p2p access if there are at least 2 GPUs
     # if max is 1, p2p access is not supported
     if max_num_gpus_per_node <= 1:
@@ -1583,7 +1647,7 @@ def peer_access_supported(max_num_gpus_per_node: int):
         # we are on cpu head node, so we need to check P2P access on a node with 2 GPUs
         ray.init()
         pg = placement_group([{"CPU": 1, "GPU": 2}], strategy="PACK")
-        get_ray_pg_ready_with_timeout(pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
+        get_ray_pg_ready_with_timeout(pg, timeout=placement_group_timeout_seconds)
         result = ray.get(
             ray.remote(num_gpus=2, scheduling_strategy=PlacementGroupSchedulingStrategy(pg))(
                 run_p2p_access_check

@@ -41,3 +41,18 @@ register(
     id="searchcode",
     entry_point="skyrl_gym.envs.searchcode.env:SearchCodeEnv",
 )
+
+register(
+    id="mcq",
+    entry_point="skyrl_gym.envs.mcq.env:MCQEnv",
+)
+
+register(
+    id="preference",
+    entry_point="skyrl_gym.envs.preference.env:PreferenceEnv",
+)
+
+register(
+    id="reasoning_gym",
+    entry_point="skyrl_gym.envs.reasoning_gym.env:ReasoningGymEnv",
+)

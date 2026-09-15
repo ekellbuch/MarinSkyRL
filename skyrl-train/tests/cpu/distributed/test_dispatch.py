@@ -1,12 +1,20 @@
+import os
+import pickle
+import threading
+
 from skyrl_train.training_batch import TrainingInputBatch
 from skyrl_train.distributed.dispatch import (
+    DispatchSettings,
+    WorkerGroupTaskError,
     MeshDispatch,
     PassThroughDispatch,
     MeshRank,
     ActorInfo,
     DispatchRegistry,
     Dispatch,
+    collect_actor_results,
 )
+from marinskyrl.runtime_options import R3Transport
 import ray
 import torch
 from typing import List, Optional, Union
@@ -15,6 +23,10 @@ import pytest
 
 
 pytestmark = pytest.mark.usefixtures("ray_module")
+
+
+def _dispatch_settings(transport: R3Transport = R3Transport.DECENTRAL) -> DispatchSettings:
+    return DispatchSettings(r3_transport=transport, r3_dispatch_put_timeout_seconds=600)
 
 
 @ray.remote
@@ -33,8 +45,22 @@ class RayActor:
 
     def get_ray_node_id(self):
         # Mirror skyrl_train.workers.worker.Worker.get_ray_node_id so the
-        # SKYRL_R3_DECENTRAL path can resolve this actor's node id.
+        # Decentralized R3 transport resolves the consumer actor's node id.
         return ray.get_runtime_context().get_node_id()
+
+    def raise_oom(self):
+        raise torch.OutOfMemoryError("injected policy-rank OOM")
+
+    def exit_process(self):
+        os._exit(17)
+
+    def wait_without_progress(self):
+        # The unresolved peer is the fault input. Bound it so a broken collector
+        # cannot leave the CPU suite blocked indefinitely.
+        threading.Event().wait(10)
+
+    def ping(self):
+        return "alive"
 
 
 class RayActorGroup:
@@ -53,13 +79,13 @@ class RayActorGroup:
         ]
 
     def mesh_dispatch_and_collect(self, data: TrainingInputBatch):
-        object_refs = MeshDispatch.dispatch(self.actor_infos, "do_work", data)
+        object_refs = MeshDispatch.dispatch(self.actor_infos, "do_work", data, settings=_dispatch_settings())
         ret = MeshDispatch.sync_collect(self.actor_infos, object_refs)
         return ret
 
     def pass_through_dispatch(self, a, b):
         # just pass values as is
-        object_refs = PassThroughDispatch.dispatch(self.actor_infos, "dummy", a, b)
+        object_refs = PassThroughDispatch.dispatch(self.actor_infos, "dummy", a, b, settings=_dispatch_settings())
         ret = PassThroughDispatch.sync_collect(self.actor_infos, object_refs)
         return ret
 
@@ -81,6 +107,32 @@ def test_pass_through_dispatch():
     assert ret is None
 
 
+@pytest.mark.parametrize("failure_method", ["raise_oom", "exit_process"])
+def test_collect_actor_results_kills_blocked_gang_on_rank_error(failure_method):
+    actors = [RayActor.remote(0, 0), RayActor.remote(1, 1)]
+    actor_infos = [
+        ActorInfo(
+            actor,
+            MeshRank(dp=index, sp=0, tp=0, pp=0, world_size=2, dp_size=2, pp_size=1),
+        )
+        for index, actor in enumerate(actors)
+    ]
+    refs = [getattr(actors[0], failure_method).remote(), actors[1].wait_without_progress.remote()]
+
+    with pytest.raises(WorkerGroupTaskError) as error:
+        collect_actor_results(actor_infos, refs, operation="policy ppo_train")
+
+    assert error.value.operation == "policy ppo_train"
+    assert error.value.actor_index == 0
+    assert error.value.mesh_rank == actor_infos[0].rank
+    restored_error = pickle.loads(pickle.dumps(error.value))
+    assert restored_error.operation == error.value.operation
+    assert restored_error.actor_index == error.value.actor_index
+    assert restored_error.mesh_rank == error.value.mesh_rank
+    with pytest.raises(ray.exceptions.ActorDiedError):
+        ray.get(actors[1].ping.remote(), timeout=5)
+
+
 def test_mesh_dispatch_with_mixed():
     num_actors = 8
     actor_group = RayActorGroup(num_actors)
@@ -88,6 +140,7 @@ def test_mesh_dispatch_with_mixed():
         actor_group.actor_infos,
         "do_work",
         TrainingInputBatch({"a": torch.tensor([1, 2, 3, 4])}),
+        settings=_dispatch_settings(),
     )
     object_refs[0] = ray.put(None)
     with pytest.raises(AssertionError):
@@ -106,16 +159,18 @@ def _r3_batch():
     )
 
 
-def test_r3_decentral_byte_identical(monkeypatch):
-    """SKYRL_R3_DECENTRAL=1 must yield BYTE-IDENTICAL collected output to the
-    resident driver-put path (Fix A changes object LOCATION, never VALUE)."""
+def test_r3_decentral_byte_identical():
+    """Decentral transport yields byte-identical output to resident transport."""
     num_actors = 8
 
     def run(decentral: bool):
-        monkeypatch.setenv("SKYRL_R3_RESIDENT", "1")
-        monkeypatch.setenv("SKYRL_R3_DECENTRAL", "1" if decentral else "0")
         group = RayActorGroup(num_actors)
-        object_refs = MeshDispatch.dispatch(group.actor_infos, "do_work", _r3_batch())
+        object_refs = MeshDispatch.dispatch(
+            group.actor_infos,
+            "do_work",
+            _r3_batch(),
+            settings=_dispatch_settings(R3Transport.DECENTRAL if decentral else R3Transport.RESIDENT),
+        )
         return MeshDispatch.sync_collect(group.actor_infos, object_refs)
 
     resident = run(decentral=False)
@@ -129,15 +184,12 @@ def test_r3_decentral_byte_identical(monkeypatch):
         assert torch.equal(decentral[k], resident[k]), f"decentral diverged on key {k}"
 
 
-def test_r3_decentral_off_is_resident_default(monkeypatch):
-    """With DECENTRAL=0 but RESIDENT on, behavior is the existing driver-put
-    resident path (no regression, byte-identical to today). NOTE: as of
-    2026-07-11 SKYRL_R3_DECENTRAL defaults to ON, so this test sets =0
-    EXPLICITLY to exercise the off path (was relying on the unset default)."""
-    monkeypatch.setenv("SKYRL_R3_RESIDENT", "1")
-    monkeypatch.setenv("SKYRL_R3_DECENTRAL", "0")
+def test_r3_resident_transport_preserves_values():
+    """Resident transport keeps the existing driver-put behavior."""
     group = RayActorGroup(8)
-    refs = MeshDispatch.dispatch(group.actor_infos, "do_work", _r3_batch())
+    refs = MeshDispatch.dispatch(
+        group.actor_infos, "do_work", _r3_batch(), settings=_dispatch_settings(R3Transport.RESIDENT)
+    )
     out = MeshDispatch.sync_collect(group.actor_infos, refs)
     assert torch.equal(out["a"], torch.tensor([1, 3, 5, 7]))
     # R3 passes through unchanged.
@@ -150,7 +202,14 @@ def test_dispatch_registry():
 
         class CustomDispatch(Dispatch):
             @classmethod
-            def dispatch(cls, actor_infos: List[ActorInfo], method: str, *args, **kwargs) -> List[ObjectRef]:
+            def dispatch(
+                cls,
+                actor_infos: List[ActorInfo],
+                method: str,
+                *args,
+                settings: DispatchSettings,
+                **kwargs,
+            ) -> List[ObjectRef]:
                 pass
 
             @classmethod

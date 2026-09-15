@@ -1,9 +1,8 @@
-"""Stage B (F5/F4) flag-off byte-identical guarantee — the gating invariant.
+"""Flag-off contract for the per-token reward channel.
 
-Mirrors tests/cpu/test_ep_config_noop.py and the routed_experts no-op test: with
-the per-token reward channel DISABLED, (1) the config key defaults to false and is
-purely additive, (2) the collator returns tensors byte-identical to the pre-Stage-B
-call and emits NO new tensors, (3) the TrainingInputBatch keyset is unchanged.
+With the channel disabled, the config key defaults to false, the collator leaves
+the existing tensors unchanged and emits no channel tensors, and concatenation
+does not add channel keys.
 
 Run:
     pytest tests/cpu/reward/test_token_channel_noop.py
@@ -15,7 +14,7 @@ from transformers import AutoTokenizer
 
 from skyrl_train.config.utils import get_default_config
 from skyrl_train.dataset.preprocess import convert_prompts_responses_to_batch_tensors
-from skyrl_train.generators.utils import concatenate_generator_outputs
+from skyrl_train.trajectory_runners.trajectory_processing import concatenate_trajectory_batches
 
 
 def test_config_key_defaults_false():
@@ -68,7 +67,7 @@ def test_collator_flag_off_byte_identical(tokenizer):
 
 
 def test_concatenate_flag_off_keys_absent():
-    """When no batch carries the channel keys, the concatenated GeneratorOutput
+    """When no batch carries the channel keys, the concatenated TrajectoryBatch
     must NOT contain them (key absent, not None) -> byte-identical keyset."""
     out = {
         "prompt_token_ids": [[1, 2]],
@@ -79,7 +78,7 @@ def test_concatenate_flag_off_keys_absent():
         "rollout_logprobs": None,
         "rollout_metrics": {},
     }
-    merged = concatenate_generator_outputs([out, out])
+    merged = concatenate_trajectory_batches([out, out], tis_lcs_alert_threshold=0.005)
     assert "token_level_shaping" not in merged
     assert "response_span_tags" not in merged
     assert "rollout_routed_experts" not in merged
@@ -109,6 +108,6 @@ def test_concatenate_flag_on_sentinel_fill():
         "rollout_logprobs": None,
         "rollout_metrics": {},
     }
-    merged = concatenate_generator_outputs([out_with, out_without])
+    merged = concatenate_trajectory_batches([out_with, out_without], tis_lcs_alert_threshold=0.005)
     assert merged["token_level_shaping"] == [[0.0, 0.0, 0.0], [0.0, 0.0]]
     assert merged["response_span_tags"] == [[1, 2, 2], [0, 0]]

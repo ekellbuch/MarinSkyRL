@@ -7,8 +7,10 @@ from huggingface_hub import snapshot_download
 
 import asyncio
 import os
+from enum import StrEnum
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
+from loguru import logger
 from skyrl_train.utils.progress import tqdm
 from omegaconf import OmegaConf
 
@@ -28,17 +30,27 @@ from skyrl_train.distributed.megatron.megatron_strategy import MegatronStrategy
 from skyrl_train.distributed.megatron.megatron_utils import print_model_size, broadcast_object_across_pp_ranks
 from skyrl_train.utils.utils import update_model_config, str_to_torch_dtype, get_physical_gpu_id
 from skyrl_train.utils.hf_load_retry import load_pretrained_with_retry
-from skyrl_train.utils.constants import SKYRL_WORKER_NCCL_TIMEOUT_IN_S
-from skyrl_train.training_batch import TrainingOutputBatch
-from skyrl_train.workers.worker_utils import BatchIterator, reduce_metrics
+from skyrl_train.models.grug_moe import validate_grug_training_strategy
+from skyrl_train.training_batch import (
+    GLOBAL_LOSS_DENOM_METADATA_KEY,
+    TrainingBatchIterator,
+    TrainingOutputBatch,
+    gradient_accumulation_steps,
+)
+from skyrl_train.utils.metrics import policy_progress_metrics, policy_training_metrics
 from skyrl_train.workers.worker import (
     PolicyWorkerBase,
     RefWorkerBase,
     CriticWorkerBase,
 )
-from skyrl_train.workers.megatron.megatron_model_wrapper import MegatronModelWrapper
+from skyrl_train.workers.megatron.megatron_model_wrapper import MegatronModelWrapper, MegatronPolicyMicroBatch
 from skyrl_train.utils.profiler import Profiler
 from skyrl_train.weight_sync import WeightExtractor, WeightChunk
+
+
+class _MegatronInitMode(StrEnum):
+    TRAINING = "training"
+    CHECKPOINT_EXPORT = "checkpoint-export"
 
 
 class MegatronWeightExtractor(WeightExtractor):
@@ -190,8 +202,9 @@ class MegatronWorker:
         """
         Initialize the Megatron-Bridge bridge and provider objects + hf_config and tokenizer
         """
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        validate_grug_training_strategy(getattr(hf_config, "model_type", None), "megatron")
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
         override_config_kwargs = {
             "bos_token_id": tokenizer.bos_token_id,
@@ -316,9 +329,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         self.scheduler: OptimizerParamScheduler = None
         self.optimizer: DistributedOptimizer = None
         self.profiler: Profiler = None
+        self._warned_exact_unit_policy_ratio = False
 
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
         self.strategy.offload_to_cpu(
             self.actor_module, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
         )
@@ -336,7 +349,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # passes device_id so ProcessGroupNCCL never "guesses device ID based on global rank".
         # The guess deadlocks the first collective (weight-init barrier) on unmasked-CVD clusters
         # where every actor sees all GPUs (cw-rno2a); see init_worker_process_group_with_device.
-        init_worker_process_group_with_device(timeout_seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
+        init_worker_process_group_with_device(
+            timeout_seconds=int(self.cfg.trainer.distributed.worker_collective_timeout_seconds)
+        )
 
         # Explicitly wrap torch.distributed.broadcast in torch.no_grad() to avoid a warning in Megatron training where the
         # autograd engine tries to track gradients through the default Torch kernel. This fixes a deprecated behaviour in
@@ -369,11 +384,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             pp_size=mpu.get_pipeline_model_parallel_world_size(),
         )
 
-    def init_model(self, model_path, num_training_steps: int = 1e9):
-        """
-        Initialize the model, optimizer, and scheduler for the policy worker.
-        """
-        # initialize the bridge and provider objects
+    def _initialize_policy_modules(self, model_path: str, *, mode: _MegatronInitMode) -> None:
+        """Construct the shared Megatron model graph at the checkpoint geometry."""
+        for_training = mode is _MegatronInitMode.TRAINING
         self.init_configs(
             model_path,
             self.cfg.trainer.policy.megatron_config,
@@ -383,10 +396,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             flash_attn=self.cfg.trainer.flash_attn,
         )
 
-        # wrap with DDP for training
         self.actor_module = self.make_megatron_module(
-            wrap_with_ddp=True,
-            ddp_config=self.cfg.trainer.policy.megatron_config.ddp_config,
+            wrap_with_ddp=for_training,
+            ddp_config=self.cfg.trainer.policy.megatron_config.ddp_config if for_training else None,
             bf16=self.cfg.trainer.bf16,
         )
 
@@ -397,11 +409,22 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # IncompleteRead / dropped connection / spurious "no .safetensors")
             # that otherwise kill the whole gang at scale; genuine missing/auth
             # failures still surface. no-op if already downloaded.
-            load_pretrained_with_retry(lambda: snapshot_download(model_path), model_id=model_path)
+            retry = self.cfg.trainer.model_load_retry
+            load_pretrained_with_retry(
+                lambda: snapshot_download(model_path),
+                model_id=model_path,
+                max_retries=int(retry.max_retries),
+                backoff_base=float(retry.backoff_base_seconds),
+                backoff_cap=float(retry.backoff_cap_seconds),
+            )
         torch.distributed.barrier()
 
         if self._rank == 0:
             print_model_size(self.actor_module[0])
+
+    def init_model(self, model_path, num_training_steps: int = 1e9):
+        """Initialize the model, optimizer, and scheduler for the policy worker."""
+        self._initialize_policy_modules(model_path, mode=_MegatronInitMode.TRAINING)
 
         # create profiler
         if self.cfg.trainer.policy.megatron_config.torch_profiler_config.enable:
@@ -447,19 +470,27 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         self.empty_cuda_cache = self.cfg.trainer.policy.megatron_config.empty_cuda_cache
 
-    def ppo_train(self, train_data) -> "TrainingOutputBatch":
-        """
-        Overrides `PolicyWorkerBase.ppo_train` for megatron.
-
-        Since we want megatron to handle gradient accumulation over micro batches, we directly pass mini batches into the
-        worker MegatronModelWrapper.forward_backward_mini_batch method.
-        """
-        dataloader = BatchIterator(
-            train_data, sample_batch_size=self.cfg.trainer.micro_train_batch_size_per_gpu, drop_last=False
+    def init_model_for_export(self, model_path: str) -> None:
+        """Initialize Megatron model structure without optimizer or training state."""
+        self._initialize_policy_modules(model_path, mode=_MegatronInitMode.CHECKPOINT_EXPORT)
+        self.model = MegatronModelWrapper(
+            config=self.cfg,
+            actor_module=self.actor_module,
+            logprob_chunk_size=OmegaConf.select(
+                self.cfg, "trainer.policy.megatron_config.logprob_chunk_size", default=None
+            ),
         )
 
-        micro_batches_per_mini_batch = (
-            self.policy_mini_batch_size_per_gpu // self.cfg.trainer.micro_train_batch_size_per_gpu
+    # This cannot inherit PolicyWorkerBase.ppo_train: Megatron Core must own
+    # pipeline scheduling and gradient accumulation, so only policy semantics
+    # are shared with the ordinary worker through backend-neutral utilities.
+    def ppo_train(self, train_data) -> "TrainingOutputBatch":
+        """Train through Megatron Core's pipeline scheduler."""
+        dataloader = TrainingBatchIterator(train_data, self.cfg.trainer.micro_train_batch_size_per_gpu)
+
+        micro_batches_per_mini_batch = gradient_accumulation_steps(
+            self.policy_mini_batch_size_per_gpu,
+            self.cfg.trainer.micro_train_batch_size_per_gpu,
         )
 
         status_list = []
@@ -486,17 +517,19 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 position_ids.masked_fill_(attention_mask == 0, 0)
 
                 micro_buffer.append(
-                    {
-                        "sequences": sequences,
-                        "attention_mask": attention_mask,
-                        "position_ids": position_ids,
-                        "num_actions": experience.num_actions,
-                        "old_action_log_probs": experience.action_log_probs,
-                        "base_action_log_probs": experience.base_action_log_probs,
-                        "advantages": experience.advantages,
-                        "loss_mask": experience.loss_mask,
-                        "rollout_action_logprobs": experience.rollout_logprobs,
-                    }
+                    MegatronPolicyMicroBatch(
+                        sequences=sequences,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        num_actions=experience.num_actions,
+                        old_action_log_probs=experience.action_log_probs,
+                        base_action_log_probs=experience.base_action_log_probs,
+                        advantages=experience.advantages,
+                        loss_mask=experience.loss_mask,
+                        rollout_action_logprobs=experience.rollout_logprobs,
+                        response_span_tags=experience.response_span_tags,
+                        global_loss_denom=(experience.metadata or {}).get(GLOBAL_LOSS_DENOM_METADATA_KEY),
+                    )
                 )
 
                 if len(micro_buffer) == micro_batches_per_mini_batch:
@@ -505,8 +538,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     for chunk in self.actor_module:
                         # if use distributed optimizer, zero grad buffer will be handled by optimizer
                         chunk.zero_grad_buffer()
-                    seq_len = micro_buffer[0]["sequences"].shape[1]
-                    micro_bsz = micro_buffer[0]["sequences"].shape[0]
+                    seq_len = micro_buffer[0].sequences.shape[1]
+                    micro_bsz = micro_buffer[0].sequences.shape[0]
 
                     metrics_list = self.model.forward_backward_mini_batch(
                         micro_batches=micro_buffer,
@@ -523,37 +556,24 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     # within a DP group, metrics are already the same across all workers - we then just all reduce across
                     # the whole world size to get the metrics for the global micro batch
                     for i, metrics in enumerate(metrics_list):
-                        status = {
-                            "final_loss": metrics["final_loss"],
-                            "policy_loss": metrics["policy_loss"],
-                            "policy_lr": self.optimizer.param_groups[0]["lr"],
-                            "ppo_clip_ratio": metrics["ppo_clip_ratio"],
-                            "policy_entropy": metrics["policy_entropy"],
-                        }
-                        if self.cfg.trainer.algorithm.use_kl_loss:
-                            status["policy_kl"] = metrics["policy_kl"]
+                        status = metrics.copy()
+                        status["policy_lr"] = self.optimizer.param_groups[0]["lr"]
+                        if not self.cfg.trainer.algorithm.use_kl_loss:
+                            status.pop("policy_kl")
 
                         # Attach grad norm only for the last micro in the mini-batch
                         if i == len(metrics_list) - 1 and grad_norm is not None:
                             status["raw_grad_norm"] = grad_norm
 
                         # attach response_length
-                        status["response_length"] = micro_buffer[i]["num_actions"]
+                        status["response_length"] = micro_buffer[i].num_actions
 
                         status = self.strategy.all_reduce(status)
                         status_list.append(status)
                         for k, v in status.items():
                             all_metrics[k].append(v)
 
-                    short_status = {
-                        "pg": status_list[-1]["policy_loss"],
-                        "glen": status_list[-1]["response_length"],
-                        "policy_lr": status_list[-1]["policy_lr"],
-                        "ent": status_list[-1]["policy_entropy"],
-                    }
-                    if "raw_grad_norm" in status_list[-1]:
-                        short_status["grad_norm"] = status_list[-1]["raw_grad_norm"]
-                    pbar.set_postfix(short_status)
+                    pbar.set_postfix(policy_progress_metrics(status_list[-1]))
 
                     policy_update_steps += 1
                     micro_buffer = []
@@ -566,11 +586,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             self.profiler.stop_and_save()
             self.profiler.stop_trace()
 
-        # not needed beyond status logging
-        all_metrics.pop("response_length", None)
-
-        status_mean = reduce_metrics(all_metrics)
-        status_mean["policy_update_steps"] = policy_update_steps
+        status_mean = policy_training_metrics(all_metrics, policy_update_steps)
+        if status_mean.get("ppo_ratio_exact_unit_fraction") == 1.0 and not self._warned_exact_unit_policy_ratio:
+            logger.warning(
+                "Megatron's recomputed old log probabilities exactly match the training forward for every policy "
+                "token. PPO clip bounds cannot activate until the mini-batch contains a forward after an optimizer "
+                "update; clip-bound sweeps are inert with the current update geometry."
+            )
+            self._warned_exact_unit_policy_ratio = True
 
         output = TrainingOutputBatch()
         output.metadata = {"train_status": status_mean}
@@ -594,9 +617,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # DEFER processing and a single finalize re-runs process_weights_after_loading
         # (re-applying swap_w13_to_w31) EXACTLY once. Without it the engine holds checkpoint
         # [gate;up] while the FlashInfer-CUTLASS kernel reads [up;gate]. Swap-inert on
-        # triton/dense backends, so byte-identical there. Gated by env for safety. Rank-0 drives
+        # triton/dense backends, so byte-identical there. Rank 0 drives
         # the engine RPC (same global-rank-0 semantics the broadcast/update loop uses below).
-        _w13_bracket = not self.use_cuda_ipc and os.environ.get("SKYRL_W13_RELOAD_BRACKET", "1") == "1"
+        _w13_bracket = not self.use_cuda_ipc and not bool(self.cfg.generator.fuse_weights)
 
         # Extract weights using the initialized extractor
         if not self.use_cuda_ipc:
@@ -712,7 +735,6 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         self.actor_module: List[nn.Module] = None
 
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, **kwargs):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
         self.strategy.offload_to_cpu(self.actor_module, None, pin_memory, non_blocking)
 
     def backload_to_gpu(self, non_blocking=True, **kwargs):
@@ -724,7 +746,9 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         """
         # Device-pinned NCCL PG init via the shared helper (see init_worker_process_group_with_device) —
         # avoids the ProcessGroupNCCL device-guess collective deadlock on unmasked-CVD clusters (cw-rno2a).
-        init_worker_process_group_with_device(timeout_seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
+        init_worker_process_group_with_device(
+            timeout_seconds=int(self.cfg.trainer.distributed.worker_collective_timeout_seconds)
+        )
 
         self.strategy = MegatronStrategy(
             megatron_config=self.cfg.trainer.ref.megatron_config,
@@ -771,7 +795,14 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             # IncompleteRead / dropped connection / spurious "no .safetensors")
             # that otherwise kill the whole gang at scale; genuine missing/auth
             # failures still surface. no-op if already downloaded.
-            load_pretrained_with_retry(lambda: snapshot_download(model_path), model_id=model_path)
+            retry = self.cfg.trainer.model_load_retry
+            load_pretrained_with_retry(
+                lambda: snapshot_download(model_path),
+                model_id=model_path,
+                max_retries=int(retry.max_retries),
+                backoff_base=float(retry.backoff_base_seconds),
+                backoff_cap=float(retry.backoff_cap_seconds),
+            )
         torch.distributed.barrier()
 
         # load weights

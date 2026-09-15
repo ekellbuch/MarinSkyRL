@@ -1,32 +1,60 @@
-from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
-from typing import Any, Dict
-from skyrl_gym.envs.lcb.livecodebench import compute_score
 import json
+import logging
+from collections.abc import Mapping
+from typing import Any
+
 from omegaconf import DictConfig
+
+from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
+from skyrl_gym.envs.lcb.livecodebench import (
+    BINARY_REWARD_MODE,
+    LCB_REWARD_MODES,
+    compute_score,
+    normalize_lcb_ground_truth,
+)
+
+logger = logging.getLogger(__name__)
+_INVALID_GROUND_TRUTH_ERROR = "invalid reward_model.ground_truth"
 
 
 class LCBEnv(BaseTextEnv):
-    """
-    Environment for LiveCodeBench execution environment.
+    """LiveCodeBench execution environment.
+
+    Malformed ground truth is logged and scores zero with verifier-error metadata
+    rather than crashing a distributed rollout worker.
     """
 
     def __init__(
         self,
         env_config: DictConfig,
-        extras: Dict[str, Any] = {},
+        extras: dict[str, Any] | None = None,
     ):
         super().__init__()
+        self.reward_mode = str(env_config.get("reward_mode", BINARY_REWARD_MODE))
+        if self.reward_mode not in LCB_REWARD_MODES:
+            raise ValueError(f"Unsupported LCB reward_mode: {self.reward_mode!r}.")
 
-        assert "reward_spec" in extras, "reward_spec field is required"
-        assert "ground_truth" in extras["reward_spec"], "ground_truth is required in reward_spec field"
-        self.tests = json.loads(extras["reward_spec"]["ground_truth"])
-
-    def _get_reward(self, action: str) -> float:
-        return compute_score(action, self.tests)
+        reward_model = (extras or {}).get("reward_model")
+        ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, Mapping) else None
+        try:
+            normalized = normalize_lcb_ground_truth(ground_truth) if isinstance(ground_truth, str) else None
+            tests = json.loads(normalized) if normalized is not None else None
+        except (TypeError, ValueError):
+            logger.exception("lcb: %s=%r; scoring 0.", _INVALID_GROUND_TRUTH_ERROR, ground_truth)
+            tests = None
+        self.tests = tests if isinstance(tests, list) and tests else None
+        if self.tests is None and not isinstance(ground_truth, str):
+            logger.error("lcb: %s=%r; scoring 0.", _INVALID_GROUND_TRUTH_ERROR, ground_truth)
 
     def step(self, action: str) -> BaseTextEnvStepOutput:
-        done = True
-        parsed_code, reward = compute_score(action, self.tests)
+        if self.tests is None:
+            return BaseTextEnvStepOutput(
+                observations=[],
+                reward=0.0,
+                done=True,
+                metadata={"parsed_code": None, "verifier_error": _INVALID_GROUND_TRUTH_ERROR},
+            )
+        parsed_code, reward = compute_score(action, self.tests, self.reward_mode)
 
         # RL on LCB w/ single-turn
-        return BaseTextEnvStepOutput(observations=[], reward=reward, done=done, metadata={"parsed_code": parsed_code})
+        return BaseTextEnvStepOutput(observations=[], reward=reward, done=True, metadata={"parsed_code": parsed_code})

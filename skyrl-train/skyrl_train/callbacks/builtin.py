@@ -18,43 +18,33 @@ Supports two configuration styles:
    ```
 """
 
+import asyncio
+import dataclasses
+import importlib
+import os
 from typing import Any, Dict, List, Optional, Type
 
 from loguru import logger
 from omegaconf import DictConfig
+import torch
 
-from skyrl_train.utils.data_tracker import DataConsumptionTracker
+from skyrl_train.config.callbacks import has_explicit_callbacks, interval_hf_export_enabled
+from skyrl_train.async_rollout_state import (
+    GeneratedOutputGroup,
+    GenerationAttempt,
+    GenerationBufferState,
+    GenerationQueuesProvider,
+)
+from skyrl_train.trajectory_runners.base import TrajectoryBatch
+from skyrl_train.json_serialization import to_jsonable
+from skyrl_train.utils.data_tracker import DataConsumptionState, DataConsumptionTracker
+from skyrl_train.utils.io import io
 
 from .base import TrainerCallback, TrainerState, TrainerControl, CallbackHandler
-
-
-def _hf_hub_online():
-    """Context manager: temporarily disable HF offline mode for a Hub network call.
-
-    ``HF_HUB_OFFLINE=1`` is commonly set so the model prestage reads a warm node-local cache, but it
-    makes ``create_repo`` / ``upload_folder`` raise ``offline mode is enabled``. huggingface_hub caches
-    the flag as a module constant at import time, so both the env var AND
-    ``huggingface_hub.constants.HF_HUB_OFFLINE`` must be cleared for the call, then restored.
-    """
-    import contextlib
-    import os
-
-    import huggingface_hub.constants as hc
-
-    @contextlib.contextmanager
-    def _cm():
-        prev_env = os.environ.pop("HF_HUB_OFFLINE", None)
-        prev_const = getattr(hc, "HF_HUB_OFFLINE", False)
-        hc.HF_HUB_OFFLINE = False
-        try:
-            yield
-        finally:
-            hc.HF_HUB_OFFLINE = prev_const
-            if prev_env is not None:
-                os.environ["HF_HUB_OFFLINE"] = prev_env
-
-    return _cm()
-
+from .types import (
+    CHECKPOINT_CALLBACK_TYPE,
+    HF_MODEL_SAVE_CALLBACK_TYPE,
+)
 
 # Registry mapping callback type names to classes
 # This enables YAML-based callback configuration
@@ -81,7 +71,7 @@ def register_callback(name: str):
     return decorator
 
 
-@register_callback("checkpoint")
+@register_callback(CHECKPOINT_CALLBACK_TYPE)
 class CheckpointCallback(TrainerCallback):
     """
     Callback for saving training checkpoints at regular intervals.
@@ -165,18 +155,17 @@ class EvaluationCallback(TrainerCallback):
         return control
 
 
-@register_callback("hf_model_save")
+@register_callback(HF_MODEL_SAVE_CALLBACK_TYPE)
 class HFModelSaveCallback(TrainerCallback):
     """
-    Callback for saving models in HuggingFace format at regular intervals.
+    Callback for requesting Hugging Face exports at regular intervals.
 
-    This replaces the inline `hf_save_interval` logic in the training loop.
-    HF format models can be loaded directly with transformers and pushed to
-    the HuggingFace Hub.
+    Normal training records a request beside the immutable sharded checkpoint;
+    a dedicated export job later converts and optionally publishes that checkpoint.
 
     Args:
-        save_steps: Save HF model every N steps. Set to -1 or 0 to disable.
-        save_on_train_end: Whether to save final HF model when training ends.
+        save_steps: Request an HF export every N steps. Set to -1 or 0 to disable.
+        save_on_train_end: Whether to request a final HF export when training ends.
     """
 
     def __init__(self, save_steps: int = -1, save_on_train_end: bool = True):
@@ -201,205 +190,6 @@ class HFModelSaveCallback(TrainerCallback):
     ) -> Optional[TrainerControl]:
         if self.save_on_train_end and self.save_steps > 0:
             control.should_save_hf_model = True
-        return control
-
-
-@register_callback("hf_hub_upload")
-class HFHubUploadCallback(TrainerCallback):
-    """
-    Callback for uploading HuggingFace format models to HuggingFace Hub.
-
-    This callback uploads models saved by HFModelSaveCallback to a HuggingFace Hub
-    repository. It runs asynchronously after the HF model save to avoid blocking
-    training.
-
-    The callback requires:
-    - HF_TOKEN environment variable or huggingface-cli login
-    - huggingface_hub package installed
-
-    Args:
-        repo_id: HuggingFace Hub repository ID (e.g., "username/model-name").
-            If None, uses HF_HUB_REPO_ID environment variable.
-        upload_steps: Upload every N steps. Should match hf_save_interval.
-            Set to -1 or 0 to disable periodic uploads.
-        upload_on_train_end: Whether to upload the final model when training ends.
-        private: Whether to create a private repository.
-        revision: Branch to upload to (default: "main").
-        upload_mode: "latest" (default) uploads each saved step to the repo ROOT,
-            overwriting the previous root weights so the repo is always
-            from_pretrained-able with zero per-step bloat. "all" additionally
-            archives each step under "{path_in_repo_prefix}/step_{N}/" while still
-            keeping the newest weights at root.
-        path_in_repo_prefix: Prefix for the per-step archive path used only in
-            "all" mode (default: "checkpoints"). Archives go to "{prefix}/step_{N}/".
-    """
-
-    def __init__(
-        self,
-        repo_id: Optional[str] = None,
-        upload_steps: int = -1,
-        upload_on_train_end: bool = True,
-        private: bool = False,
-        revision: str = "main",
-        upload_mode: str = "latest",
-        path_in_repo_prefix: str = "checkpoints",
-    ):
-        import os
-
-        self.repo_id = repo_id or os.environ.get("HF_HUB_REPO_ID")
-        self.upload_steps = upload_steps
-        self.upload_on_train_end = upload_on_train_end
-        self.private = private
-        self.revision = revision
-        self.upload_mode = upload_mode
-        self.path_in_repo_prefix = path_in_repo_prefix
-        self._pending_uploads: List[int] = []  # Steps that need uploading
-        self._export_path: Optional[str] = None
-        self._api = None
-
-    def _get_api(self):
-        """Lazy-load HuggingFace Hub API."""
-        if self._api is None:
-            try:
-                from huggingface_hub import HfApi
-
-                self._api = HfApi()
-            except ImportError:
-                logger.error("huggingface_hub not installed. Run: pip install huggingface_hub")
-                raise
-        return self._api
-
-    def _ensure_repo_exists(self) -> bool:
-        """Ensure the HuggingFace Hub repository exists, creating if needed."""
-        if not self.repo_id:
-            logger.warning("HFHubUploadCallback: No repo_id configured, skipping upload")
-            return False
-
-        try:
-            api = self._get_api()
-            with _hf_hub_online():
-                api.create_repo(
-                    repo_id=self.repo_id,
-                    repo_type="model",
-                    private=self.private,
-                    exist_ok=True,
-                )
-            return True
-        except Exception as e:
-            logger.error(f"HFHubUploadCallback: Failed to create/access repo {self.repo_id}: {e}")
-            return False
-
-    def on_train_begin(
-        self,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs,
-    ) -> Optional[TrainerControl]:
-        """Store export_path from trainer config at training start."""
-        trainer = kwargs.get("trainer")
-        if trainer is not None and hasattr(trainer, "cfg"):
-            self._export_path = getattr(trainer.cfg.trainer, "export_path", None)
-            logger.info(
-                f"HFHubUploadCallback initialized: repo={self.repo_id}, "
-                f"upload_steps={self.upload_steps}, export_path={self._export_path}"
-            )
-        return control
-
-    def on_step_end(
-        self,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs,
-    ) -> Optional[TrainerControl]:
-        """Queue upload after HF model save steps."""
-        if self.upload_steps > 0 and state.global_step % self.upload_steps == 0:
-            self._pending_uploads.append(state.global_step)
-        return control
-
-    def on_train_end(
-        self,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs,
-    ) -> Optional[TrainerControl]:
-        """Upload final model and process any pending uploads."""
-        if self.upload_on_train_end and self.upload_steps > 0:
-            # Add final step if not already pending
-            if state.global_step not in self._pending_uploads:
-                self._pending_uploads.append(state.global_step)
-
-        # Process all pending uploads
-        self._process_pending_uploads()
-        return control
-
-    def _process_pending_uploads(self) -> None:
-        """Process all pending uploads."""
-        if not self._pending_uploads:
-            return
-
-        if not self._export_path:
-            logger.warning("HFHubUploadCallback: No export_path configured, skipping uploads")
-            return
-
-        if not self._ensure_repo_exists():
-            return
-
-        from pathlib import Path
-
-        api = self._get_api()
-
-        for step in self._pending_uploads:
-            model_path = Path(self._export_path) / f"global_step_{step}" / "policy"
-
-            if not model_path.exists():
-                logger.warning(f"HFHubUploadCallback: Model path not found: {model_path}")
-                continue
-
-            # Always upload the step to the repo ROOT (path_in_repo="" => repo root in
-            # huggingface_hub), overwriting prior root weights. Whichever step uploads
-            # last naturally wins root, keeping the repo from_pretrained-able. In "all"
-            # mode we additionally archive each step under "{prefix}/step_{N}/".
-            upload_targets = [("", f"Upload checkpoint at step {step} (root)")]
-            if self.upload_mode == "all":
-                archive_path = f"{self.path_in_repo_prefix}/step_{step}"
-                upload_targets.append((archive_path, f"Archive checkpoint at step {step}"))
-
-            for path_in_repo, commit_message in upload_targets:
-                dest = f"{self.repo_id}/{path_in_repo}" if path_in_repo else f"{self.repo_id} (root)"
-                try:
-                    logger.info(f"HFHubUploadCallback: Uploading {model_path} to {dest}")
-                    with _hf_hub_online():
-                        api.upload_folder(
-                            folder_path=str(model_path),
-                            repo_id=self.repo_id,
-                            path_in_repo=path_in_repo,
-                            repo_type="model",
-                            revision=self.revision,
-                            commit_message=commit_message,
-                        )
-                    logger.info(f"HFHubUploadCallback: Successfully uploaded step {step} to {dest}")
-                except Exception as e:
-                    logger.error(f"HFHubUploadCallback: Failed to upload step {step} to {dest}: {e}")
-
-        self._pending_uploads.clear()
-
-    async def on_train_end_async(
-        self,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs,
-    ) -> Optional[TrainerControl]:
-        """Async version - uploads in background to not block training end."""
-        import asyncio
-
-        if self.upload_on_train_end and self.upload_steps > 0:
-            if state.global_step not in self._pending_uploads:
-                self._pending_uploads.append(state.global_step)
-
-        # Run uploads in thread pool to not block
-        if self._pending_uploads:
-            await asyncio.to_thread(self._process_pending_uploads)
-
         return control
 
 
@@ -441,7 +231,6 @@ class DatabaseRegistrationCallback(TrainerCallback):
         **kwargs,
     ) -> Optional[TrainerControl]:
         """Record training start time and load Supabase credentials."""
-        import os
         from datetime import datetime, timezone
 
         # Only register from rank 0
@@ -493,7 +282,6 @@ class DatabaseRegistrationCallback(TrainerCallback):
         if not self.enabled or not self._supabase_ready:
             return control
 
-        import os
         from datetime import datetime, timezone
 
         try:
@@ -548,21 +336,9 @@ class DatabaseRegistrationCallback(TrainerCallback):
         except Exception:
             pass
 
-        # Build training parameters (serialize config)
-        def _to_jsonable(obj):
-            """Convert OmegaConf to JSON-serializable dict."""
-            if hasattr(obj, "items"):
-                return {k: _to_jsonable(v) for k, v in obj.items()}
-            elif isinstance(obj, (list, tuple)):
-                return [_to_jsonable(v) for v in obj]
-            elif isinstance(obj, (int, float, str, bool, type(None))):
-                return obj
-            else:
-                return str(obj)
-
         training_params = {
-            "trainer": _to_jsonable(cfg.trainer) if hasattr(cfg, "trainer") else {},
-            "generator": _to_jsonable(cfg.generator) if hasattr(cfg, "generator") else {},
+            "trainer": to_jsonable(cfg.trainer) if hasattr(cfg, "trainer") else {},
+            "generator": to_jsonable(cfg.generator) if hasattr(cfg, "generator") else {},
             "algorithm": str(getattr(cfg.trainer.algorithm, "advantage_estimator", "unknown")),
         }
 
@@ -696,6 +472,89 @@ class LoggingCallback(TrainerCallback):
         if self.log_every_step:
             control.should_log = True
         return control
+
+
+class PreflightGateError(Exception):
+    """Raised when the pre-flight reward gate fails with on_failure='abort'."""
+
+
+@register_callback("preflight_gate")
+class PreflightGateCallback(TrainerCallback):
+    """Pre-flight reward gate: abort training when the reward distribution is
+    outside the band where RLOO has usable within-group variance.
+
+    DEFAULT-OFF. When enabled, checks mean per-sample reward after the first
+    training step's rollouts are scored (before the second step).  On failure
+    with ``on_failure="abort"`` raises ``PreflightGateError``; with
+    ``on_failure="warn"`` logs and continues.
+    """
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        min_reward: float = 0.25,
+        max_reward: float = 0.75,
+        on_failure: str = "abort",
+        num_trials: int = 256,
+    ):
+        self.enabled = enabled
+        self.min_reward = min_reward
+        self.max_reward = max_reward
+        self.on_failure = on_failure
+        self.num_trials = num_trials
+        self._checked = False
+
+    def on_step_end(
+        self,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> Optional[TrainerControl]:
+        if self._checked or not self.enabled:
+            return control
+        self._checked = True
+
+        trainer = kwargs.get("trainer")
+        if trainer is None:
+            return control
+
+        rewards = self._extract_step_rewards(trainer)
+        if not rewards:
+            # An enabled gate that quietly does nothing is the failure this whole
+            # mechanism exists to prevent, so say so at error level rather than
+            # letting the run proceed looking gated.
+            logger.error(
+                "[preflight] Gate is ENABLED but step 1 exposed no per-sample rewards, "
+                "so nothing was checked and this run is UNGATED. Expected the trainer to "
+                "set _current_step_rewards during reward post-processing."
+            )
+            return control
+
+        if len(rewards) < self.num_trials:
+            # Not a failure: the sample count is set by train_batch_size x
+            # n_samples_per_prompt, not by the dataset. Report it so a verdict drawn
+            # from a thin sample is not read as a firm one.
+            logger.warning(
+                f"[preflight] Checking {len(rewards)} samples, fewer than the requested "
+                f"num_trials={self.num_trials}; the estimate is correspondingly noisier."
+            )
+
+        from skyrl_train.utils.preflight_gate import check_preflight_gate
+
+        result = check_preflight_gate(rewards, self.min_reward, self.max_reward)
+        if not result.passed and self.on_failure == "abort":
+            raise PreflightGateError(result.message)
+
+        return control
+
+    @staticmethod
+    def _extract_step_rewards(trainer) -> List[float]:
+        """Extract per-sample scalar rewards from the trainer's current batch."""
+        for attr in ("_current_step_rewards", "step_rewards"):
+            val = getattr(trainer, attr, None)
+            if val is not None:
+                return [float(r) for r in val]
+        return []
 
 
 @register_callback("vllm_stats")
@@ -980,8 +839,7 @@ def create_default_callbacks(cfg: DictConfig) -> List[TrainerCallback]:
         List of configured callbacks
     """
     # Check for new-style explicit callback configuration
-    callbacks_config = getattr(cfg.trainer, "callbacks", None)
-    if callbacks_config is not None and len(callbacks_config) > 0:
+    if has_explicit_callbacks(cfg):
         logger.info("Using explicit callback configuration from YAML")
         callbacks = create_callbacks_from_config(cfg)
         # Always add logging callback if not explicitly configured
@@ -1011,26 +869,8 @@ def create_default_callbacks(cfg: DictConfig) -> List[TrainerCallback]:
         )
 
     # HF model save callback
-    hf_save_interval = getattr(cfg.trainer, "hf_save_interval", -1)
-    if hf_save_interval > 0:
-        callbacks.append(HFModelSaveCallback(save_steps=hf_save_interval))
-
-    # HF Hub upload callback (uploads saved HF models to HuggingFace Hub)
-    hf_hub_repo_id = getattr(cfg.trainer, "hf_hub_repo_id", None)
-    if hf_hub_repo_id and hf_save_interval > 0:
-        hf_hub_private = getattr(cfg.trainer, "hf_hub_private", False)
-        hf_hub_revision = getattr(cfg.trainer, "hf_hub_revision", "main")
-        hf_upload_mode = getattr(cfg.trainer, "hf_upload_mode", "latest")
-        callbacks.append(
-            HFHubUploadCallback(
-                repo_id=hf_hub_repo_id,
-                upload_steps=hf_save_interval,
-                upload_on_train_end=True,
-                private=hf_hub_private,
-                revision=hf_hub_revision,
-                upload_mode=hf_upload_mode,
-            )
-        )
+    if interval_hf_export_enabled(cfg):
+        callbacks.append(HFModelSaveCallback(save_steps=int(cfg.trainer.hf_save_interval)))
 
     # Reference model update callback
     update_ref_every_epoch = getattr(cfg.trainer, "update_ref_every_epoch", False)
@@ -1048,6 +888,20 @@ def create_default_callbacks(cfg: DictConfig) -> List[TrainerCallback]:
             if harbor:
                 agent_name = getattr(harbor, "name", None)
         callbacks.append(DatabaseRegistrationCallback(agent_name=agent_name))
+
+    # Pre-flight reward gate (default-off)
+    gate_cfg = getattr(cfg.trainer, "preflight_gate", None)
+    gate_enabled = getattr(gate_cfg, "enabled", False) if gate_cfg else False
+    if gate_enabled:
+        callbacks.append(
+            PreflightGateCallback(
+                enabled=True,
+                min_reward=getattr(gate_cfg, "min_reward", 0.25),
+                max_reward=getattr(gate_cfg, "max_reward", 0.75),
+                on_failure=getattr(gate_cfg, "on_failure", "abort"),
+                num_trials=getattr(gate_cfg, "num_trials", 256),
+            )
+        )
 
     # vLLM stats callback (enabled when using vLLM backend)
     # This collects engine stats directly, bypassing unreliable Ray log-to-driver
@@ -1138,12 +992,17 @@ def create_callback_from_config(callback_config: Dict[str, Any]) -> TrainerCallb
         raise ValueError(f"Callback config missing 'type' key: {callback_config}")
 
     callback_type = callback_config["type"]
-    if callback_type not in CALLBACK_REGISTRY:
+    if ":" in callback_type:
+        # An experiment-owned callback: "package.module:ClassName", the same
+        # form the Harbor agent_import_path uses.
+        module_name, _, class_name = callback_type.partition(":")
+        callback_cls = getattr(importlib.import_module(module_name), class_name)
+    elif callback_type in CALLBACK_REGISTRY:
+        callback_cls = CALLBACK_REGISTRY[callback_type]
+    else:
         available = ", ".join(CALLBACK_REGISTRY.keys())
         raise ValueError(f"Unknown callback type '{callback_type}'. Available types: {available}")
 
-    # Get the callback class and instantiate with remaining params
-    callback_cls = CALLBACK_REGISTRY[callback_type]
     params = {k: v for k, v in callback_config.items() if k != "type"}
 
     try:
@@ -1230,13 +1089,6 @@ class DataTrackingCallback(TrainerCallback):
         control: TrainerControl,
         **kwargs,
     ) -> Optional[TrainerControl]:
-        import dataclasses
-        import os
-
-        import torch
-
-        from skyrl_train.utils.io import io
-
         trainer = kwargs.get("trainer")
         if trainer is None:
             logger.warning("DataTrackingCallback.on_save: no trainer in kwargs, skipping")
@@ -1279,12 +1131,6 @@ class DataTrackingCallback(TrainerCallback):
 
         Returns True if state was loaded, False if no artifact found.
         """
-        import os
-
-        import torch
-
-        from skyrl_train.utils.data_tracker import DataConsumptionState
-        from skyrl_train.utils.io import io
 
         # Try new format first
         artifact_path = os.path.join(ckpt_path, DataTrackingCallback.ARTIFACT_NAME)
@@ -1324,109 +1170,91 @@ class DataTrackingCallback(TrainerCallback):
 
 
 class BufferCheckpointCallback(TrainerCallback):
-    """Best-effort save/restore of the async generation buffer at checkpoint time.
+    """Persist async completed groups and retry prompts with each checkpoint.
 
-    Saves all pending GeneratedOutputGroup items from the asyncio.Queue so that
-    on resume the buffer can be restored without re-generating from scratch.
+    Saves completed output groups and stale-group retry prompts so resume preserves
+    every dataset row still needed by the current epoch.
     """
 
     ARTIFACT_NAME = "generation_buffer_state.pt"
-    error_behavior = "warn"
+    error_behavior = "raise"
 
-    def on_save(
+    def __init__(self) -> None:
+        self._queues: Optional[GenerationQueuesProvider] = None
+
+    def bind_queues(self, queues: GenerationQueuesProvider) -> None:
+        """Select the current epoch's queues for checkpoint persistence."""
+        self._queues = queues
+
+    async def on_save_async(
         self,
         state: TrainerState,
         control: TrainerControl,
         **kwargs,
     ) -> Optional[TrainerControl]:
-        import os
-
-        import torch
-
-        from skyrl_train.utils.io import io
-
         trainer = kwargs.get("trainer")
         if trainer is None:
-            logger.warning("BufferCheckpointCallback.on_save: no trainer in kwargs, skipping")
+            raise RuntimeError("BufferCheckpointCallback requires trainer context during checkpoint save")
+
+        if self._queues is None:
+            raise RuntimeError("BufferCheckpointCallback queues were not bound before checkpoint save")
+        # This method does not yield before snapshotting, so generation tasks cannot
+        # interleave with the drain-and-restore operation.
+        buffer_state = self._queues.snapshot()
+        items = buffer_state.completed_groups
+        retry_prompts = buffer_state.retry_prompts
+        if not items and not retry_prompts:
             return control
 
-        buf = getattr(trainer, "_generation_output_group_buffer", None)
-        if buf is None:
-            return control
+        serialized = [
+            {
+                "trajectory_batch": dict(item.trajectory_batch),
+                "uid": item.uid,
+                "earliest_model_step": item.earliest_model_step,
+                "source_prompts": item.source_prompts,
+                "generation_attempt": dataclasses.asdict(item.generation_attempt),
+            }
+            for item in items
+        ]
+        ckpt_path = os.path.join(
+            trainer.cfg.trainer.ckpt_path,
+            f"global_step_{state.global_step}",
+        )
+        artifact_path = os.path.join(ckpt_path, self.ARTIFACT_NAME)
 
-        try:
-            # Drain-and-restore: non-destructive snapshot of the queue.
-            # Safe because on_save runs synchronously within the event loop —
-            # no generation worker can interleave between drain and restore.
-            items = []
-            while not buf.empty():
-                try:
-                    items.append(buf.get_nowait())
-                except Exception:
-                    break
-            # Put them all back
-            for item in items:
-                buf.put_nowait(item)
-
-            if not items:
-                return control
-
-            serialized = []
-            for item in items:
-                serialized.append(
-                    {
-                        "generator_output": dict(item.generator_output),
-                        "uid": item.uid,
-                        "global_step_when_scheduled": item.global_step_when_scheduled,
-                    }
-                )
-
-            ckpt_path = os.path.join(
-                trainer.cfg.trainer.ckpt_path,
-                f"global_step_{state.global_step}",
-            )
-            artifact_path = os.path.join(ckpt_path, self.ARTIFACT_NAME)
+        def save_state() -> None:
             with io.open_file(artifact_path, "wb") as f:
-                torch.save(serialized, f)
-            logger.info(f"Saved {len(serialized)} generation buffer items to {artifact_path}")
-        except Exception as e:
-            logger.warning(f"BufferCheckpointCallback.on_save failed (best-effort): {e}")
+                torch.save({"completed_groups": serialized, "retry_prompts": retry_prompts}, f)
+
+        await asyncio.to_thread(save_state)
+        logger.info(
+            f"Saved {len(serialized)} completed generation groups and {len(retry_prompts)} pending retries "
+            f"to {artifact_path}"
+        )
 
         return control
 
     @staticmethod
-    def load_buffer_items(ckpt_path: str):
-        """Load buffer items from a checkpoint directory.
-
-        Returns a list of GeneratedOutputGroup, or empty list if no file found.
-        """
-        import os
-
-        import torch
-
-        from skyrl_train.fully_async_trainer import GeneratedOutputGroup
-        from skyrl_train.generators.base import GeneratorOutput
-        from skyrl_train.utils.io import io
+    def load_buffer_state(ckpt_path: str) -> GenerationBufferState:
+        """Load completed output groups and retry prompts from a checkpoint."""
 
         artifact_path = os.path.join(ckpt_path, BufferCheckpointCallback.ARTIFACT_NAME)
         if not io.exists(artifact_path):
-            return []
+            return GenerationBufferState(completed_groups=[], retry_prompts=[])
 
-        try:
-            with io.open_file(artifact_path, "rb") as f:
-                serialized = torch.load(f, map_location="cpu", weights_only=False)
+        with io.open_file(artifact_path, "rb") as f:
+            state = torch.load(f, map_location="cpu", weights_only=False)
 
-            items = []
-            for entry in serialized:
-                gen_out: GeneratorOutput = entry["generator_output"]
-                items.append(
-                    GeneratedOutputGroup(
-                        generator_output=gen_out,
-                        uid=entry["uid"],
-                        global_step_when_scheduled=entry["global_step_when_scheduled"],
-                    )
+        items = []
+        for entry in state["completed_groups"]:
+            trajectory_batch: TrajectoryBatch = entry["trajectory_batch"]
+            items.append(
+                GeneratedOutputGroup(
+                    trajectory_batch=trajectory_batch,
+                    uid=entry["uid"],
+                    earliest_model_step=entry["earliest_model_step"],
+                    source_prompts=entry["source_prompts"],
+                    generation_attempt=GenerationAttempt(**entry["generation_attempt"]),
                 )
-            return items
-        except Exception as e:
-            logger.warning(f"BufferCheckpointCallback.load_buffer_items failed: {e}")
-            return []
+            )
+        return GenerationBufferState(completed_groups=items, retry_prompts=state["retry_prompts"])

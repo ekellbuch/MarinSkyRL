@@ -16,7 +16,7 @@ must:
 See notes/RL/skyrl/fsdp2_context_parallel_stages/{README,stage0_config_scaffold_scope}.md.
 
 Run:
-    uv run --isolated --extra dev pytest tests/cpu/distributed/test_cp_config.py -v
+    uv run --isolated --group dev --extra cpu pytest tests/cpu/distributed/test_cp_config.py -v
 """
 
 from pathlib import Path
@@ -25,9 +25,10 @@ import pytest
 from omegaconf import OmegaConf
 
 from skyrl_train.config.utils import get_default_config
+from tests.cpu.fsdp_config_assertions import TRAINER_MODEL_ROLES, assert_role_fsdp_defaults
 
 # The baseline snapshots `get_default_config()` without the intentionally additive
-# CP, grouped-mm, attention-backend, and DCP fields. Keeping the remaining defaults
+# CP, grouped-mm, debug-mode, attention-backend, model-source, and DCP fields. Keeping the remaining defaults
 # current makes this a CP no-op regression test rather than a stale whole-config lock.
 # `resolve=False` preserves interpolations, so the comparison is HOME-/env-independent.
 GOLDEN = Path(__file__).parent.parent / "data" / "ppo_base_pre_cp.yaml"
@@ -43,13 +44,76 @@ CP_FIELDS = {
 # behavior (G1).
 STAGE2_TRAINER_FIELDS = {
     "attn_backend": "auto",
+    # preflight_gate is a default-off reward gate unrelated to CP; stripped here
+    # because it is additive and must not appear in the pre-CP golden diff.
+    "preflight_gate": {
+        "enabled": False,
+        "min_reward": 0.25,
+        "max_reward": 0.75,
+        "num_trials": 256,
+        "on_failure": "abort",
+    },
+    # token_stats is a default-off per-token diagnostics switch unrelated to CP;
+    # additive like preflight_gate, so it is stripped before the golden diff.
+    "token_stats": {"enabled": False},
 }
-# Additive generator key from the vLLM DCP port Stage 0 (flag-off no-op, default == 1).
-# Like the CP fields, it is purely additive and must be stripped before the structural
-# -identity comparison against the pre-CP golden (it is unrelated to CP — DCP is the
-# rollout-side decode KV-cache shard).
-STAGE0_DCP_GENERATOR_FIELDS = {
+DEBUG_MODE_TRAINER_FIELDS = {
+    "debug_mode": "off",
+}
+RUNTIME_CONFIG_TRAINER_FIELDS = {
+    "collective_phase_diagnostics": False,
+    "distributed": {
+        "placement_group_timeout_seconds": 180,
+        "worker_collective_timeout_seconds": 1800,
+    },
+    "model_load_retry": {
+        "max_retries": 5,
+        "backoff_base_seconds": 2.0,
+        "backoff_cap_seconds": 32.0,
+    },
+    "progress": {
+        "mode": "auto",
+        "min_interval_seconds": 0.5,
+        "heartbeat_seconds": 15.0,
+        "percent_step": 5.0,
+        "count_step": 1000,
+    },
+}
+ADDITIVE_ALGORITHM_FIELDS = {
+    "batch_invariant": False,
+    "dppo_divergence_threshold": 0.1,
+    "dppo_divergence_type": "tv",
+}
+ADDITIVE_DYNAMIC_SAMPLING_FIELDS = {
+    "informative_on": "shaped",
+    "min_reward_std": 0.0,
+}
+ADDITIVE_OVERLONG_FIELDS = {
+    "penalty_scale": 1.0,
+}
+# Additive generator keys with behavior-preserving disabled defaults. Like the CP
+# fields, they are stripped before comparison with the pre-CP golden.
+ADDITIVE_GENERATOR_FIELDS = {
     "inference_engine_decode_context_parallel_size": 1,
+    "vllm_attention_backend": None,
+    "engine_init_timeout_seconds": 1800,
+    "r3_transport": "decentral",
+    "r3_dispatch_put_timeout_seconds": 600,
+    "coordinator_executor_workers": 256,
+    "gdn_backend": "torch",
+}
+ADDITIVE_TEACHER_FIELDS = {
+    "engine_init_timeout_seconds": "${generator.engine_init_timeout_seconds}",
+}
+ADDITIVE_POLICY_MODEL_FIELDS = {
+    "lm_head_compute_dtype": None,
+    "logprob_chunk_size": None,
+    "source_uri": None,
+    "source_identity": None,
+}
+ADDITIVE_POLICY_FIELDS = {
+    "grug_query_bias_interpolation_weight": None,
+    "grug_query_bias_update_rate": None,
 }
 # Additive MoE fsdp_config key (runtime grouped-mm MoE swap). Flag-off no-op
 # (default == False) and unrelated to CP; it landed after the pre-CP golden was
@@ -58,18 +122,18 @@ STAGE0_DCP_GENERATOR_FIELDS = {
 MOE_FSDP_FIELDS = {
     "use_grouped_mm": False,
 }
-ROLES = ("policy", "ref", "critic")
+EXPERT_LOADER_FIELDS = {
+    "expert_loader_chunk_rows": 8,
+}
+ADDITIVE_TRAINING_OPTIMIZER_FIELDS = {
+    "fsdp_parameter_storage_dtype": None,
+}
 
 
 # ----------------------------------------------------------------------------- G0
 def test_cp_fields_parse_with_defaults():
     """All three CP keys present, with disabled defaults, in every role's fsdp_config."""
-    cfg = get_default_config()
-    for role in ROLES:
-        fsdp = cfg.trainer[role].fsdp_config
-        for k, v in CP_FIELDS.items():
-            assert k in fsdp, f"trainer.{role}.fsdp_config missing {k}"
-            assert fsdp[k] == v, f"trainer.{role}.fsdp_config.{k}={fsdp[k]!r}, expected {v!r}"
+    assert_role_fsdp_defaults(get_default_config(), CP_FIELDS)
 
 
 def test_default_config_validates_noop():
@@ -93,39 +157,60 @@ def test_all_defaults_is_structurally_identical_to_baseline():
     Proves the default (production) path is byte-identical post-change.
     """
     container = OmegaConf.to_container(get_default_config(), resolve=False, throw_on_missing=False)
-    for role in ROLES:
+    for role in TRAINER_MODEL_ROLES:
         fsdp = container["trainer"][role]["fsdp_config"]
-        for k in (*CP_FIELDS, *MOE_FSDP_FIELDS):  # strip the additive keys -> should reproduce pre-CP shape
+        for k in (*CP_FIELDS, *MOE_FSDP_FIELDS, *EXPERT_LOADER_FIELDS):
             fsdp.pop(k, None)
-    for k in STAGE2_TRAINER_FIELDS:  # strip Stage-2 additive top-level trainer keys
+    for role in ("policy", "critic"):
+        optimizer = container["trainer"][role]["optimizer_config"]
+        for k in ADDITIVE_TRAINING_OPTIMIZER_FIELDS:
+            optimizer.pop(k, None)
+    for k in (*STAGE2_TRAINER_FIELDS, *DEBUG_MODE_TRAINER_FIELDS, *RUNTIME_CONFIG_TRAINER_FIELDS):
         container["trainer"].pop(k, None)
-    for k in STAGE0_DCP_GENERATOR_FIELDS:  # strip DCP Stage-0 additive generator key
+    for k in ADDITIVE_ALGORITHM_FIELDS:
+        container["trainer"]["algorithm"].pop(k, None)
+    for k in ADDITIVE_DYNAMIC_SAMPLING_FIELDS:
+        container["trainer"]["algorithm"]["dynamic_sampling"].pop(k, None)
+    for k in ADDITIVE_GENERATOR_FIELDS:
         container["generator"].pop(k, None)
+    for k in ADDITIVE_TEACHER_FIELDS:
+        container["teacher"].pop(k, None)
+    for k in ADDITIVE_POLICY_MODEL_FIELDS:
+        container["trainer"]["policy"]["model"].pop(k, None)
+    for k in ADDITIVE_POLICY_FIELDS:
+        container["trainer"]["policy"].pop(k, None)
+    for k in ADDITIVE_OVERLONG_FIELDS:
+        container["generator"]["trajectory_reward_shaping"]["overlong"].pop(k, None)
+    container["trainer"]["placement"].pop("enable_numa_affinity", None)
+    container["trainer"]["policy"].pop("host_memory_monitor", None)
+    container["trainer"]["algorithm"].pop("tis_splice", None)
+    container["trainer"]["algorithm"].pop("tis_lcs_alert_threshold", None)
     golden = OmegaConf.to_container(OmegaConf.load(GOLDEN), resolve=False, throw_on_missing=False)
     assert container == golden, "default config drifted from the no-CP baseline"
 
 
 def test_diff_is_exactly_the_additive_fsdp_keys_x_three_roles():
-    """The fsdp_config delta vs the golden is EXACTLY the additive keys (3 CP + grouped-mm) per role."""
+    """The fsdp_config delta contains only the CP, grouped-mm, and expert-loader fields."""
     current = OmegaConf.to_container(get_default_config(), resolve=False, throw_on_missing=False)
     golden = OmegaConf.to_container(OmegaConf.load(GOLDEN), resolve=False, throw_on_missing=False)
-    expected_added = set(CP_FIELDS) | set(MOE_FSDP_FIELDS)
-    for role in ROLES:
+    expected_added = set(CP_FIELDS) | set(MOE_FSDP_FIELDS) | set(EXPERT_LOADER_FIELDS)
+    for role in TRAINER_MODEL_ROLES:
         cur_fsdp = current["trainer"][role]["fsdp_config"]
         gold_fsdp = golden["trainer"][role]["fsdp_config"]
         added = set(cur_fsdp) - set(gold_fsdp)
         assert added == expected_added, (
             f"trainer.{role}.fsdp_config added keys {sorted(added)}, expected {sorted(expected_added)}"
         )
-        # And the added keys carry the disabled defaults.
+        # The CP and grouped-mm keys carry their disabled defaults.
         for k, v in {**CP_FIELDS, **MOE_FSDP_FIELDS}.items():
             assert cur_fsdp[k] == v
-    # The only new top-level trainer keys are the Stage-2 additive ones (attn_backend).
+    # Only explicitly additive top-level trainer keys may differ from the golden.
     added_trainer = set(current["trainer"]) - set(golden["trainer"])
-    assert added_trainer == set(STAGE2_TRAINER_FIELDS), (
-        f"trainer added top-level keys {sorted(added_trainer)}, expected {sorted(STAGE2_TRAINER_FIELDS)}"
+    expected_trainer_fields = STAGE2_TRAINER_FIELDS | DEBUG_MODE_TRAINER_FIELDS | RUNTIME_CONFIG_TRAINER_FIELDS
+    assert added_trainer == set(expected_trainer_fields), (
+        f"trainer added top-level keys {sorted(added_trainer)}, expected {sorted(expected_trainer_fields)}"
     )
-    for k, v in STAGE2_TRAINER_FIELDS.items():
+    for k, v in expected_trainer_fields.items():
         assert current["trainer"][k] == v
 
 
@@ -140,7 +225,7 @@ def _cp_enabled_config(role: str = "policy", cp_size: int = 2):
     cfg.trainer.strategy = "fsdp2"
     cfg.trainer.use_sample_packing = False
     # Give every role a world size divisible by cp_size (default 4 gpus/node already is).
-    for r in ROLES:
+    for r in TRAINER_MODEL_ROLES:
         cfg.trainer[r].sequence_parallel_size = 1
     cfg.trainer[role].fsdp_config.context_parallel_size = cp_size
     cfg.trainer[role].fsdp_config.cp_style = "ring_sdpa"
@@ -223,7 +308,7 @@ def test_cp_rejects_indivisible_world_size():
         _validate_cp_cfg(cfg)
 
 
-@pytest.mark.parametrize("role", ROLES)
+@pytest.mark.parametrize("role", TRAINER_MODEL_ROLES)
 def test_cp_mutual_exclusion_enforced_per_role(role):
     """The Ulysses mutual-exclusion assert fires for each role independently."""
     pytest.importorskip("hydra")

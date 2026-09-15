@@ -17,6 +17,8 @@ from decimal import Decimal
 import time
 
 import multiprocessing
+from collections.abc import Mapping
+from typing import Any, NotRequired, TypedDict
 
 
 BASE_IMPORTS = """from itertools import accumulate, chain, combinations, count, permutations, product, groupby, islice, repeat
@@ -75,6 +77,123 @@ def truncatefn(s, length=300):
 class CODE_TYPE(Enum):
     call_based = 0
     standard_input = 1
+
+
+class TestExecutionMode(Enum):
+    collect_all = 0
+    stop_on_failure = 1
+
+
+STDIN_TEST_TYPE = "stdin"
+FUNCTIONAL_TEST_TYPE = "functional"
+FUNCTION_NAME_KEY = "func_name"
+BINARY_REWARD_MODE = "binary"
+FRACTIONAL_REWARD_MODE = "fractional"
+LCB_REWARD_MODES = frozenset({BINARY_REWARD_MODE, FRACTIONAL_REWARD_MODE})
+CodeGroundTruth = str | Mapping[str, Any] | list[Mapping[str, Any]]
+ParsedCodeGroundTruth = Mapping[str, Any] | list[Any] | str | int | float | bool | None
+_STDIN_SOURCE_TEST_TYPES = {STDIN_TEST_TYPE, "stdin_stdout"}
+_FUNCTIONAL_SOURCE_TEST_TYPES = {FUNCTIONAL_TEST_TYPE, "call_based"}
+_SOURCE_FUNCTION_NAME_KEY = "fn_name"
+
+
+class CanonicalCodeCase(TypedDict):
+    input: str
+    output: str
+    testtype: str
+    metadata: NotRequired[dict[str, str]]
+
+
+def _parse_code_ground_truth(ground_truth: CodeGroundTruth) -> ParsedCodeGroundTruth:
+    if not isinstance(ground_truth, str):
+        return ground_truth
+    try:
+        return json.loads(ground_truth)
+    except json.JSONDecodeError as exc:
+        raise ValueError("LCB ground_truth must be valid JSON.") from exc
+
+
+def _canonical_code_case(case: Mapping[str, Any]) -> CanonicalCodeCase:
+    test_input = case.get("input")
+    expected_output = case.get("output")
+    test_type = case.get("testtype", case.get("type"))
+    if test_type in _STDIN_SOURCE_TEST_TYPES:
+        if not isinstance(test_input, str) or not isinstance(expected_output, str):
+            raise TypeError("Standard-input LCB test-case input and output must be strings.")
+        return {"input": test_input, "output": expected_output, "testtype": STDIN_TEST_TYPE}
+    if test_type in _FUNCTIONAL_SOURCE_TEST_TYPES:
+        function_name = case.get(_SOURCE_FUNCTION_NAME_KEY)
+        metadata = case.get("metadata")
+        if function_name is None and isinstance(metadata, Mapping):
+            function_name = metadata.get(FUNCTION_NAME_KEY)
+        if not isinstance(function_name, str) or not function_name:
+            raise ValueError("Functional LCB test cases require a function name.")
+        if isinstance(test_input, list):
+            test_input = "\n".join(json.dumps(argument) for argument in test_input)
+        elif not isinstance(test_input, str):
+            raise TypeError("Functional LCB test-case input must be a list of arguments or an encoded string.")
+        if not isinstance(expected_output, str):
+            expected_output = json.dumps(expected_output)
+        return {
+            "input": test_input,
+            "output": expected_output,
+            "testtype": FUNCTIONAL_TEST_TYPE,
+            "metadata": {FUNCTION_NAME_KEY: function_name},
+        }
+    raise ValueError(f"Unsupported LCB test-case type: {test_type!r}.")
+
+
+def _canonical_apps_cases(ground_truth: Mapping[str, Any]) -> list[CanonicalCodeCase]:
+    inputs = ground_truth.get("inputs")
+    outputs = ground_truth.get("outputs")
+    if not isinstance(inputs, list) or not isinstance(outputs, list):
+        raise TypeError("APPS ground_truth requires input and output lists.")
+    if not inputs or len(inputs) != len(outputs):
+        raise ValueError("APPS ground_truth requires equally sized, non-empty input and output lists.")
+    function_name = ground_truth.get(_SOURCE_FUNCTION_NAME_KEY)
+    test_type = FUNCTIONAL_TEST_TYPE if function_name is not None else STDIN_TEST_TYPE
+    return [
+        _canonical_code_case(
+            {
+                "input": test_input,
+                "output": expected_output,
+                "testtype": test_type,
+                _SOURCE_FUNCTION_NAME_KEY: function_name,
+            }
+        )
+        for test_input, expected_output in zip(inputs, outputs)
+    ]
+
+
+def normalize_lcb_ground_truth(ground_truth: CodeGroundTruth) -> str:
+    """Return a canonical JSON-encoded LCB case list.
+
+    Accepts canonical case lists, APPS ``inputs``/``outputs`` mappings, and open-r1
+    ``test_cases`` mappings, either directly or as JSON text. All cases must use one
+    execution mode and, for functional tests, one function name.
+    """
+    parsed = _parse_code_ground_truth(ground_truth)
+    if isinstance(parsed, Mapping) and "test_cases" in parsed:
+        if parsed.get("language") not in {None, "python"}:
+            raise ValueError("LCB supports only Python verification specs.")
+        cases = parsed["test_cases"]
+    elif isinstance(parsed, Mapping):
+        cases = _canonical_apps_cases(parsed)
+    else:
+        cases = parsed
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("LCB ground_truth must contain at least one test case.")
+    if not all(isinstance(case, Mapping) for case in cases):
+        raise TypeError("LCB test cases must be mappings.")
+    canonical_cases = [_canonical_code_case(case) for case in cases]
+    test_types = {case["testtype"] for case in canonical_cases}
+    if len(test_types) != 1:
+        raise ValueError("LCB ground_truth cannot mix standard-input and functional test cases.")
+    if FUNCTIONAL_TEST_TYPE in test_types:
+        function_names = {case["metadata"][FUNCTION_NAME_KEY] for case in canonical_cases}
+        if len(function_names) != 1:
+            raise ValueError("All functional LCB test cases must use the same function name.")
+    return json.dumps(canonical_cases, sort_keys=True)
 
 
 # stuff for setting up signal timer
@@ -219,7 +338,26 @@ def get_stripped_lines(val: str):
     return [val_line.strip() for val_line in val.split("\n")]
 
 
-def grade_call_based(code: str, all_inputs: list, all_outputs: list, fn_name: str, timeout: int):
+def _execution_failure(error: Exception, test_input, expected_output) -> tuple[int, dict[str, Any]]:
+    timed_out = "timeoutexception" in repr(error).lower()
+    error_code = -3 if timed_out else -4
+    return error_code, {
+        "error": repr(error),
+        "error_code": error_code,
+        "error_message": "Time Limit Exceeded" if timed_out else "Runtime Error",
+        "inputs": truncatefn(test_input),
+        "expected": truncatefn(expected_output),
+    }
+
+
+def grade_call_based(
+    code: str,
+    all_inputs: list,
+    all_outputs: list,
+    fn_name: str,
+    timeout: int,
+    execution_mode: TestExecutionMode = TestExecutionMode.collect_all,
+):
     # call-based clean up logic
     # need to wrap in try-catch logic after to catch the correct errors, but for now this is fine.
     code = import_string + "\n\n" + code
@@ -239,6 +377,7 @@ def grade_call_based(code: str, all_inputs: list, all_outputs: list, fn_name: st
 
     total_execution = 0
     all_results = []
+    failure_metadata = None
     for idx, (gt_inp, gt_out) in enumerate(zip(all_inputs, all_outputs)):
         signal.alarm(timeout)
         faulthandler.enable()
@@ -260,40 +399,30 @@ def grade_call_based(code: str, all_inputs: list, all_outputs: list, fn_name: st
 
             all_results.append(tmp_result)
 
-            if not tmp_result:
-                return all_results, {
+            if not tmp_result and failure_metadata is None:
+                failure_metadata = {
                     "output": truncatefn(prediction),
                     "inputs": truncatefn(gt_inp),
                     "expected": truncatefn(gt_out),
                     "error_code": -2,
                     "error_message": "Wrong Answer",
                 }
+            if not tmp_result and execution_mode is TestExecutionMode.stop_on_failure:
+                return all_results, failure_metadata
         except Exception as e:
             signal.alarm(0)
-            if "timeoutexception" in repr(e).lower():
-                all_results.append(-3)
-                return all_results, {
-                    "error": repr(e),
-                    "error_code": -3,
-                    "error_message": "Time Limit Exceeded",
-                    "inputs": truncatefn(gt_inp),
-                    "expected": truncatefn(gt_out),
-                }
-            else:
-                all_results.append(-4)
-                return all_results, {
-                    "error": repr(e),
-                    "error_code": -4,
-                    "error_message": "Runtime Error",
-                    "inputs": truncatefn(gt_inp),
-                    "expected": truncatefn(gt_out),
-                }
+            error_code, metadata = _execution_failure(e, gt_inp, gt_out)
+            all_results.append(error_code)
+            if failure_metadata is None:
+                failure_metadata = metadata
+            if execution_mode is TestExecutionMode.stop_on_failure:
+                return all_results, failure_metadata
 
         finally:
             signal.alarm(0)
             faulthandler.disable()
 
-    return all_results, {"execution time": total_execution}
+    return all_results, failure_metadata or {"execution time": total_execution}
 
 
 def grade_stdio(
@@ -301,6 +430,7 @@ def grade_stdio(
     all_inputs: list,
     all_outputs: list,
     timeout: int,
+    execution_mode: TestExecutionMode = TestExecutionMode.collect_all,
 ):
     ## runtime doesn't interact well with __name__ == '__main__'
     code = clean_if_name(code)
@@ -320,11 +450,13 @@ def grade_stdio(
 
     all_results = []
     total_execution_time = 0
+    failure_metadata = None
     for idx, (gt_inp, gt_out) in enumerate(zip(all_inputs, all_outputs)):
         signal.alarm(timeout)
         faulthandler.enable()
 
         signal.alarm(timeout)
+        execution_failed = False
         with Capturing() as captured_output:
             try:
                 start = time.time()
@@ -334,28 +466,20 @@ def grade_stdio(
                 signal.alarm(0)
             except Exception as e:
                 signal.alarm(0)
-                if "timeoutexception" in repr(e).lower():
-                    all_results.append(-3)
-                    return all_results, {
-                        "error": repr(e),
-                        "error_code": -3,
-                        "error_message": "Time Limit Exceeded",
-                        "inputs": truncatefn(gt_inp),
-                        "expected": truncatefn(gt_out),
-                    }
-                else:
-                    all_results.append(-4)
-                    return all_results, {
-                        "error": repr(e),
-                        "error_code": -4,
-                        "error_message": "Runtime Error",
-                        "inputs": truncatefn(gt_inp),
-                        "expected": truncatefn(gt_out),
-                    }
+                error_code, metadata = _execution_failure(e, gt_inp, gt_out)
+                all_results.append(error_code)
+                if failure_metadata is None:
+                    failure_metadata = metadata
+                execution_failed = True
 
             finally:
                 signal.alarm(0)
                 faulthandler.disable()
+
+        if execution_failed:
+            if execution_mode is TestExecutionMode.stop_on_failure:
+                return all_results, failure_metadata
+            continue
 
         prediction = captured_output[0]
 
@@ -374,8 +498,13 @@ def grade_stdio(
         if len(stripped_prediction_lines) != len(stripped_gt_out_lines):
             all_results.append(-2)
             WA_send_args["error_message"] = "Wrong answer: mismatched output length"
-            return all_results, WA_send_args
+            if failure_metadata is None:
+                failure_metadata = WA_send_args
+            if execution_mode is TestExecutionMode.stop_on_failure:
+                return all_results, failure_metadata
+            continue
 
+        matches = True
         for output_line_idx, (
             stripped_prediction_line,
             stripped_gt_out_line,
@@ -396,24 +525,28 @@ def grade_stdio(
 
             success, decimal_prediction_line = convert_line_to_decimals(stripped_prediction_line)
             if not success:
-                all_results.append(-2)
-                return all_results, WA_send_args
+                matches = False
+                break
             success, decimal_gtout_line = convert_line_to_decimals(stripped_gt_out_line)
             if not success:
-                all_results.append(-2)
-                return all_results, WA_send_args
+                matches = False
+                break
 
             if decimal_prediction_line == decimal_gtout_line:
                 continue
 
-            all_results.append(-2)
-            return all_results, WA_send_args
-        all_results.append(True)
+            matches = False
+            break
+        all_results.append(True if matches else -2)
+        if not matches and failure_metadata is None:
+            failure_metadata = WA_send_args
+        if not matches and execution_mode is TestExecutionMode.stop_on_failure:
+            return all_results, failure_metadata
 
-    return all_results, {"execution time": total_execution_time}
+    return all_results, failure_metadata or {"execution time": total_execution_time}
 
 
-def run_test(sample, test=None, debug=False, timeout=6):
+def run_test(sample, test=None, debug=False, timeout=6, execution_mode=TestExecutionMode.collect_all):
     """
     if test(generated_code) is not None it'll try to run the code.
     otherwise it'll just return an input and output pair.
@@ -462,6 +595,7 @@ def run_test(sample, test=None, debug=False, timeout=6):
                     all_outputs=in_outs["outputs"],
                     fn_name=method_name,
                     timeout=timeout,
+                    execution_mode=execution_mode,
                 )
                 return results, metadata
             except Exception as e:
@@ -482,6 +616,7 @@ def run_test(sample, test=None, debug=False, timeout=6):
                     all_inputs=in_outs["inputs"],
                     all_outputs=in_outs["outputs"],
                     timeout=timeout,
+                    execution_mode=execution_mode,
                 )
                 return results, metadata
             except Exception as e:
@@ -585,9 +720,9 @@ def postprocess_lcb_sample(sample):
         "outputs": sample_outputs,
     }
 
-    if sample[0].get("testtype") == "functional":
+    if sample[0].get("testtype") == FUNCTIONAL_TEST_TYPE:
         metadata = sample[0].get("metadata", {})
-        fn_name = metadata.get("func_name", None)
+        fn_name = metadata.get(FUNCTION_NAME_KEY, None)
         assert fn_name is not None, (
             f"Function name is not found, check if your LCB data is preprocessed correctly: {metadata}"
         )
@@ -600,10 +735,30 @@ def postprocess_lcb_sample(sample):
     return sample
 
 
-def lcb_check_correctness(sample, generation, timeout=6, debug=False):
-    """Check correctness of code generation with a global timeout.
-    The global timeout is to catch some extreme/rare cases not handled by the timeouts
-    inside `run_test`"""
+def _run_test_in_subprocess(sample, generation, debug, result, metadata_list, timeout, execution_mode):
+    res, metadata = run_test(
+        sample,
+        test=generation,
+        debug=debug,
+        timeout=timeout,
+        execution_mode=execution_mode,
+    )
+    result.append(res)
+    metadata_list.append(metadata)
+
+
+def lcb_test_results(
+    sample,
+    generation,
+    timeout=6,
+    debug=False,
+    execution_mode=TestExecutionMode.collect_all,
+):
+    """Return one pass/failure result per executed test case.
+
+    A process-level timeout catches extreme cases not handled by the per-test alarms.
+    Stop-on-failure mode preserves the binary scorer's original short circuit.
+    """
     assert len(sample) >= 1, "Sample must contain at least one test case"
     sample = postprocess_lcb_sample(sample)
 
@@ -611,14 +766,12 @@ def lcb_check_correctness(sample, generation, timeout=6, debug=False):
     result = manager.list()
     metadata_list = manager.list()
 
-    def _temp_run(sample, generation, debug, result, metadata_list, timeout):
-        res, metadata = run_test(sample, test=generation, debug=debug, timeout=timeout)
-        result.append(res)
-        metadata_list.append(metadata)
-
+    # The target must be picklable: under the `spawn` start method the child re-imports it by
+    # qualified name. The trainer forces `spawn` in `skyrl_train.entrypoints.main_base`, and it is
+    # the default on macOS.
     p = multiprocessing.Process(
-        target=_temp_run,
-        args=(sample, generation, debug, result, metadata_list, timeout),
+        target=_run_test_in_subprocess,
+        args=(sample, generation, debug, result, metadata_list, timeout, execution_mode),
     )
     p.start()
     p.join(timeout=(timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5)
@@ -630,11 +783,20 @@ def lcb_check_correctness(sample, generation, timeout=6, debug=False):
         result = [[-1 for i in range(len(in_outs["inputs"]))]]
         if debug:
             print("global timeout")
-    if not result:
-        return False
-    # print(result[0], metadata_list)
-    # Check if all elements in result[0] are True
-    return all(x is True for x in result[0])
+    return list(result[0])
+
+
+def lcb_check_correctness(sample, generation, timeout=6, debug=False):
+    return all(
+        result is True
+        for result in lcb_test_results(
+            sample,
+            generation,
+            timeout,
+            debug,
+            execution_mode=TestExecutionMode.stop_on_failure,
+        )
+    )
 
 
 def extract_code_from_model(model_response: str):
@@ -653,11 +815,15 @@ def extract_code_from_model(model_response: str):
     return code_blocks[-1].strip()
 
 
-def compute_score(model_response, tests):
+def compute_score(model_response, tests, reward_mode=BINARY_REWARD_MODE):
     output_code = extract_code_from_model(model_response)
     if output_code is None:
         return output_code, 0.0
-    is_correct = lcb_check_correctness(tests, output_code, debug=False)
-
-    reward = 1.0 if is_correct else 0.0
+    if reward_mode == BINARY_REWARD_MODE:
+        reward = 1.0 if lcb_check_correctness(tests, output_code, debug=False) else 0.0
+    elif reward_mode == FRACTIONAL_REWARD_MODE:
+        results = lcb_test_results(tests, output_code, debug=False)
+        reward = sum(result is True for result in results) / len(results)
+    else:
+        raise ValueError(f"Unsupported LCB reward_mode: {reward_mode!r}.")
     return output_code, reward

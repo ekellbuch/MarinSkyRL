@@ -5,6 +5,7 @@ from loguru import logger
 import numpy as np
 import torch
 from torch import distributed as dist
+from torch.distributed.tensor import DeviceMesh
 from typing import Optional, Dict, Any, Union, TypeVar
 import torch.optim as optim
 from jaxtyping import Float
@@ -16,6 +17,9 @@ DataT = TypeVar("DataT", bound=Union[Dict[str, Any], torch.Tensor])
 
 
 class DistributedStrategy(ABC):
+    device_mesh: DeviceMesh | None = None
+    ep_size: int = 1
+
     @abstractmethod
     def setup_distributed(self):
         pass
@@ -44,7 +48,13 @@ class DistributedStrategy(ABC):
 
     @abstractmethod
     def load_checkpoint(
-        self, model, ckpt_dir, optimizer, scheduler, load_module_strict, load_optimizer_states, load_lr_scheduler_states
+        self,
+        model,
+        ckpt_dir,
+        optimizer,
+        scheduler,
+        load_module_strict,
+        load_training_state,
     ):
         """Load checkpoint"""
         pass

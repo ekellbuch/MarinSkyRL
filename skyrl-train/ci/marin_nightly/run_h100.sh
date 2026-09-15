@@ -8,16 +8,20 @@
 # takes a step, and weights sync back into the inference engine. It says nothing about
 # model quality, and is not meant to.
 #
-# Every uv call is --frozen: the nightly installs exactly what the lockfile pins, so a failure
-# here is the trainer's, not a resolver's. The Hydra flags below spell out what
-# examples/gsm8k/run_gsm8k.sh would have passed, sized for one GPU.
+# The scheduled workflow runs in the cluster's standard Iris task image. This script creates the
+# same frozen root environment used by Iris launches before exercising the trainer.
+# The flags below spell out what examples/gsm8k/run_gsm8k.sh would have passed, sized for one GPU.
 set -euo pipefail
 
+REPOSITORY_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+NIGHTLY_RL_ENV="${NIGHTLY_RL_ENV:-$REPOSITORY_ROOT/.iris-nightly-env}"
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 MAX_STEPS="${MAX_STEPS:-30}"
 DATA_DIR="${DATA_DIR:-$HOME/data/gsm8k_nightly}"
 LOG="${LOG:-$PWD/nightly-run.log}"
 SPEC="${SPEC:-ci/marin_nightly/specs/gsm8k-qwen3-0.6b.json}"
+source "$REPOSITORY_ROOT/skyrl-train/ci/marin_nightly/resolve_runtime.sh" \
+  "$REPOSITORY_ROOT" "$NIGHTLY_RL_ENV" production
 
 # The defaults below are the behavioural shape the shipped gate spec is calibrated against: 30
 # GRPO steps at batch 32 with 8 samples/prompt is enough for reward to visibly climb on a 0.6B
@@ -38,34 +42,25 @@ LR="${LR:-2.0e-6}"
 TRAIN_ROWS="${TRAIN_ROWS:-2000}"
 VAL_ROWS="${VAL_ROWS:-16}"
 
-cd "$(dirname "$0")/../.."   # skyrl-train/
+cd "$REPOSITORY_ROOT/skyrl-train"
 
-# skyrl-train depends on skyrl-gym through `path = "./skyrl-gym"`, which in the repo is a symlink to
-# the sibling package. Two zip-based packaging layers here cannot use a symlink: Iris bundles the
-# workspace as a zip whose extraction flattens the symlink into a plain text file, and Ray then
-# rebuilds the venv on each worker from a zip of *this* directory (its runtime_env working_dir), so
-# skyrl-gym must be a real directory inside it, not a link pointing out. Materialise it as a real
-# copy once, up front; uv sync and every Ray worker then resolve ./skyrl-gym directly.
+# Ray's zip runtime cannot preserve the repository symlink, so materialize the sibling environment
+# package before setting the source paths. The trainer also imports shared launcher modules from
+# cloud/, which remains at the checkout root.
 rm -rf skyrl-gym
 cp -R ../skyrl-gym skyrl-gym
+export PYTHONPATH="$PWD/skyrl-gym:$PWD:$REPOSITORY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
-# torch comes from the cu130 index, so the pod needs an NVIDIA driver >= 580. Log what we got:
-# if a CUDA-13 wheel ever lands on an older driver, the failure is otherwise cryptic.
 echo "::: GPU and driver"
 nvidia-smi --query-gpu=name,driver_version --format=csv
 
-echo "::: syncing skyrl-train (vllm extra, native attention)"
-# flash-attn has no prebuilt wheel for torch 2.11 + cu13 (see pyproject.toml), and compiling it on
-# the pod is impractical, so this run trains on native attention. --no-install-package keeps the
-# package out of the environment entirely: it would otherwise install as a stub with no compiled
-# kernel, and vLLM's rotary does `find_spec("flash_attn")` and imports it -- a stub crashes there,
-# where a genuine absence falls back cleanly. Every later `uv run` is --no-sync so it uses this
-# environment as-is instead of reconciling flash-attn (a base dependency) back in.
-uv sync --frozen --extra vllm --extra dev --no-install-package flash-attn
+test -x "$PYTHON"
+echo "::: using the frozen root environment at ${NIGHTLY_RL_ENV}"
+"$PYTHON" -c "import torch, vllm; print(f'torch {torch.__version__} | vllm {vllm.__version__}')"
 
 echo "::: preparing a ${TRAIN_ROWS}-prompt GSM8K slice"
-uv run --frozen --no-sync python examples/gsm8k/gsm8k_dataset.py --output_dir "$DATA_DIR"
-DATA_DIR="$DATA_DIR" TRAIN_ROWS="$TRAIN_ROWS" VAL_ROWS="$VAL_ROWS" uv run --frozen --no-sync python - <<'PY'
+"$PYTHON" examples/gsm8k/gsm8k_dataset.py --output_dir "$DATA_DIR"
+DATA_DIR="$DATA_DIR" TRAIN_ROWS="$TRAIN_ROWS" VAL_ROWS="$VAL_ROWS" "$PYTHON" - <<'PY'
 import os
 import pathlib
 
@@ -91,7 +86,9 @@ export VLLM_USE_DEEP_GEMM=0
 # sequences into one relies on flash-attn's varlen kernel, so model_wrapper asserts
 # flash_attention_2 whenever use_sample_packing is true.
 START=$(date +%s)
-uv run --frozen --no-sync -m skyrl_train.entrypoints.main_base \
+# This lane bypasses task_runtime.py, so resolve telemetry before starting the trainer.
+"$PYTHON" -m cloud.iris.telemetry_env -- \
+  "$PYTHON" -m skyrl_train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.advantage_estimator=grpo \
@@ -137,5 +134,8 @@ uv run --frozen --no-sync -m skyrl_train.entrypoints.main_base \
 ELAPSED=$(( $(date +%s) - START ))
 
 echo "::: gating (run took ${ELAPSED}s)"
-uv run --frozen --no-sync python -m ci.marin_nightly.gate \
+"$PYTHON" -m ci.marin_nightly.gate \
   --log "$LOG" --spec "$SPEC" --wall-clock-seconds "$ELAPSED"
+
+echo "::: checking Grug PyTorch parity against the committed Levanter fixture"
+"$PYTHON" -m tests.grug_training_parity

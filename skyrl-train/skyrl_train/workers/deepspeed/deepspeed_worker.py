@@ -38,11 +38,13 @@ class DeepSpeedWeightExtractor(WeightExtractor):
         zero_stage: int,
         group_by_module: bool = False,
         batch_size_threshold_gb: float = 0.0,
+        fuse_weights: bool = False,
     ):
         self.model = model
         self.zero_stage = zero_stage
         self.group_by_module = group_by_module
         self.batch_size_threshold_gb = batch_size_threshold_gb
+        self.fuse_weights = fuse_weights
 
     def extract_weights(self, dtype: torch.dtype):
         """Extract weights from DeepSpeed model.
@@ -74,6 +76,7 @@ class DeepSpeedWeightExtractor(WeightExtractor):
                 gather_tensor_fn=self._gather_tensor,
                 get_shape_fn=lambda name, param, tensor: list(param.shape if self.zero_stage != 3 else param.ds_shape),
                 batch_size_threshold_gb=self.batch_size_threshold_gb,
+                fuse_weights=self.fuse_weights,
             ):
                 yield chunk
 
@@ -88,20 +91,13 @@ class DeepSpeedPolicyWorkerBase(PolicyWorkerBase):
         # NOTE (erictang000): the Deepspeed backend only offloads optimizer states + fp32 params to GPU, so
         # bf16 weights remain on GPU at all times. We thus absorb `offload_optimizer` and `offload_model` into `kwargs`
         # and do not pass them down to the strategy.
-        # TODO (erictang000): this is where this was getting called previously - do we need to do this every time?
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
         self.strategy.offload_to_cpu(self.model, pin_memory, non_blocking)
 
     def backload_to_gpu(self, non_blocking=True, **kwargs):
         self.strategy.backload_to_gpu(self.model, non_blocking)
 
-    def init_model(self, model_id_or_path, num_training_steps: int = None):
-        assert self.cfg.trainer.strategy in ("deepspeed")
+    def _create_strategy(self) -> DeepspeedStrategy:
         self.zero_stage = self.cfg.trainer.policy.deepspeed_config.zero_optimization.stage
-        if self.cfg.trainer.policy.optimizer_config.max_grad_norm > 0:
-            self.cfg.trainer.policy.deepspeed_config.gradient_clipping = (
-                self.cfg.trainer.policy.optimizer_config.max_grad_norm
-            )
         strategy = DeepspeedStrategy(
             self.cfg.trainer.policy.deepspeed_config,
             seed=self.cfg.trainer.seed,
@@ -111,12 +107,11 @@ class DeepSpeedPolicyWorkerBase(PolicyWorkerBase):
         )
         strategy.setup_distributed()
         self.strategy = strategy
-
-        # Update per-gpu mini batch size based on device mesh
         self._normalize_mini_batch_size()
+        return strategy
 
-        ds_config = strategy.get_ds_train_config()
-        wrapped_model = HFModelWrapper(
+    def _build_policy_model(self, model_id_or_path: str, *, ds_config: dict, use_torch_compile: bool) -> HFModelWrapper:
+        return HFModelWrapper(
             model_id_or_path,
             use_flash_attention_2=self.cfg.trainer.flash_attn,
             bf16=self.cfg.trainer.bf16,
@@ -125,9 +120,27 @@ class DeepSpeedPolicyWorkerBase(PolicyWorkerBase):
             ds_config=ds_config,
             sequence_parallel_size=self.sequence_parallel_size,
             use_sample_packing=self.cfg.trainer.use_sample_packing,
-            use_torch_compile=self.cfg.trainer.policy.use_torch_compile,
+            use_torch_compile=use_torch_compile,
             rope_scaling=get_rope_scaling_config(self.cfg.trainer),
             rope_theta=get_rope_theta_config(self.cfg.trainer),
+            training_strategy=self.cfg.trainer.strategy,
+            model_load_retry=self.cfg.trainer.model_load_retry,
+            gdn_backend=str(self.cfg.generator.gdn_backend),
+            lm_head_compute_dtype=self.cfg.trainer.policy.model.lm_head_compute_dtype,
+            logprob_chunk_size=self.cfg.trainer.policy.model.get("logprob_chunk_size", None),
+        )
+
+    def init_model(self, model_id_or_path, num_training_steps: int = None):
+        assert self.cfg.trainer.strategy in ("deepspeed")
+        if self.cfg.trainer.policy.optimizer_config.max_grad_norm > 0:
+            self.cfg.trainer.policy.deepspeed_config.gradient_clipping = (
+                self.cfg.trainer.policy.optimizer_config.max_grad_norm
+            )
+        strategy = self._create_strategy()
+        wrapped_model = self._build_policy_model(
+            model_id_or_path,
+            ds_config=strategy.get_ds_train_config(),
+            use_torch_compile=self.cfg.trainer.policy.use_torch_compile,
         )
 
         # configure optimizer
@@ -169,9 +182,22 @@ class DeepSpeedPolicyWorkerBase(PolicyWorkerBase):
             batch_size_threshold_gb=(
                 self.cfg.generator.weight_transfer_threshold_cuda_ipc_GB if self.use_cuda_ipc else 0.0
             ),
+            fuse_weights=bool(self.cfg.generator.fuse_weights),
         )
 
         self._model_update_group_name = None
+
+    def init_model_for_export(self, model_id_or_path: str) -> None:
+        """Initialize DeepSpeed model structure without optimizer or training state."""
+        strategy = self._create_strategy()
+        wrapped_model = self._build_policy_model(
+            model_id_or_path,
+            ds_config=strategy.get_ds_eval_config(),
+            use_torch_compile=False,
+        )
+        self._seq_parallel_monkey_patch(model=wrapped_model.model)
+        self.model = strategy.prepare(wrapped_model)
+        self.model.eval()
 
     def process_sequences(self, sequences, input_len, eos_token_id, pad_token_id):
         return self.model.process_sequences(sequences, input_len, eos_token_id, pad_token_id)
@@ -292,7 +318,6 @@ class DeepSpeedPolicyWorkerBase(PolicyWorkerBase):
 
 class DeepSpeedCriticWorkerBase(CriticWorkerBase):
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, **kwargs):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
         self.strategy.offload_to_cpu(self.model, pin_memory, non_blocking)
 
     def backload_to_gpu(self, non_blocking=True, **kwargs):
@@ -392,6 +417,10 @@ class DeepSpeedRefWorkerBase(RefWorkerBase):
             use_sample_packing=self.cfg.trainer.use_sample_packing,
             rope_scaling=get_rope_scaling_config(self.cfg.trainer),
             rope_theta=get_rope_theta_config(self.cfg.trainer),
+            training_strategy=self.cfg.trainer.strategy,
+            model_load_retry=self.cfg.trainer.model_load_retry,
+            gdn_backend=str(self.cfg.generator.gdn_backend),
+            logprob_chunk_size=self.cfg.trainer.policy.model.get("logprob_chunk_size", None),
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 

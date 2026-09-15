@@ -1,5 +1,6 @@
 import os
 import random
+import tempfile
 from datetime import timedelta
 from typing import List, Union, Optional
 from jaxtyping import Float
@@ -38,6 +39,8 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 from transformers import PreTrainedTokenizer
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
+from skyrl_train import hf_model_io
 
 
 # Optimizer checkpoint format and gather transport.
@@ -243,8 +246,7 @@ class MegatronStrategy(DistributedStrategy):
         optimizer: Optional[DistributedOptimizer] = None,
         scheduler: Optional[OptimizerParamScheduler] = None,
         load_module_strict: bool = True,
-        load_optimizer_states: bool = True,
-        load_lr_scheduler_states: bool = True,
+        load_training_state: bool = True,
     ):
         if not ckpt_dir or not io.exists(ckpt_dir):
             raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_dir}")
@@ -260,11 +262,11 @@ class MegatronStrategy(DistributedStrategy):
         sharded_state_dict = {}
         model_sharded_state_dict = unwrapped_model.sharded_state_dict()
         sharded_state_dict["model"] = model_sharded_state_dict
-        if optimizer and load_optimizer_states:
+        if optimizer and load_training_state:
             sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
                 model_sharded_state_dict, is_loading=True, metadata=_MEGATRON_OPTIM_CKPT_METADATA
             )
-        if scheduler and load_lr_scheduler_states:
+        if scheduler and load_training_state:
             sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
         with io.local_read_dir(ckpt_dir) as read_dir:
@@ -284,14 +286,14 @@ class MegatronStrategy(DistributedStrategy):
         model[0].load_state_dict(state_dict["model"], strict=load_module_strict)
         self.print("Loaded model state dict.")
 
-        if optimizer and load_optimizer_states:
+        if optimizer and load_training_state:
             assert "optimizer" in state_dict, (
                 f"Optimizer state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
             )
             optimizer.load_state_dict(state_dict["optimizer"])
             self.print("Loaded optimizer state dict.")
 
-        if scheduler and load_lr_scheduler_states:
+        if scheduler and load_training_state:
             assert "lr_scheduler" in state_dict, (
                 f"LR scheduler state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
             )
@@ -299,14 +301,14 @@ class MegatronStrategy(DistributedStrategy):
             self.print("Loaded LR scheduler state dict.")
 
         # Load RNG state, if present.
-        if "rng" in state_dict:
+        if load_training_state and "rng" in state_dict:
             self.load_rng_state(state_dict["rng"])
 
         # Restore replicated client state (ZClip / StaleClip), if present. Guarded
         # for backward-compat with checkpoints written before this file existed.
         states = {}
         extra_state_path = os.path.join(ckpt_dir, "extra_state.pt")
-        if io.exists(extra_state_path):
+        if load_training_state and io.exists(extra_state_path):
             with io.open_file(extra_state_path, "rb") as f:
                 extra_state = torch.load(f, weights_only=False)
             states = extra_state.get("client_state", {}) or {}
@@ -320,8 +322,10 @@ class MegatronStrategy(DistributedStrategy):
             io.makedirs(output_dir, exist_ok=True)
         dist.barrier()
 
-        # All ranks call into bridge.
-        with io.local_work_dir(output_dir) as work_dir:
+        # Every rank exhausts Bridge's collective conversion; only cloud non-writers discard their local files.
+        rank_writes_output = self.is_rank_0() or not io.is_cloud_path(output_dir)
+        model_dir = hf_model_io.local_hf_model_dir(output_dir) if rank_writes_output else tempfile.TemporaryDirectory()
+        with model_dir as work_dir:
             bridge.save_hf_weights(model.actor_module, work_dir)
             self.print(f"Successfully saved HF safetensors model to {output_dir}")
 
@@ -330,4 +334,4 @@ class MegatronStrategy(DistributedStrategy):
                 self.save_hf_configs(self.hf_config, work_dir, tokenizer)
                 self.print(f"Successfully saved HF config and tokenizer to {output_dir}")
 
-        dist.barrier()
+        # The Ray caller waits for every rank result; no collective needs to span artifact publication.

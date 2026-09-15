@@ -1,11 +1,11 @@
 (Experimental) Fully Async Training: In-flight Weight Update / Multi-Turn Partial Rollout
 =========================================================================================
 
-SkyRL supports fully async training for any generator that implements the ``GeneratorInterface``, including your **arbitrary agent harness (both single-turn and multi-turn)**, to address the **straggler issues in long-horizon tasks**.
+SkyRL supports fully async training for any ``TrajectoryRunner``, including an **arbitrary agent harness (both single-turn and multi-turn)**, to address the **straggler issues in long-horizon tasks**.
 
 We treat "fully async training" synonymous to the terms **"in-flight weight update"** and **"multi-turn partial rollout"**, as discussed in works like AReal, PipelineRL, ScaleRL, etc.
 
-The core logic of fully async training lives in `fully_async_trainer.py <https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl-train/skyrl_train/fully_async_trainer.py>`_, a subclass of the synchronous trainer class in `trainer.py <https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl-train/skyrl_train/trainer.py>`_. This ``fully_async_trainer.py`` works out-of-the-box with any generator that the user implements -- so users do not need to implement any additional logic for fully async training.
+The core logic of fully async training lives in `fully_async_trainer.py <https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl-train/skyrl_train/fully_async_trainer.py>`_, a subclass of the synchronous trainer class in `trainer.py <https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl-train/skyrl_train/trainer.py>`_. It works with any trajectory runner without additional fully asynchronous integration code.
 
 .. figure:: images/skyrl_fully_async.png
    :alt: Systems Diagram of Fully Async Training in SkyRL
@@ -21,7 +21,7 @@ The core logic of fully async training lives in `fully_async_trainer.py <https:/
 
 .. note::
 
-    The fully async training is currently only supported for Generators that use ``/chat/completions``. We will support ``.generate()`` and ``/completions`` soon.
+    The fully async training is currently only supported for trajectory runners that use ``/chat/completions``. We will support ``/completions`` soon.
 
 I. What is Fully Async Training?
 ---------------------------------
@@ -75,28 +75,28 @@ II. How to use fully async training in SkyRL?
 
 The fully async trainer class is implemented in ``fully_async_trainer.py::FullyAsyncRayPPOTrainer``, subclassing the synchronous trainer class ``trainer.py::RayPPOTrainer``.
 
-This trainer class is generator-agnostic, meaning it can support any generator that implements the ``GeneratorInterface`` interface, including your arbitrary agent harness.
+This trainer class accepts any harness that implements the ``TrajectoryRunner`` interface.
 
 We provide an example script in ``examples/fully_async``, where we train Qwen2.5-1.5B-Instruct on GSM8K with the fully async approach.
 
 We break down the usage into two simple steps.
 
-Step 1: Define your ``main_async.py``
+Step 1: Select the fully asynchronous entrypoint
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Following `examples/fully_async/main_async.py <https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl-train/examples/fully_async/main_async.py>`_, subclass the base entrypoint class ``BasePPOExp``:
+The maintained entrypoint is ``skyrl_train.entrypoints.fully_async``. To customize it, subclass ``BasePPOExp``:
 
 - Override ``get_trainer()`` to use fully async trainer class ``FullyAsyncRayPPOTrainer``
-- Override ``get_generator()`` to use your custom generator class. Note that currently we only support generators that use ``/chat/completions`` (hence the ``SkyRLGymHTTPGenerator`` used in the example).
+- Override ``get_trajectory_runner()`` to compose a runner with the required model client. The maintained entrypoint uses ``OpenAIHTTPModelClient`` for ``/chat/completions`` transport.
 
 Step 2: Config knobs to tune for fully async training
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Following `examples/fully_async/async_run_gsm8k.sh <https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl-train/examples/fully_async/async_run_gsm8k.sh>`_, update the training configuration to use your new entrypoint ``main_async.py``:
+Following ``examples/fully_async/async_run_gsm8k.sh``, select the packaged entrypoint:
 
 .. code-block:: bash
 
-    uv run --isolated --extra vllm -m examples.fully_async.main_async \
+    uv run --isolated --extra vllm -m skyrl_train.entrypoints.fully_async \
     ...
 
 For fully async specifically, the following are the main knobs to tune:
@@ -109,6 +109,13 @@ For fully async specifically, the following are the main knobs to tune:
   each worker works on a group of trajectories. It should be ``>= trainer.policy_mini_batch_size`` to avoid wasted throughput, 
   and ``<= trainer.policy_mini_batch_size * (trainer.fully_async.max_staleness_steps + 1)`` since it would be wasted due to capacity control.
   The larger the number, the more throughput, and likely more staleness (and hence off-policy-ness).
+- ``trainer.fully_async.admission_stall_timeout``: The maximum number of seconds to assemble one admitted training mini-batch.
+  The default is six hours so long agent episodes and dynamic-sampling rejection do not terminate a healthy run. This deadline is
+  independent of episode, collective, and recent training-step durations. Increase it when a valid batch can take longer than six
+  hours; decrease it only when false-positive termination is preferable to a long rejected-only wait.
+- ``rollout.fanout.coordinator_rpc_timeout``: The maximum time to wait for a Harbor rollout coordinator RPC. The default is six
+  hours. Expiry cancels the coordinator request and fails the generation worker without converting its trials to agent timeouts.
+  Harbor owns trial deadlines and retries; this watchdog only detects and unwinds a coordinator that does not return.
 
 On GPU placement: first disable colocation of training and generation, then configure how many GPUs to dedicate to training and generation respectively. The following snippet dedicates 4 GPUs to each.
 
@@ -148,11 +155,12 @@ The high-level control logics of fully async training in SkyRL are shown in the 
 
 There are 5 core components:
 
-1. K ``GenerationWorker``: workers that produce the trajectories. Each is simply an ``asyncio.Task`` that runs ``AnyGenerator.generate()``. K is ``trainer.fully_async.num_parallel_generation_workers``. ``AnyGenerator`` means that it works with any generator.
+1. K ``GenerationWorker``: workers that produce the trajectories. Each is simply an ``asyncio.Task`` that runs ``TrajectoryRunner.run()``. K is ``trainer.fully_async.num_parallel_generation_workers``. Any ``TrajectoryRunner`` implementation may be used.
 2. ``TrainingWorker``: simply a single thread that runs the training loop.
 3. ``GenerationOutputGroupBuffer``: a buffer that stores the generated groups of output.
 4. ``AsyncDataloader``: a thin wrapper of the dataloader, polled by the generation workers to get data.
-5. ``AsyncStalenessManager``: a controller that manages the staleness control to ensure no trajectory is dropped for being too stale.
+5. ``AsyncStalenessManager``: a controller that limits generation lead; a completed-buffer sweep regenerates any group
+   that still exceeds the hard staleness cap.
 
 Note that all the control logics pertain to a single epoch. We do not do any cross-epoch asynchrony.
 
@@ -162,16 +170,18 @@ is a set of ``generator.n_samples_per_prompt`` number of trajectories generated 
 1. K Generation Workers
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-Generation workers are virtual workers, each is simply an ``asyncio.Task`` that runs ``generator.generate()``
-for a group of trajectories. There is only one ``generator`` instance (e.g. ``SkyRLGymGenerator``) and one
+Generation workers are virtual workers, each is simply an ``asyncio.Task`` that runs ``trajectory_runner.run()``
+for a group of trajectories. There is only one trajectory runner (e.g. ``SkyRLGymTrajectoryRunner``) and one
 physical ``InferenceEngineClient`` in the back serving the actual LLM inference.
 
 Each generation worker runs the following steps in a while loop:
 
-1. Get a single data from the ``AsyncDataloader``. Might await on staleness control based on ``AsyncStalenessManager`` (i.e. too many data accumulated in the buffer and a new generation will result in staleness violation).
-2. Generate one group of trajectories. Can be single-turn or multi-turn, ``SkyRLGymGenerator`` or your own generator.
-3. Enqueue the generated group to the ``GenerationOutputGroupBuffer``.
-4. Repeat from step 1 until the ``AsyncDataloader`` is exhausted for this epoch.
+1. Prefer a stale-group retry row, otherwise get one row from the ``AsyncDataloader``. After the dataloader is exhausted,
+   wait for retries. Acquire generation capacity through ``AsyncStalenessManager`` before generating.
+2. Collect one group of trajectories. It can use ``SkyRLGymTrajectoryRunner`` or another single-turn or multi-turn runner.
+3. Re-check the completed group's age. Enqueue it to ``GenerationOutputGroupBuffer`` if fresh, or enqueue its original
+   row for regeneration if stale.
+4. Repeat from step 1 until the training worker finishes the epoch and cancels the generation tasks.
 
 2. Training Worker (i.e. the training loop)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -180,12 +190,12 @@ While we call it a "training worker", it is simply the single thread that runs t
 
 It follows the following steps in a for-loop over the number of steps per epoch:
 
-1. Get precisely ``trainer.policy_mini_batch_size`` groups from the ``GenerationOutputGroupBuffer``.
-   The staleness controller enforces a global capacity bound that aims to keep batches within ``trainer.fully_async.max_staleness_steps`` steps stale. However, it does not strictly guarantee it. See :ref:`async-staleness-manager` for more details.
+1. Sweep all completed groups, requeue every over-cap group's original row, and wait until precisely
+   ``trainer.policy_mini_batch_size`` fresh groups are available. See :ref:`async-staleness-manager` for details.
 2. Train on the generated groups.
 3. Mark the data that we used to train as "consumed" to the ``AsyncDataloader``, so that when we resume
    training from a checkpoint, we know what data has been trained on and hence can be skipped.
-4. Make ``AnyGenerator`` (really the ``InferenceEngineClient`` in the back): pause generation, sync weights, resume generation. Note that this operation is agnostic to what the generator is doing. It can either be in the middle of a ``/chat/completions`` generation, or interacting with the environment.
+4. Pause the model client (really the ``InferenceEngineClient`` in the back): pause generation, sync weights, resume generation. Note that this operation is agnostic to what the runner is doing. It can either be in the middle of a ``/chat/completions`` generation, or interacting with the environment.
 5. Update the global step and hence the capacity controlled by the ``AsyncStalenessManager``, potentially unblocking
    generation workers stuck on step 1 -- as they can now generate new data that will not be as stale as before.
 6. Repeat from step 1 until the epoch is done.
@@ -194,8 +204,11 @@ It follows the following steps in a for-loop over the number of steps per epoch:
 3. Generation Output Group Buffer
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The generation output group buffer is simply a ``asyncio.Queue`` that stores the generated groups of output.
-It is enqueued by the generation workers, and dequeued by the training worker.
+The generation state has a bounded completed-group ``asyncio.Queue``, an unbounded source-row retry queue, and a shared
+condition. Generation workers re-check freshness after any completed-buffer backpressure. Fresh groups enter the
+completed queue; stale groups place their original row in the retry queue. Before each step, the training worker drains
+and checks the entire completed queue atomically, restores fresh overflow, and wakes blocked producers. Checkpoints
+snapshot both queues.
 
 4. Async Dataloader
 ~~~~~~~~~~~~~~~~~~~
@@ -234,10 +247,12 @@ Definitions
 - **Consumed by trainer**: groups that have already been used for updating the model weights.
 - ``current_global_step``: the model version currently being worked on; the model has completed ``current_global_step - 1`` updates.
 - ``mini_batch_size = B``: number of groups consumed per training step.
-- ``max_staleness_steps = S``: the maximum allowed difference between when a group was scheduled to generate, and the step that trains on it.
-- ``accepted``: total number of groups that finished generation (either already consumed or waiting in the buffer). This includes all the generation outputs throughout the entire training process. Thus, this number is strictly increasing.
+- ``max_staleness_steps = S``: the maximum allowed difference between the earliest model step captured by any sample
+  in a group and the step that trains on it. The scheduling step is the fallback when capture is unavailable.
+- ``accepted``: number of groups that finished generation and remain eligible (either already consumed or waiting in
+  the buffer). Discarding a stale group decrements it before scheduling the replacement.
 - ``running``: number of groups currently being generated by workers.
-- ``submitted``: total number of groups submitted to workers (used for logging).
+- ``submitted``: number of submitted groups retained in capacity accounting. Stale and cancelled attempts decrement it.
 
 Capacity control
 ^^^^^^^^^^^^^^^^
@@ -268,26 +283,31 @@ After each training step, the trainer increments the version and calls
 Per-sample staleness vs capacity bound
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The capacity inequality keeps generation from outpacing training by more than ``S`` steps in **aggregate**. It does **NOT** strictly guarantee that every trajectory group will be trained within ``S`` steps of when it was scheduled. In rare cases (e.g., very long rollouts), a trajectory group may complete after more than ``S`` steps have elapsed while the system as a whole still satisfies the capacity constraint. However, in **steady state**, staleness remains within the configured budget of ``max_staleness_steps``.
+The capacity inequality limits how far generation can lead training in **aggregate**. A long rollout can still finish
+outside that aggregate budget, so the completed-buffer sweep below enforces the hard per-group limit.
 
-Possible ways for handling such rare groups that violate the ``S`` bound:
-
-- **Current behavior**: Still accept the trajectory group for training, but log the staleness metrics with a warning.
-  
-  - Matches `PipelineRL's behavior <https://github.com/ServiceNow/PipelineRL/blob/67654d7905816f7526ab7ba6d064d996094879ce/pipelinerl/finetune_loop.py#L583-L588>`_ and `AReal's default behavior <https://github.com/inclusionAI/AReaL/blob/1e7cf19f6206acc65de83c96dac27666895e30e0/areal/core/workflow_executor.py#L569-L577>`_.
-- Drop the trajectory group using ``AsyncStalenessManager.on_rollout_rejected()`` **(not supported yet but should be hackable)**
-
-  - Matches AReal's behavior if the ``should_accept_fn`` is based on per-sample staleness.
-- Drop the trajectory group and resample. Would require logics to ``AsyncDataloader`` to requeue the data. **(not supported yet but should be hackable)**
+The trainer sweeps every completed group before assembling a batch. It discards each group older than ``S``, requeues
+that group's original dataset row, and waits for a regenerated replacement. Training starts only after the configured
+full mini-batch consists entirely of fresh groups. A group's age starts at the earliest model step captured by any of
+its samples, so a late sample cannot hide earlier work from the staleness check.
 
 Checkpointing semantics
 ^^^^^^^^^^^^^^^^^^^^^^^
 
-When saving a checkpoint, only trainer-consumed state is recorded. On resume, we set ``accepted := consumed`` (and do not restore those that were running or about-to-be-consumed in the buffer), which preserves the capacity invariant without reintroducing stale or partially generated work.
+Checkpoint artifacts record consumed dataset state, every completed group in the generation buffer, and every source
+row waiting for stale-group regeneration. Resume restores completed groups and pending retries before generation
+workers start. The restored groups and retries reserve their dataset UIDs, so restarting dataset iteration cannot
+generate a second copy of pending work. Partially generated groups are not checkpointed or reserved and are scheduled
+again through the restored dataset state. Buffer persistence fails the checkpoint operation if it cannot save a
+complete artifact. See the `fully asynchronous resume UID ownership design
+<https://github.com/marin-community/MarinSkyRL/blob/main/docs/design/fully-async-resume-uid-ownership.md>`_ for the UID
+ownership contract.
 
 .. note::
 
-    ``AsyncStalenessManager`` is a deliberate design choice. One could instead over-generate and drop groups that are too stale at training time. We prefer proactive admission control to avoid wasted compute and simplify buffer management. With very small ``S``, the system may stall more often; increasing ``S`` trades off stricter on-policy-ness for higher throughput.
+    ``AsyncStalenessManager`` uses proactive admission control to limit wasted work, while the completed-buffer sweep
+    enforces the hard per-group cap. With very small ``S``, replacement may stall training more often; increasing ``S``
+    trades stricter on-policy behavior for higher throughput.
 
 .. note::
 

@@ -58,25 +58,17 @@ cd SkyRL/skyrl-train
 Then, create a new virtual environment and install the dependencies:
 
 ```bash
-# creates a venv at .venv/
-uv sync --extra vllm 
-source .venv/bin/activate
+# creates the root project venv at ../.venv/
+uv sync --extra vllm
+source ../.venv/bin/activate
 ```
 
-#### Extra ↔ torch version matrix (FSDP2 Context-Parallel branch)
+#### Training profiles and backends
 
-The inference/training extras are mutually exclusive (see `[tool.uv].conflicts` in
-`pyproject.toml`) because each pins its own exact `torch`. Pick exactly one with `uv sync --extra <X>`:
-
-All torch wheels come from the CUDA 13 index (`pytorch-cu130`), matching the production SIF;
-they need an NVIDIA driver >= 580.
-
-| Extra      | torch    | Notes                                                                    |
-|------------|----------|--------------------------------------------------------------------------|
-| (base)     | `>=2.10` | trainer floor — carries torch-native `context_parallel` for FSDP2 CP     |
-| `vllm`     | `2.11.0` | active inference path / CP set (vLLM 0.20.2, flash-attn 2.6.3)            |
-| `sglang`   | `2.11.0` | sglang 0.5.13 (first sglang line on torch 2.11)                          |
-| `mcore`    | `2.9.1`  | Megatron path: TE 2.11 + megatron-bridge 0.3.0 (+ megatron-core in bridge's range). **Partial** — the Megatron components support torch 2.10, but the bundled vLLM (0.14.1) hard-pins `torch==2.9.1` (every published vLLM through 0.16.1 does), capping this extra at 2.9.1 until vLLM moves to torch 2.10 |
+Select `cpu` for CPU training. GPU-only component extras imply the `cuda` profile, so ordinary FSDP/vLLM
+training selects `vllm`; add `fsdp` only for its TorchTitan expert-parallel dependencies. Native CUDA artifacts
+are selected by architecture from the frozen root lock. Iris installs and validates that profile in its standard
+task image before training.
 
 Then, prepare the dataset:
 
@@ -105,7 +97,7 @@ For detailed installation instructions, as well as more examples, please refer t
 
 To implement a new task or environment using the SkyRL-Gym interface, please see our [Walkthrough Docs](https://skyrl.readthedocs.io/en/latest/tutorials/new_env.html).
 
-If you don't want to use the SkyRL-Gym interface, or you have an existing task or agentic pipeline implementation and just want to train with it on top of SkyRL, we recommend you create a simple custom [`Generator`](skyrl_train/generators/base.py), which requires implementing a single method, `generate()`. We have one example of a custom Generator at [`SkyRLGymGenerator`](skyrl_train/generators/skyrl_gym_generator.py) which executes environments written in the SkyRL-Gym interface. We are working to provide more example integrations of agent harnesses -- please reach out if you'd like yours to be one of them!
+If you already have a task or agent harness, implement the [`TrajectoryRunner`](skyrl_train/trajectory_runners/base.py) contract and its `run()` lifecycle. [`SkyRLGymTrajectoryRunner`](skyrl_train/trajectory_runners/skyrl_gym.py) shows how a runner composes model transport, environment interaction, and projection into trainer-ready trajectories.
 
 ## Reproducing SkyRL-SQL
 We also test SkyRL by reproducing our prior release [SkyRL-SQL](https://novasky-ai.notion.site/skyrl-sql), which enabled efficient Multi-Turn RL for Text2SQL. 

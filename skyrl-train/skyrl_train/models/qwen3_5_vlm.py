@@ -35,10 +35,8 @@ re-download, no weight movement): take the loaded shell's
 ``model.language_model`` as the CausalLM ``.model`` and the shell's ``lm_head``
 as the CausalLM ``.lm_head``, drop the vision tower + MTP head.
 
-Gated on ``SKYRL_QWEN3_5_VLM_UNWRAP`` (default on) so it can be disabled.
+This unwrap is the supported policy representation for these checkpoints.
 """
-
-import os
 
 from loguru import logger
 
@@ -54,8 +52,6 @@ def is_qwen3_5_vlm_shell(config) -> bool:
     on the top ``model_type`` starting with ``qwen3_5`` so unrelated VLMs with a
     ``text_config`` are untouched.
     """
-    if os.environ.get("SKYRL_QWEN3_5_VLM_UNWRAP", "1") not in ("1", "true", "True"):
-        return False
     text_config = getattr(config, "text_config", None)
     if text_config is None:
         return False
@@ -82,11 +78,8 @@ def is_qwen3_5_text_tower(config) -> bool:
     shell (``Qwen3_5MoeForConditionalGeneration``) and therefore expects the text
     weights under the ``model.language_model.`` HF namespace rather than ``model.``.
 
-    Gated on the same ``SKYRL_QWEN3_5_VLM_UNWRAP`` flag as the unwrap, so toggling
-    the unwrap off keeps the sender-side name namespace unchanged in lockstep.
+    The sender-side namespace therefore stays aligned with the mandatory unwrap.
     """
-    if os.environ.get("SKYRL_QWEN3_5_VLM_UNWRAP", "1") not in ("1", "true", "True"):
-        return False
     if config is None:
         return False
     top_is_qwen3_5 = str(getattr(config, "model_type", "")).startswith("qwen3_5")
@@ -134,6 +127,34 @@ def map_text_name_to_vlm_engine(name: str) -> str:
     if name.startswith("model."):
         return "model.language_model." + name[len("model.") :]
     return name
+
+
+def qwen3_5_vllm_internal_weight_candidates(name: str, *, tied_word_embeddings: bool) -> tuple[str, ...]:
+    """Return exact and translated vLLM parameter names in lookup order."""
+    candidates = [name]
+    if name.startswith("model.language_model."):
+        candidates.append("language_model.model." + name.removeprefix("model.language_model."))
+    elif name.startswith("model."):
+        candidates.append("language_model.model." + name.removeprefix("model."))
+    elif name.startswith("lm_head."):
+        candidates.append("language_model.lm_head." + name.removeprefix("lm_head."))
+        if tied_word_embeddings and name == "lm_head.weight":
+            candidates.append("language_model.model.embed_tokens.weight")
+    return tuple(candidates)
+
+
+def remove_vision_no_split_modules(model) -> None:
+    """Keep the Qwen3.5 text policy's FSDP wrap classes text-only.
+
+    Transformers currently leaves ``Qwen3_5VisionBlock`` in
+    ``_no_split_modules`` even when ``AutoModelForCausalLM`` returns a
+    ``Qwen3_5ForCausalLM`` text tower. Marin's FSDP auto-wrap resolver requires
+    every listed class to occur in the model, so the stale vision entry prevents
+    FSDP initialization.
+    """
+    no_split_modules = getattr(model, "_no_split_modules", None)
+    if no_split_modules:
+        model._no_split_modules = [name for name in no_split_modules if "Vision" not in name]
 
 
 def unwrap_to_text_causal_lm(vlm_model):
@@ -190,9 +211,7 @@ def unwrap_to_text_causal_lm(vlm_model):
     # module. transformers stores `_no_split_modules` as a per-instance *set* on
     # the constructed model (the class attribute is a list); we overwrite the
     # instance attribute with a plain list of the surviving (text) classes.
-    nsm = getattr(text_model, "_no_split_modules", None)
-    if nsm:
-        text_model._no_split_modules = [c for c in nsm if "Vision" not in c]
+    remove_vision_no_split_modules(text_model)
 
     logger.info(
         "[qwen3_5_vlm] unwrapped %s -> %s (text tower); dropped vision + MTP head. _no_split_modules=%s",

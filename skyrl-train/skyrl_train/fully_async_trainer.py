@@ -12,45 +12,95 @@ High-level notes:
 """
 
 import asyncio
+import collections
 import sys
 from loguru import logger
 from skyrl_train.trainer import RayPPOTrainer
 from skyrl_train.utils.progress import tqdm
 from skyrl_train.utils import Timer, get_system_memory_metrics
-from skyrl_train.utils.ppo_utils import normalize_advantages_dict
 from skyrl_train.training_batch import TrainingInputBatch
-from skyrl_train.generators.base import GeneratorOutput
+from skyrl_train.trajectory_runners.base import TrajectoryBatch
 from skyrl_train.utils.trainer_utils import ResumeMode, build_dataloader
-from skyrl_train.generators.utils import prepare_generator_input, concatenate_generator_outputs
+from skyrl_train.utils.logging_utils import log_exception_as_text
+from skyrl_train.trajectory_runners.trajectory_processing import (
+    prepare_trajectory_request,
+    concatenate_trajectory_batches,
+)
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
 from dataclasses import dataclass
 from skyrl_train.utils.data_tracker import DataConsumptionTracker
 from skyrl_train.callbacks.builtin import DataTrackingCallback, BufferCheckpointCallback
 from torchdata.stateful_dataloader import StatefulDataLoader
-from typing import List, Optional, Tuple
-import inspect
+from typing import List, Tuple, TypeVar
+from enum import Enum, auto
 from omegaconf import OmegaConf
 from skyrl_train.callbacks import TrainerState
+from skyrl_train.telemetry import critical_phase, record_generated_work, record_policy_step, record_rollout_buffer
+from skyrl_train.async_rollout_state import GeneratedOutputGroup, GenerationAttempt, GenerationBufferState
+from skyrl_train.dynamic_sampling import (
+    DynamicSamplingType,
+    GroupSelectionPolicy,
+    GroupSelectionResult,
+    resolve_dynamic_sampling_criteria,
+)
+from skyrl_train.group_admission import AdmissionDecision, AdmissionRejection, GroupAdmissionPolicy
+from skyrl_train.utils.algorithm_registry import policy_loss_requires_rollout_logprobs
+
+
+_QueueItem = TypeVar("_QueueItem")
+DATASET_SELECTION_SOURCE = "dataset"
+STALE_RETRY_SELECTION_SOURCE = "stale_retry"
+
+
+class GenerationStalledError(RuntimeError):
+    """Raised when generation cannot make progress (no active producers, or dataset exhausted)."""
+
+
+def _epoch_completed(global_step: int, epoch: int, num_steps_per_epoch: int) -> bool:
+    """Whether the step loop finished `epoch` rather than being cut short.
+
+    The loop exits three ways: the epoch's steps run out, `max_steps` is
+    reached, or a callback asks to stop. Only the first has finished an epoch,
+    and `global_step` is post-increment, so a completed epoch has advanced past
+    that epoch's last step.
+
+    This decides whether `on_epoch_end` fires, which is load-bearing:
+    `DataTrackingCallback.on_epoch_end_async` clears the epoch-scoped consumed
+    UID set and advances the epoch counter, and `_finalize_training` then writes
+    the final checkpoint from that tracker. Firing it after a `max_steps` stop
+    persists `consumed_uids_in_epoch=[]` beside a non-zero
+    `total_samples_consumed` -- and that final checkpoint is the one
+    `resume_mode=latest` loads, after which `_AsyncDataloader` rewinds to row 0
+    with nothing to skip and retrains prompts the previous run already trained.
+    """
+    return global_step > (1 + epoch) * num_steps_per_epoch
+
+
+def _drain_queue(queue: asyncio.Queue[_QueueItem]) -> List[_QueueItem]:
+    """Remove and return every item currently available without yielding."""
+    items = []
+    while True:
+        try:
+            items.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            return items
 
 
 @dataclass
-class GeneratedOutputGroup:
-    """
-    The GeneratorOutput for a single group of rollouts, along with the metadata.
+class _GenerationQueues:
+    completed: asyncio.Queue[GeneratedOutputGroup]
+    retries: asyncio.Queue[List[dict]]
+    condition: asyncio.Condition
 
-    Attributes:
-        generator_output (GeneratorOutput): The GeneratorOutput for a single group of rollouts.
-            That is, the output to the same prompt, but `n_samples_per_prompt` of it.
-
-        uid (str): The uid of the group. Underlyingly, it is the index of the data in train_dataloader.dataset.
-
-        global_step_when_scheduled (int): The global step when the group was scheduled for generation,
-            used for validating the staleness control.
-    """
-
-    generator_output: GeneratorOutput
-    uid: str
-    global_step_when_scheduled: int
+    def snapshot(self) -> GenerationBufferState:
+        """Copy both queues without yielding to another event-loop task."""
+        completed = _drain_queue(self.completed)
+        retries = _drain_queue(self.retries)
+        for group in completed:
+            self.completed.put_nowait(group)
+        for prompts in retries:
+            self.retries.put_nowait(prompts)
+        return GenerationBufferState(completed_groups=completed, retry_prompts=retries)
 
 
 @dataclass
@@ -61,12 +111,11 @@ class _RolloutStat:
     Note that these statistics are not per-epoch, but accumulates across all epochs.
 
     Attributes:
-        submitted (int): The number of trajectories submitted to all generation workers, only used
-            for logging purposes (e.g. compute submitted / accepted ratio to see how many
-            trajectories failed). This is strictly increasing.
-        accepted (int): The number of trajectories finished generation (can be either consumed by,
-            or about to be consumed by the training worker). This is strictly increasing.
-        running (int): The number of trajectories currently being generated by the generation workers.
+        submitted (int): The number of groups retained in submission-capacity accounting.
+            Stale or cancelled attempts decrement it.
+        accepted (int): The number of groups finished generation (can be either consumed by,
+            or about to be consumed by the training worker). Discarded stale attempts decrement it.
+        running (int): The number of groups currently being generated by the generation workers.
 
     For details, see https://skyrl.readthedocs.io/en/latest/tutorials/fully_async.html#async-staleness-manager
     """
@@ -74,6 +123,27 @@ class _RolloutStat:
     submitted: int = 0
     accepted: int = 0
     running: int = 0
+
+
+class _GroupFreshness(Enum):
+    FRESH = auto()
+    STALE = auto()
+
+
+@dataclass
+class _AdmissionPartition:
+    accepted_groups: List[GeneratedOutputGroup]
+    rejected_groups: List[tuple[GeneratedOutputGroup, AdmissionDecision]]
+    discarded_groups: List[tuple[GeneratedOutputGroup, AdmissionDecision]]
+
+
+@dataclass
+class _CandidateSelection:
+    admitted_groups: List[GeneratedOutputGroup]
+    surplus_groups: List[GeneratedOutputGroup]
+    discarded_groups: List[tuple[GeneratedOutputGroup, GroupSelectionResult]]
+    discarded_reasons: collections.Counter[str]
+    candidate_count: int
 
 
 class _AsyncStalenessManager:
@@ -87,8 +157,8 @@ class _AsyncStalenessManager:
     staleness remains within the configured budget of `max_staleness_steps`.
 
     In pathological cases (e.g., very long-running trajectories), an individual group may take
-    more than `max_staleness_steps` of training steps of time to finish generation. For such rare
-    cases, we still accept the trajectory and log the staleness metrics with a warning.
+    more than `max_staleness_steps` of training steps to finish. Such attempts are discarded and
+    regenerated from the same source prompt before training proceeds.
 
     The key capacity formula is implemented in `_compute_capacity_unlocked`. For details and caveats,
     see https://skyrl.readthedocs.io/en/latest/tutorials/fully_async.html#async-staleness-manager.
@@ -153,18 +223,14 @@ class _AsyncStalenessManager:
         return min(producer_concurrency_capacity, producer_staleness_capacity)
 
     async def acquire_submission_slot(self) -> None:
-        """Reserve a slot for generation (increments submitted and running).
+        """Block until generation capacity is available, then reserve a slot.
 
-        This method no longer blocks on staleness capacity. Concurrency is managed by
-        the number of workers (num_parallel_generation_workers), and stale groups are
-        discarded at consumption time in convert_generation_group_mini_batch_to_training_input().
-
-        This approach maximizes vLLM utilization by allowing all workers to submit work
-        immediately, rather than blocking when the staleness budget is exceeded.
+        Individual long-running generations can still exceed the aggregate staleness
+        budget; those attempts are regenerated before training.
         """
         async with self._cond:
-            # No blocking - just increment counters
-            # Concurrency is naturally bounded by num_parallel_generation_workers
+            while self._compute_capacity_unlocked() <= 0:
+                await self._cond.wait()
             self._stat.submitted += 1
             self._stat.running += 1
 
@@ -174,14 +240,17 @@ class _AsyncStalenessManager:
             self._stat.running -= 1
             self._cond.notify_all()
 
-    async def on_rollout_rejected(self) -> None:
-        """
-        Called when a generation is not accepted, or generation worker runs into error while generating a trajectory.
-
-        Currently, we do not call this method but instead raise errors. We might need to use this when we want to
-        filter out trajectories.
-        """
+    async def on_rollouts_discarded(self, count: int) -> None:
+        """Remove completed rejected attempts from capacity accounting."""
         async with self._cond:
+            self._stat.accepted -= count
+            self._stat.submitted -= count
+            self._cond.notify_all()
+
+    async def cancel_submission_slot(self) -> None:
+        """Release a reserved slot without accepting a completed group."""
+        async with self._cond:
+            self._stat.submitted -= 1
             self._stat.running -= 1
             self._cond.notify_all()
 
@@ -213,7 +282,12 @@ class _AsyncDataloader:
         self._iter = enumerate(self._train_dataloader)
         self._lock: asyncio.Lock = asyncio.Lock()
         self._data_tracker = data_tracker
+        self._pending_uids: set[str] = set()
         self._exhausted: bool = False
+
+    def reserve_pending_uids(self, uids: set[str]) -> None:
+        """Exclude checkpointed pending work from restarted dataset iteration."""
+        self._pending_uids.update(uids)
 
     def load_state_from_checkpoint(self) -> None:
         """
@@ -240,6 +314,7 @@ class _AsyncDataloader:
         async with self._lock:
             self._train_dataloader.load_state_dict(self._train_dataloader_initial_state)  # reset to initial state
             self._iter = enumerate(self._train_dataloader)
+            self._pending_uids.clear()
             self._exhausted = False
 
     async def get_next_non_consumed_data(self):
@@ -249,8 +324,8 @@ class _AsyncDataloader:
         If we loaded from a checkpoint, it will skip the already-consumed data. Returns None if the dataloader is exhausted.
         """
         assert self._iter is not None and self._lock is not None, "Dataloader not initialized; call reset() first"
-        # Read the skip set from the tracker (epoch-scoped consumed UIDs)
-        skip_set = self._data_tracker.get_consumed_uids_in_epoch()
+        # Resume skips groups that already trained and groups restored as pending work.
+        skip_set = self._data_tracker.get_consumed_uids_in_epoch() | self._pending_uids
         async with self._lock:
             try:
                 while True:
@@ -267,11 +342,6 @@ class _AsyncDataloader:
 
 
 class FullyAsyncRayPPOTrainer(RayPPOTrainer):
-    # Drives the fully-async loop -> enables the DRIVER-side collective-free
-    # seq_mean_token_sum_norm_global denominator precompute in train_critic_and_policy
-    # (the 80B gs1 NCCL-desync fix). See RayPPOTrainer.is_fully_async.
-    is_fully_async: bool = True
-
     def __init__(self, *args, **kwargs):
         # Extract cfg before base init so we can initialize async-specific knobs used by our overrides.
         cfg = kwargs.get("cfg", args[0] if len(args) > 0 else None)
@@ -281,12 +351,28 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.num_parallel_generation_workers = cfg.trainer.fully_async.num_parallel_generation_workers
         self.mini_batch_size = cfg.trainer.policy_mini_batch_size
         self.max_staleness_steps = cfg.trainer.fully_async.max_staleness_steps
+        self.admission_stall_timeout = int(cfg.trainer.fully_async.admission_stall_timeout)
+        if self.admission_stall_timeout <= 0:
+            raise ValueError("trainer.fully_async.admission_stall_timeout must be positive")
+        self._group_selection_policy = GroupSelectionPolicy.for_fully_async(
+            cfg.trainer.algorithm.dynamic_sampling.type,
+            criteria=resolve_dynamic_sampling_criteria(
+                cfg.trainer.algorithm.dynamic_sampling.informative_on,
+                float(cfg.trainer.algorithm.dynamic_sampling.min_reward_std),
+            ),
+        )
+        self._dynamic_sampling_type = self._group_selection_policy.sampling_type
+        max_sample_batches = int(cfg.trainer.algorithm.dynamic_sampling.max_sample_batches)
+        self._dynamic_sampling_max_sample_batches = max_sample_batches
+        self._dynamic_sampling_max_candidate_groups = (
+            max_sample_batches * int(cfg.trainer.train_batch_size) if max_sample_batches > 0 else None
+        )
 
         # Completed-but-unconsumed generation-buffer cap (head-node memory bound).
         #
         # WHY THIS KNOB (2026-07-10, 80B head-plasma/RAM overflow root-cause): the
         # per-epoch buffer below is `asyncio.Queue(maxsize=num_parallel_generation_workers)`.
-        # Each buffered `GeneratedOutputGroup` holds a full `GeneratorOutput` whose
+        # Each buffered `GeneratedOutputGroup` holds a full `TrajectoryBatch` whose
         # `rollout_routed_experts` (R3) capture is O(response_len · num_moe_layers ·
         # top_k) per token — for Qwen3-Next-80B (L=48, K=10) that is ~15 MiB/sequence,
         # ~126 MiB per 8-sample group. With `num_parallel_generation_workers=900` the
@@ -296,20 +382,50 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # depth is NOT a throughput lever here: generation concurrency is capped by the
         # inference engines' working set (num_inference_engines · max_num_seqs /
         # n_samples_per_prompt), NOT by the worker count, so a deep buffer only lets a
-        # stale rollout BACKLOG accumulate (most of which ages past max_staleness_steps
-        # and is discarded at consumption anyway). This knob lets us bound that backlog
-        # WITHOUT reducing worker concurrency.
+        # rollout backlog accumulate. This knob bounds the completed-output backlog
+        # without reducing the number of worker loops available for generation.
         #
         # Default None => maxsize == num_parallel_generation_workers, i.e. BYTE-IDENTICAL
         # to today's behavior (no config change => no behavior change). Set it to a small
         # multiple of the mini-batch (e.g. mini_batch_size · (max_staleness_steps + 1), or
         # a fixed 128) to cap the footprint to O(1) in async depth. NOTE: when this is set
         # below num_parallel_generation_workers, up to (num_parallel_generation_workers -
-        # cap) workers may block in `buffer.put(...)` each still holding ONE completed
-        # group, so to fully bound the head-node footprint you should ALSO lower
+        # cap) workers may wait on the shared queue condition while each still holds ONE
+        # completed group, so to fully bound the head-node footprint you should ALSO lower
         # num_parallel_generation_workers toward the engine working set.
         self.max_buffered_groups = (
             OmegaConf.select(cfg, "trainer.fully_async.max_buffered_groups", default=None)
+            or self.num_parallel_generation_workers
+        )
+
+        # Simultaneously-open generation groups, i.e. head-of-pipeline work in progress.
+        #
+        # WHY THIS KNOB: a worker loop opens one prompt group and asks the trajectory
+        # runner for all `generator.n_samples_per_prompt` rollouts of it in one call, so
+        # the rollout backend is asked for `max_concurrent_generation_groups ·
+        # n_samples_per_prompt` trials while it holds only `n_concurrent_trials` seats.
+        # At 32 workers x 32 samples against 320 seats that is 3.2x oversubscription:
+        # each open group gets ~10 of its 32 seats and so closes in three serialized
+        # waves instead of one. The trainer consumes COMPLETE groups, so spreading seats
+        # across many partially-open groups buys trial occupancy at the cost of group
+        # latency, and group latency is what the optimizer waits on.
+        #
+        # Bounding open groups to what the seat pool can fill at full width
+        # (n_concurrent_trials // n_samples_per_prompt) lets each open group take all 32
+        # of its seats, and a worker opens a new group only as one closes.
+        #
+        # This bounds work in progress and nothing else. It does not touch staleness:
+        # capacity remains `min(concurrency, staleness)` in `_compute_capacity_unlocked`,
+        # so `max_staleness_steps` is still the other half of that min() and per-group
+        # freshness classification is unchanged. Worker loops still number
+        # `num_parallel_generation_workers`; the surplus ones block in
+        # `acquire_submission_slot()`, which is the state they already reach today
+        # whenever the staleness half of the min() binds.
+        #
+        # Default None => equals num_parallel_generation_workers, i.e. BYTE-IDENTICAL to
+        # today's behavior: no config change means no behavior change.
+        self.max_concurrent_generation_groups = int(
+            OmegaConf.select(cfg, "trainer.fully_async.max_concurrent_generation_groups", default=None)
             or self.num_parallel_generation_workers
         )
 
@@ -320,23 +436,25 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             "Invalid num_parallel_generation_workers, must be >= mini_batch_size. Got: "
             f"{self.mini_batch_size=}, {self.num_parallel_generation_workers=}"
         )
-        # NOTE: Upper-bound guard (workers <= mini_batch_size * (max_staleness_steps + 1))
-        # commented out to allow scaling num_parallel_generation_workers independently of
-        # max_staleness_steps. Stale groups are discarded at consumption time in
-        # convert_generation_group_mini_batch_to_training_input(), so exceeding the
-        # capacity formula is safe — it just means some groups may be discarded.
-        #
-        # assert (
-        #     self.num_parallel_generation_workers <= self.mini_batch_size * (self.max_staleness_steps + 1)
-        # ), (
-        #     "Invalid num_parallel_generation_workers, the following must hold: "
-        #     "num_parallel_generation_workers <= mini_batch_size * (max_staleness_steps + 1). Got: "
-        #     f"{self.mini_batch_size=}, {self.num_parallel_generation_workers=}, {self.max_staleness_steps=}"
-        # )
-
+        assert self.mini_batch_size <= self.max_concurrent_generation_groups, (
+            "Invalid max_concurrent_generation_groups: fewer groups may be open than a "
+            "mini-batch needs, so the trainer can never assemble one. Got: "
+            f"{self.mini_batch_size=}, {self.max_concurrent_generation_groups=}"
+        )
+        assert self.max_concurrent_generation_groups <= self.num_parallel_generation_workers, (
+            "Invalid max_concurrent_generation_groups: it bounds the open groups the "
+            "worker loops share, so raising it above the worker count cannot open more. "
+            f"Got: {self.max_concurrent_generation_groups=}, {self.num_parallel_generation_workers=}"
+        )
         # Initialize base trainer
         super().__init__(*args, **kwargs)
-
+        self._group_admission_policy = GroupAdmissionPolicy(
+            self.group_advantage_invariant,
+            max_staleness_steps=self.max_staleness_steps,
+            rollout_logprobs_required=policy_loss_requires_rollout_logprobs(
+                self.cfg.trainer.algorithm.policy_loss_type
+            ),
+        )
         # K-actor rollout fan-out gate. Resolved in _maybe_enable_rollout_fanout()
         # at train() start; initialized False so the flag is always defined
         # (e.g. if train() is never reached, the weight-sync block stays a no-op).
@@ -345,9 +463,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # Some async-specific validations
         assert self.cfg.trainer.train_batch_size == self.cfg.trainer.policy_mini_batch_size, (
             "train_batch_size must equal policy_mini_batch_size for fully async training"
-        )
-        assert self.cfg.trainer.algorithm.dynamic_sampling.type is None, (
-            "dynamic sampling is not supported for fully async training yet."
         )
         assert not self.cfg.generator.batched, "batched is not supported for fully async training."
         assert self.cfg.generator.async_engine, "async_engine must be True for fully async training."
@@ -365,19 +480,32 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # Register the data tracking callback for checkpoint persistence and epoch transitions
         self.callback_handler.add_callback(DataTrackingCallback(self.data_tracker))
         # Register buffer checkpoint callback for saving/restoring generation buffer on resume
-        self.callback_handler.add_callback(BufferCheckpointCallback())
-        self._generation_output_group_buffer = None
+        self._buffer_checkpoint_callback = BufferCheckpointCallback()
+        self.callback_handler.add_callback(self._buffer_checkpoint_callback)
         self._pending_buffer_restore_path = None
         self._staleness_manager = _AsyncStalenessManager(
-            max_concurrent_generation_groups=self.num_parallel_generation_workers,
+            max_concurrent_generation_groups=self.max_concurrent_generation_groups,
             mini_batch_size=self.mini_batch_size,
             max_staleness_steps=self.max_staleness_steps,
         )
+        # Printed so a run's own log says which admission geometry it ran under. The
+        # A/B arms of a group-admission experiment otherwise differ only by a Hydra
+        # override that never reaches the log.
+        logger.info(
+            "fully-async admission geometry: "
+            f"workers={self.num_parallel_generation_workers} "
+            f"max_concurrent_generation_groups={self.max_concurrent_generation_groups} "
+            f"mini_batch={self.mini_batch_size} max_staleness_steps={self.max_staleness_steps}"
+        )
         # Tracked at instance level so the finally block in train() can cancel
         # them even when an exception skips the per-epoch epilogue.
-        self._active_generator_tasks: List[asyncio.Task] = []
+        self._active_trajectory_tasks: List[asyncio.Task] = []
+        self._groups_rejected_since_step = 0
+        self._rejection_reasons_since_step: collections.Counter[str] = collections.Counter()
+        self._groups_inspected_since_step = 0
+        self._step_time_history: collections.deque[float] = collections.deque(maxlen=5)
 
-    def _build_train_dataloader_and_compute_training_steps(self):
+    def _configure_training_schedule(self):
         """
         Overrides to build dataloader for fully async training. See `_AsyncDataloader` for more details.
         """
@@ -391,86 +519,56 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         logger.info(f"Number of steps per epoch: {self.num_steps_per_epoch}")
         logger.info(f"Total training steps: {self.total_training_steps}")
 
-    def _create_trainer_state(self, epoch: int) -> TrainerState:
-        """
-        Override to use num_steps_per_epoch for fully async training.
+    def _num_steps_per_epoch(self) -> int:
+        """Account for fully async mini-batch accumulation."""
+        return self.num_steps_per_epoch
 
-        In fully async training, the dataloader has batch size of 1 and we
-        accumulate mini_batch_size samples before training, so the number
-        of steps per epoch is different from len(train_dataloader).
-        """
-        return TrainerState(
-            global_step=self.global_step,
-            epoch=epoch,
-            total_steps=self.total_training_steps,
-            num_steps_per_epoch=self.num_steps_per_epoch,
-            is_last_step=(self.global_step == self.total_training_steps),
-            is_epoch_end=(self.global_step % self.num_steps_per_epoch == 0) if self.num_steps_per_epoch > 0 else False,
-            metrics=dict(self.all_metrics),
-            timings=dict(self.all_timings),
-        )
-
-    def _cancel_generator_tasks(self) -> None:
-        """Cancel any active generator tasks left over from an abnormal exit.
+    def _cancel_trajectory_tasks(self) -> None:
+        """Cancel any active generation tasks left over from an abnormal exit.
 
         Normally the per-epoch epilogue cancels these, but if an exception
         breaks out of the inner training loop the epilogue is skipped.
         """
-        tasks = self._active_generator_tasks
+        tasks = self._active_trajectory_tasks
         if not tasks:
             return
         n_running = sum(1 for t in tasks if not t.done())
         if n_running:
-            logger.warning(f"Cancelling {n_running} orphaned generator tasks from abnormal train loop exit")
+            logger.warning(f"Cancelling {n_running} orphaned generation tasks from abnormal train loop exit")
             for t in tasks:
                 t.cancel()
-        self._active_generator_tasks = []
+        self._active_trajectory_tasks = []
 
-    def _restore_buffer_from_checkpoint(self, buffer, checkpoint_path: str) -> None:
-        """Restore generation buffer items from a checkpoint (best-effort)."""
-        try:
-            items = BufferCheckpointCallback.load_buffer_items(checkpoint_path)
-            if not items:
-                return
-
-            restored = 0
-            for item in items:
-                try:
-                    buffer.put_nowait(item)
-                    self._staleness_manager._stat.accepted += 1
-                    self._staleness_manager._stat.submitted += 1
-                    restored += 1
-                except asyncio.QueueFull:
-                    logger.warning(
-                        f"Generation buffer full after restoring {restored}/{len(items)} items, skipping remaining"
-                    )
-                    break
-
-            if restored > 0:
-                logger.info(f"Restored {restored} generation buffer items from checkpoint")
-        except Exception as e:
-            logger.warning(f"Failed to restore generation buffer from checkpoint (best-effort): {e}")
+    def _restore_buffer_from_checkpoint(self, queues: _GenerationQueues, checkpoint_path: str) -> None:
+        """Restore completed outputs and pending retries from a checkpoint."""
+        buffer_state = BufferCheckpointCallback.load_buffer_state(checkpoint_path)
+        if len(buffer_state.completed_groups) > queues.completed.maxsize:
+            raise ValueError(
+                f"Checkpoint contains {len(buffer_state.completed_groups)} completed groups, exceeding buffer capacity "
+                f"{queues.completed.maxsize}"
+            )
+        self.async_train_dataloader.reserve_pending_uids(buffer_state.pending_uids())
+        for item in buffer_state.completed_groups:
+            queues.completed.put_nowait(item)
+        for prompts in buffer_state.retry_prompts:
+            queues.retries.put_nowait(prompts)
+        self._staleness_manager._stat.accepted += len(buffer_state.completed_groups)
+        self._staleness_manager._stat.submitted += len(buffer_state.completed_groups)
+        logger.info(
+            f"Restored {len(buffer_state.completed_groups)} completed generation groups and "
+            f"{len(buffer_state.retry_prompts)} pending retries "
+            "from checkpoint"
+        )
 
     def _maybe_enable_rollout_fanout(self) -> None:
-        """If ``rollout.fanout.enabled``, replace self.generator with a K-actor
-        RolloutDispatcher. Default OFF => no-op (self.generator unchanged, code
-        path byte-for-byte identical to today).
-
-        The dispatcher is generator-interface-compatible (startup/generate/
-        shutdown + eval-session passthrough + global_step_fn), so the rest of the
-        train loop is untouched. The staleness/async buffer stays single-loop in
-        this trainer (it must NOT be distributed — same code class as the prior
-        all_reduce key-mismatch NCCL deadlocks). The dispatcher owns no staleness
-        state; it only shards generate() and ships back compact GeneratorOutput.
-        """
+        """Enable configured multi-actor rollout collection without distributing staleness state."""
         rollout_cfg = OmegaConf.select(self.cfg, "rollout.fanout")
         self._rollout_fanout_enabled = bool(rollout_cfg is not None and getattr(rollout_cfg, "enabled", False))
         if not self._rollout_fanout_enabled:
             return
 
-        # Import lazily so the non-fanout path never imports the coordinator
-        # module (and its heavy transitive Harbor import on the dispatcher).
-        from examples.terminal_bench.rollout_coordinator import RolloutDispatcher
+        # Harbor is optional and absent from launcher-only CPU environments.
+        from skyrl_train.trajectory_runners.harbor.rollout_dispatcher import RolloutDispatcher  # noqa: PLC0415
 
         terminal_bench_cfg = OmegaConf.select(self.cfg, "terminal_bench_config")
         if terminal_bench_cfg is None:
@@ -481,17 +579,19 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         num_coordinators = int(getattr(rollout_cfg, "num_coordinators", 4))
         cpus_per_coordinator = int(getattr(rollout_cfg, "cpus_per_coordinator", 8))
+        coordinator_rpc_timeout = float(rollout_cfg.coordinator_rpc_timeout)
         logger.info(
-            f"Rollout fan-out ENABLED: replacing single-process generator with "
+            f"Rollout fan-out ENABLED: replacing single-process runner with "
             f"RolloutDispatcher (K={num_coordinators}, cpus_per_coordinator="
-            f"{cpus_per_coordinator})."
+            f"{cpus_per_coordinator}, coordinator_rpc_timeout={coordinator_rpc_timeout:g}s)."
         )
-        self.generator = RolloutDispatcher(
+        self.trajectory_runner = RolloutDispatcher(
             cfg=self.cfg,
-            generator_cfg=self.cfg.generator,
+            trajectory_runner_cfg=self.cfg.generator,
             terminal_bench_cfg=terminal_bench_cfg,
             num_coordinators=num_coordinators,
             cpus_per_coordinator=cpus_per_coordinator,
+            coordinator_rpc_timeout=coordinator_rpc_timeout,
         )
 
     async def train(self):
@@ -500,72 +600,27 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         """
         self.global_step = 0
 
-        # Optionally swap the single-process generator for a K-actor rollout
-        # dispatcher (gated; default OFF => no-op, self.generator unchanged).
+        # Optionally swap the single-process runner for a K-actor rollout
+        # dispatcher (gated; default OFF => no-op, self.trajectory_runner unchanged).
         self._maybe_enable_rollout_fanout()
 
-        # Initialize generator resources (e.g., shared QueueOrchestrator for Harbor)
-        # This must happen before any generate() calls. When fan-out is enabled,
-        # self.generator is now the RolloutDispatcher, whose startup() builds the
-        # PlacementGroup + K coordinators and starts each coordinator's generator.
-        try:
-            await self.generator.startup()
-            logger.info("Generator startup complete")
-        except Exception as e:
-            logger.opt(depth=0).error("Generator startup failed: " + str(e))
-            raise
+        await self._startup_trajectory_runner()
 
         try:
             await self._train_loop()
         except Exception as e:
-            logger.opt(exception=True).error(
-                "Train loop failed at global_step " + str(self.global_step) + ": " + str(e)
-            )
+            log_exception_as_text(f"Train loop failed at global_step {self.global_step}", e)
             raise
         finally:
-            # Cancel any orphaned generator tasks that survived an early exit
+            # Cancel any orphaned generation tasks that survived an early exit
             # (the per-epoch epilogue only runs on normal loop completion).
-            self._cancel_generator_tasks()
+            self._cancel_trajectory_tasks()
 
             await self._teardown()
 
-    async def _handle_resume_at_max_steps(self) -> None:
-        """Handle a run that resumed AT or PAST max_steps (already complete).
-
-        Fires the on_train_end callbacks (so any configured final checkpoint /
-        HF export / HF upload runs if it is missing) and returns without executing
-        another training step. This makes a resumed-at-max run exit 0 (clean
-        COMPLETED), which terminates the afternotok restart chain instead of
-        overshooting to gs N+1 and FAILING.
-        """
-        logger.info(
-            f"Resumed at global_step {self.global_step} >= max training steps "
-            f"({self.total_training_steps}); run is already COMPLETE. Skipping further "
-            f"training and finalizing (export/upload if missing)."
-        )
-
-        final_epoch = max(self.cfg.trainer.epochs - 1, 0)
-        final_state = self._create_trainer_state(epoch=final_epoch)
-        self._control.reset()
-        self._control = await self.callback_handler.call_event_async(
-            "on_train_end", final_state, self._control, trainer=self
-        )
-
-        # Honor final-save requests from callbacks (idempotent: re-saving the gsN
-        # checkpoint / re-exporting HF is safe and ensures the export exists).
-        if self._control.should_save:
-            with Timer("save_checkpoints", self.all_timings):
-                await asyncio.to_thread(self.save_checkpoints)
-                logger.info("Saved final checkpoint (resume-at-max finalize).")
-        if self._control.should_save_hf_model:
-            with Timer("save_hf_model", self.all_timings):
-                await asyncio.to_thread(self.save_models)
-                logger.info("Saved final HF model (resume-at-max finalize).")
-        logger.info("Training already complete on resume — exiting cleanly.")
-
     async def _train_loop(self):
         """
-        Internal training loop, separated for proper generator lifecycle management.
+        Internal training loop, separated for proper trajectory-runner lifecycle management.
         """
         # Load checkpoint state if resumption is enabled.
         # Data consumption state is loaded via DataTrackingCallback.load_from_checkpoint()
@@ -574,6 +629,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             with Timer("load_checkpoints"):
                 self.global_step, checkpoint_path = self.load_checkpoints()
                 logger.info(f"Resumed training from global_step {self.global_step}")
+
                 if self.global_step > 0:
                     # Load data consumption state into the tracker
                     loaded = DataTrackingCallback.load_from_checkpoint(checkpoint_path, self.data_tracker)
@@ -653,6 +709,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # main training loop
         pbar = tqdm(total=self.total_training_steps, initial=self.global_step, desc="Training Step Progress")
         start_epoch = self.global_step // self.num_steps_per_epoch
+        last_completed_step = self.global_step
         self.global_step += 1  # start training at global_step 1
         for epoch in range(start_epoch, self.cfg.trainer.epochs):
             # 0. Per-epoch prologue. Note that we do not do any cross-epoch asynchrony here.
@@ -661,65 +718,51 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             # (byte-identical to prior behavior) but can be bounded independently via
             # trainer.fully_async.max_buffered_groups to cap head-node memory — see
             # self.max_buffered_groups in __init__.
-            generation_output_group_buffer = asyncio.Queue[GeneratedOutputGroup](maxsize=self.max_buffered_groups)
+            generation_queues = _GenerationQueues(
+                completed=asyncio.Queue(maxsize=self.max_buffered_groups),
+                retries=asyncio.Queue(),
+                condition=asyncio.Condition(),
+            )
 
-            # Store buffer ref for checkpoint callback access
-            self._generation_output_group_buffer = generation_output_group_buffer
+            self._buffer_checkpoint_callback.bind_queues(generation_queues)
 
             # Restore buffer from checkpoint if resuming
             if self._pending_buffer_restore_path is not None:
-                self._restore_buffer_from_checkpoint(generation_output_group_buffer, self._pending_buffer_restore_path)
+                self._restore_buffer_from_checkpoint(
+                    generation_queues,
+                    self._pending_buffer_restore_path,
+                )
                 self._pending_buffer_restore_path = None
 
-            # Provide the generator with a live reference to global_step so it can
+            # Provide the runner with a live reference to global_step so it can
             # capture the step at first vLLM inference (for accurate staleness tracking).
-            self.generator.global_step_fn = lambda: self.global_step
+            self.trajectory_runner.global_step_fn = lambda: self.global_step
 
             # Maintain self.num_parallel_generation_workers concurrent group-generation workers.
             # Stored on self so the finally block in train() can cancel them on abnormal exit.
-            self._active_generator_tasks = [
-                asyncio.create_task(self._run_generate_for_a_group_loop(generation_output_group_buffer))
+            self._active_trajectory_tasks = [
+                asyncio.create_task(self._run_generate_for_a_group_loop(generation_queues))
                 for _ in range(self.num_parallel_generation_workers)
             ]
-            generator_tasks = self._active_generator_tasks
+            trajectory_tasks = self._active_trajectory_tasks
 
             for _ in range(self.global_step, (1 + epoch) * self.num_steps_per_epoch + 1):
                 with Timer("step", self.all_timings):
-                    # 1. Wait until we have enough groups buffered.
-                    cur_generation_group_mini_batch: List[GeneratedOutputGroup] = []
-                    with Timer("wait_for_generation_buffer", self.all_timings):
-                        buffer_pbar = tqdm(
-                            total=self.mini_batch_size,
-                            initial=0,
-                            desc="Generation Buffer Progress",
-                            position=1,
+                    # 1. Discard every completed stale attempt and wait for a full fresh batch.
+                    with (
+                        Timer("wait_for_generation_buffer", self.all_timings),
+                        critical_phase("rollout_or_inference_wait"),
+                    ):
+                        cur_generation_group_mini_batch = await self._get_admitted_generation_group_mini_batch(
+                            generation_queues,
                         )
-                        # NOTE(Charlie): we currently trim the train_dataloader to make it perfectly divisible by
-                        # self.mini_batch_size, and assume that all trajectories succeed (just like sync training),
-                        # so we always get a full mini-batch. Otherwise (e.g. want to drop stale trajectories), we
-                        # should handle the case where the dataloader is exhausted and the buffer is empty, or
-                        # else this loop will never exit.
-                        while len(cur_generation_group_mini_batch) < self.mini_batch_size:
-                            # We do finish-time FIFO here (not schedule-time FIFO)
-                            cur_generation_group_mini_batch.append(await generation_output_group_buffer.get())
-                            buffer_pbar.update(1)
-                            buffer_pbar.set_postfix({"buffer qsize": generation_output_group_buffer.qsize()})
-                        buffer_pbar.close()
 
-                    # 2. Post-process the generated groups, aggregating to a single GeneratorOutput, and convert to training format.
-                    #    If all groups are stale, wait for more fresh data instead of crashing.
-                    training_input = None
-                    while training_input is None:
-                        with Timer("convert_to_training_input", self.all_timings):
-                            training_input = await asyncio.to_thread(
-                                self.convert_generation_group_mini_batch_to_training_input,
-                                cur_generation_group_mini_batch,
-                            )
-                        if training_input is None:
-                            logger.info("Waiting for fresh generation data (refilling mini-batch)...")
-                            cur_generation_group_mini_batch = []
-                            while len(cur_generation_group_mini_batch) < self.mini_batch_size:
-                                cur_generation_group_mini_batch.append(await generation_output_group_buffer.get())
+                    # 2. Post-process the complete generated mini-batch and convert it to training format.
+                    with Timer("convert_to_training_input", self.all_timings):
+                        training_input = await asyncio.to_thread(
+                            self.convert_generation_group_mini_batch_to_training_input,
+                            cur_generation_group_mini_batch,
+                        )
 
                     # TIS graceful-degrade observability (Fix A): record whether THIS
                     # training batch was missing all rollout logprobs (-> TIS skipped,
@@ -796,15 +839,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                 # Handle checkpoint saving
                 if self._control.should_save:
-                    with Timer("save_checkpoints", self.all_timings):
-                        await asyncio.to_thread(self.save_checkpoints)
-                    await self.callback_handler.call_event_async("on_save", step_state, self._control, trainer=self)
+                    await self._save_intermediate_checkpoint(step_state)
                     self._control.should_save = False
 
                 # Handle HF model saving
                 if self._control.should_save_hf_model:
-                    with Timer("save_hf_model", self.all_timings):
-                        await asyncio.to_thread(self.save_models)
+                    await asyncio.to_thread(self.handle_hf_export)
                     self._control.should_save_hf_model = False
 
                 # Handle evaluation
@@ -833,9 +873,14 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     )
 
                 self.all_metrics = {}
+                step_duration = self.all_timings.get("step")
+                if step_duration is not None:
+                    self._step_time_history.append(step_duration)
                 self.all_timings = {}
                 pbar.update(1)
 
+                last_completed_step = self.global_step
+                record_policy_step(self.global_step)
                 self.global_step += 1
 
                 # 9. Notify generation workers that the capacity has increased, unblocking them.
@@ -852,12 +897,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     break
 
             # 12. Per-epoch epilogue.
-            # Call on_epoch_end callbacks
-            epoch_state = self._create_trainer_state(epoch=epoch)
-            self._control.reset()
-            self._control = await self.callback_handler.call_event_async(
-                "on_epoch_end", epoch_state, self._control, trainer=self
-            )
+            # Call on_epoch_end callbacks, but only when the epoch actually
+            # ended -- see _epoch_completed. The rest of the epilogue still runs
+            # on the way out of a max_steps stop; it is only the callbacks that
+            # must not, because they clear state the final checkpoint is about
+            # to be written from.
+            if _epoch_completed(self.global_step, epoch, self.num_steps_per_epoch):
+                epoch_state = self._create_trainer_state(epoch=epoch)
+                self._control.reset()
+                self._control = await self.callback_handler.call_event_async(
+                    "on_epoch_end", epoch_state, self._control, trainer=self
+                )
 
             # Handle ref model update at epoch end (via RefModelUpdateCallback or direct config)
             ref_callback = self._get_ref_update_callback()
@@ -865,28 +915,25 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 with Timer("update_ref_with_policy", self.all_timings):
                     await asyncio.to_thread(self.update_ref_with_policy)
 
-            # Cancel generator tasks for this epoch
-            for t in generator_tasks:
+            # Cancel generation tasks for this epoch
+            for t in trajectory_tasks:
                 t.cancel()
             try:
-                await asyncio.gather(*generator_tasks, return_exceptions=True)
+                await asyncio.gather(*trajectory_tasks, return_exceptions=True)
             except Exception:
                 pass
-            self._active_generator_tasks = []
+            self._active_trajectory_tasks = []
 
             # Per-epoch reset/validation for data loading and staleness management
-            assert all(t.done() for t in generator_tasks), (
-                "Generator tasks must be done before resetting the dataloader manager and validating the staleness manager."
+            assert all(t.done() for t in trajectory_tasks), (
+                "Trajectory runner tasks must be done before resetting the dataloader manager and validating the staleness manager."
             )
             # Drain any generation outputs that arrived after the training loop
             # stopped consuming (race between producer enqueue and consumer exit).
-            n_drained = 0
-            while not generation_output_group_buffer.empty():
-                try:
-                    generation_output_group_buffer.get_nowait()
-                    n_drained += 1
-                except asyncio.QueueEmpty:
-                    break
+            n_drained = len(_drain_queue(generation_queues.completed))
+            assert generation_queues.retries.empty(), (
+                f"Epoch ended with {generation_queues.retries.qsize()} stale-group retries still pending"
+            )
             if n_drained > 0:
                 logger.warning(
                     f"Drained {n_drained} unconsumed generation output(s) at epoch boundary "
@@ -919,22 +966,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # End of training
         pbar.close()
 
-        # Call on_train_end callbacks
-        final_state = self._create_trainer_state(epoch=self.cfg.trainer.epochs - 1)
-        self._control.reset()
-        self._control = await self.callback_handler.call_event_async(
-            "on_train_end", final_state, self._control, trainer=self
+        await self._finalize_training(
+            completed_step=last_completed_step,
+            epoch=self.cfg.trainer.epochs - 1,
         )
-
-        # Handle final checkpoint/model save if requested by callbacks
-        if self._control.should_save:
-            with Timer("save_checkpoints", self.all_timings):
-                await asyncio.to_thread(self.save_checkpoints)
-                logger.info("Saved final checkpoint.")
-        if self._control.should_save_hf_model:
-            with Timer("save_hf_model", self.all_timings):
-                await asyncio.to_thread(self.save_models)
-                logger.info("Saved final model.")
         logger.info("Training done!")
 
     async def _run_training(self, training_input: TrainingInputBatch):
@@ -973,13 +1008,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # calculate advantages and returns / along with tensorboard logging
         with Timer("compute_advantages_and_returns", self.all_timings):
             training_input = self.compute_advantages_and_returns(training_input)
-            # remove some unwanted keys
-            for key in ["rewards"]:
-                training_input.pop(key)
-            training_input.metadata.pop("uids")
-
-            if self.cfg.trainer.algorithm.advantage_batch_normalize:
-                training_input = normalize_advantages_dict(training_input)
+            training_input = self.finalize_advantages_for_training(training_input)
 
         if self.cfg.trainer.dump_data_batch:
             # dump data to file
@@ -987,26 +1016,32 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 self.dump_data(training_input, file_name=f"global_step_{self.global_step}_training_input")
 
         # train policy/critic model
-        with Timer("train_critic_and_policy", self.all_timings):
+        with Timer("train_critic_and_policy", self.all_timings), critical_phase("train_step"):
             status = await asyncio.to_thread(self.train_critic_and_policy, training_input)
 
         return status
 
-    async def _run_generate_for_a_group_loop(self, generation_output_group_buffer: asyncio.Queue):
-        """
-        Generator worker: repeatedly pulls the next prompt (possibly blocked by staleness control),
-        generates one single generation group, respecting a pause/resume event, and enqueues the result.
-        """
+    async def _run_generate_for_a_group_loop(self, queues: _GenerationQueues):
+        """Generate dataset rows or retries and route only fresh groups to the completed queue."""
         try:
             while True:
-                # 0. Pull next batch from dataloader. If returns None, then dataloader is exhausted.
-                rand_prompts = await self.async_train_dataloader.get_next_non_consumed_data()
-                if rand_prompts is None:
-                    return
-
-                # 1. Prepare generator input
+                slot_acquired = False
+                rand_prompts, selection_source = await self._next_generation_prompts(queues)
+                task_id = rand_prompts[0]["uid"]
+                attempt = GenerationAttempt(
+                    task_id=task_id,
+                    selection_source=selection_source,
+                    optimizer_step_at_selection=self.global_step,
+                )
+                await self._dispatch_generation_event(
+                    "on_generation_selected",
+                    attempt=attempt,
+                    prompts=rand_prompts,
+                )
+                await self._staleness_manager.acquire_submission_slot()
+                slot_acquired = True
                 assert len(rand_prompts) == 1
-                generator_input, uids = prepare_generator_input(
+                trajectory_request, uids = prepare_trajectory_request(
                     rand_prompts,
                     self.cfg.generator.n_samples_per_prompt,
                     get_sampling_params_for_backend(self.cfg.generator.backend, self.cfg.generator.sampling_params),
@@ -1016,85 +1051,105 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 )
                 assert all(uid == uids[0] for uid in uids), "Expect all uids to be the same"
 
-                # 2. Acquire capacity slot.
-                # Capture global_step pessimistically at submission time (before
-                # generation starts) so the staleness value for the whole group
-                # reflects the earliest possible step, not a later one.
-                slot_acquired = False
-                global_step_at_start = self.global_step  # pessimistic: capture BEFORE slot acquisition
-                await self._staleness_manager.acquire_submission_slot()
-                slot_acquired = True
+                # Capture a fallback global step before collection. Runners that
+                # record sampled-token steps replace it with actual_global_step below.
+                global_step_at_start = self.global_step
 
-                # 3. Generate one rollout group
-
-                if "disable_tqdm" in inspect.signature(self.generator.generate).parameters:
-                    # A workaround to disable tqdm for the SkyRLGymGenerator.generate method which will
-                    # blast the console with each worker's progress bar.
-                    cur_generator_output: GeneratorOutput = await self.generator.generate(
-                        generator_input, disable_tqdm=True
-                    )
-                else:
-                    cur_generator_output: GeneratorOutput = await self.generator.generate(generator_input)
-
-                # 4. Enqueue the completed group and mark accepted to free capacity slot.
-                # Prefer the actual global_step captured at first vLLM inference (more accurate
-                # staleness) over the pessimistic capture at task pickup time.
-                actual_step = cur_generator_output.get("actual_global_step")
-                staleness_step = actual_step if actual_step is not None else global_step_at_start
-                # Backpressure: BLOCK on a full buffer instead of crashing.
-                #
-                # The buffer is sized maxsize=num_parallel_generation_workers (== the
-                # number of these worker loops). Each worker, after a put, loops back and
-                # generates AGAIN — so while the consumer is blocked inside a long (e.g.
-                # 80B, multi-hour) training step, a single worker can produce MORE than one
-                # completed group before any are drained. With nothing draining, the prior
-                # put_nowait() would raise QueueFull on the (maxsize+1)-th enqueue and the
-                # except-handler below would sys.exit(1) and kill the driver. That overflow
-                # is INEVITABLE whenever a training step is slow relative to rollout
-                # throughput (root cause of the 80B step-2 failure, job 665754).
-                #
-                # `await buffer.put(...)` provides the natural, correct bound: a producer
-                # that finishes while the buffer is full simply WAITS for the consumer to
-                # free a slot, rather than crashing. This is a strict no-op in the
-                # not-full case (put returns immediately, identical to put_nowait), so the
-                # fast-consumer arms (8B TIS) are byte-for-byte unchanged. It structurally
-                # bounds buffered-but-unconsumed groups to exactly `maxsize` — without
-                # enlarging the buffer. Per-group staleness is still enforced downstream in
-                # convert_generation_group_mini_batch_to_training_input(), which discards
-                # any group staler than max_staleness_steps.
-                #
-                # Counter accounting is preserved: the submission slot (`running`) stays
-                # held across the (possibly blocking) put, and on_rollout_accepted() —
-                # which moves the rollout from `running` to `accepted` — fires only AFTER
-                # the group is actually buffered, which is exactly correct. If the worker
-                # is cancelled while blocked in put(), slot_acquired is still True so the
-                # CancelledError handler below reconciles submitted/running.
-                await generation_output_group_buffer.put(
-                    GeneratedOutputGroup(
-                        generator_output=cur_generator_output,
-                        uid=uids[0],
-                        global_step_when_scheduled=staleness_step,
-                    )
+                # Disable each runner's progress bar so concurrent workers do not flood the console.
+                cur_trajectory_batch: TrajectoryBatch = await self.trajectory_runner.run(
+                    trajectory_request, disable_tqdm=True
                 )
+                record_generated_work(
+                    cur_trajectory_batch["response_ids"],
+                    cur_trajectory_batch.get("is_last_step"),
+                )
+
+                # Prefer the earliest global step captured during inference over the fallback.
+                actual_step = cur_trajectory_batch.get("actual_global_step")
+                staleness_step = actual_step if actual_step is not None else global_step_at_start
+                completed_group = GeneratedOutputGroup(
+                    trajectory_batch=cur_trajectory_batch,
+                    uid=uids[0],
+                    earliest_model_step=staleness_step,
+                    source_prompts=rand_prompts,
+                    generation_attempt=attempt,
+                )
+                freshness = await self._enqueue_if_fresh(queues, completed_group)
+                if freshness is _GroupFreshness.STALE:
+                    await self._record_generation_outcome(completed_group, "stale")
+                    await self._staleness_manager.cancel_submission_slot()
+                    slot_acquired = False
+                    self._record_admission_scan(
+                        [(completed_group, AdmissionDecision((AdmissionRejection.STALE,)))],
+                        inspected_count=1,
+                    )
+                    continue
+                record_rollout_buffer(queues.completed.qsize(), queues.completed.maxsize)
                 await self._staleness_manager.on_rollout_accepted()
                 slot_acquired = False  # Slot properly released; safe for next iteration
         except asyncio.CancelledError:
             # If a slot was acquired but generation was cancelled before
             # on_rollout_accepted() ran, undo the slot acquisition so that
             # validate_state_at_epoch_end() sees running == 0 and
-            # submitted == accepted.  We adjust the counters synchronously
-            # because we cannot reliably `await` inside a CancelledError
-            # handler (the next await would re-raise CancelledError).
-            if "slot_acquired" in locals() and slot_acquired:
-                self._staleness_manager._stat.submitted -= 1
-                self._staleness_manager._stat.running -= 1
+            # submitted == accepted.
+            if slot_acquired:
+                await self._staleness_manager.cancel_submission_slot()
+            return
+        except GenerationStalledError:
+            # The dataset is exhausted and no retries are arriving — this
+            # worker has no more work to do for the epoch. Exit gracefully.
+            if slot_acquired:
+                await self._staleness_manager.cancel_submission_slot()
+            logger.info("Trajectory worker exiting: collection stalled (dataset exhausted, no retries)")
             return
         except Exception as e:
-            logger.opt(exception=True).error("Generator worker errored out with exception: " + str(e))
-            if "slot_acquired" in locals() and slot_acquired:
-                self._staleness_manager._stat.submitted -= 1
-                self._staleness_manager._stat.running -= 1
+            log_exception_as_text("Trajectory worker failed", e)
+            if slot_acquired:
+                await self._staleness_manager.cancel_submission_slot()
             sys.exit(1)
+
+    async def _next_generation_prompts(
+        self,
+        queues: _GenerationQueues,
+    ) -> tuple[List[dict], str]:
+        """Prefer retries and wait for one after the epoch's dataset rows are scheduled.
+
+        Returns one prompt group and its selection source, either ``dataset``
+        or ``stale_retry``.
+
+        Raises ``GenerationStalledError`` when the dataset is exhausted and no
+        retries arrive within the stall deadline, so the caller can end the
+        epoch instead of blocking forever.
+        """
+        try:
+            return queues.retries.get_nowait(), STALE_RETRY_SELECTION_SOURCE
+        except asyncio.QueueEmpty:
+            prompts = await self.async_train_dataloader.get_next_non_consumed_data()
+            if prompts is not None:
+                return prompts, DATASET_SELECTION_SOURCE
+
+        try:
+            return (
+                await asyncio.wait_for(
+                    queues.retries.get(),
+                    timeout=self._generation_stall_timeout(),
+                ),
+                STALE_RETRY_SELECTION_SOURCE,
+            )
+        except asyncio.TimeoutError:
+            raise GenerationStalledError("Dataset exhausted and no retries arrived within the stall deadline")
+
+    async def _enqueue_if_fresh(self, queues: _GenerationQueues, group: GeneratedOutputGroup) -> _GroupFreshness:
+        """Enqueue a fresh group or route a stale group to retry."""
+        async with queues.condition:
+            while queues.completed.full():
+                await queues.condition.wait()
+            freshness = self._classify_and_route_group(queues, group)
+            if freshness is _GroupFreshness.STALE:
+                return freshness
+            queues.completed.put_nowait(group)
+            queues.condition.notify_all()
+            return freshness
 
     async def async_sync_policy_weights_to_inference_engines(self):
         # Pre-broadcast drain: hard-sync every policy shard rank's event loop BEFORE the
@@ -1141,88 +1196,344 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         refs = self.policy_model.async_run_ray_method("pass_through", "barrier_all")
         await asyncio.gather(*refs)
 
-    def convert_generation_group_mini_batch_to_training_input(
-        self, cur_generation_group_mini_batch: List[GeneratedOutputGroup]
-    ) -> Optional[TrainingInputBatch]:
-        """Given a mini-batch of generated groups, concatenate them into a single GeneratorOutput, then convert to a TrainingInputBatch.
+    def _classify_and_route_group(self, queues: _GenerationQueues, group: GeneratedOutputGroup) -> _GroupFreshness:
+        if self._group_admission_policy.is_stale(group, global_step=self.global_step):
+            queues.retries.put_nowait(group.source_prompts)
+            return _GroupFreshness.STALE
+        return _GroupFreshness.FRESH
 
-        Stale groups (staleness > max_staleness_steps) are discarded rather than trained on.
-        This is the deadline-based staleness control approach: instead of blocking workers
-        at submission time, we allow all workers to submit freely and discard stale results
-        at consumption time. This maximizes vLLM utilization.
+    def _record_admission_scan(
+        self,
+        rejected_groups: List[tuple[GeneratedOutputGroup, AdmissionDecision]],
+        *,
+        inspected_count: int,
+    ) -> None:
+        self._groups_rejected_since_step += len(rejected_groups)
+        for _, decision in rejected_groups:
+            assert decision.primary_rejection is not None
+            self._rejection_reasons_since_step[decision.primary_rejection.value] += 1
+        self._groups_inspected_since_step += inspected_count
 
-        Returns None if all groups in the mini-batch were stale, signaling the caller to
-        wait for fresh data rather than crash.
-        """
-        generator_outputs = []
-        uids = []
-        stalenesses = []
-        discarded_count = 0
-        discarded_uids = []
-        group_size = len(cur_generation_group_mini_batch[0].generator_output["response_ids"])
+    def _partition_completed_groups(
+        self, completed_groups: List[GeneratedOutputGroup], occupied_uids: set[str]
+    ) -> _AdmissionPartition:
+        """Evaluate completed work and select at most one representative per UID."""
+        decisions = [
+            self._group_admission_policy.evaluate(group, global_step=self.global_step) for group in completed_groups
+        ]
+        selected_index_by_uid: dict[str, int] = {}
+        for index, (group, decision) in enumerate(zip(completed_groups, decisions, strict=True)):
+            if group.uid in occupied_uids:
+                continue
+            selected_index = selected_index_by_uid.get(group.uid)
+            if selected_index is None or (decision.accepted and not decisions[selected_index].accepted):
+                selected_index_by_uid[group.uid] = index
 
-        for cur_generated_output_group in cur_generation_group_mini_batch:
-            cur_staleness = self.global_step - cur_generated_output_group.global_step_when_scheduled
-
-            # Discard stale groups instead of training on them
-            if cur_staleness > self.max_staleness_steps:
-                logger.info(
-                    f"Discarding stale group uid={cur_generated_output_group.uid} "
-                    f"staleness={cur_staleness} > max={self.max_staleness_steps}"
-                )
-                discarded_count += 1
-                discarded_uids.append(cur_generated_output_group.uid)
-                continue  # Skip this group
-
-            stalenesses.append(cur_staleness)
-            generator_outputs.append(cur_generated_output_group.generator_output)
-            uids.extend([cur_generated_output_group.uid] * group_size)
-
-        # Handle edge case: all groups were discarded — signal caller to wait and retry
-        if len(generator_outputs) == 0:
-            logger.warning(
-                f"All {len(cur_generation_group_mini_batch)} groups in mini-batch were stale and discarded "
-                f"(max_staleness_steps={self.max_staleness_steps}). "
-                f"Training will wait for fresh generation data."
-            )
-            return None
-
-        # Log discard and effective batch statistics (always, not just when discarding)
-        total_groups = len(cur_generation_group_mini_batch)
-        kept_groups = len(generator_outputs)
-        discard_rate = discarded_count / total_groups if total_groups > 0 else 0.0
-        logger.info(
-            f"Step {self.global_step}: effective_batch={kept_groups * group_size} samples "
-            f"({kept_groups}/{total_groups} groups), discard_rate={discard_rate:.1%}"
+        duplicate_decision = AdmissionDecision((AdmissionRejection.DUPLICATE_UID,))
+        accepted_groups = []
+        rejected_groups = []
+        discarded_groups = []
+        for index, (group, decision) in enumerate(zip(completed_groups, decisions, strict=True)):
+            if group.uid in occupied_uids or selected_index_by_uid[group.uid] != index:
+                discarded_groups.append((group, duplicate_decision))
+            elif decision.accepted:
+                accepted_groups.append(group)
+            else:
+                rejected_groups.append((group, decision))
+        return _AdmissionPartition(
+            accepted_groups=accepted_groups,
+            rejected_groups=rejected_groups,
+            discarded_groups=discarded_groups,
         )
 
-        generator_output = concatenate_generator_outputs(generator_outputs)
-        assert generator_output["rollout_metrics"] is not None, "Rollout metrics should be non-null."
-        self.all_metrics.update(generator_output["rollout_metrics"])
+    def _publish_admission_metrics(self, *, dynamic_candidate_count: int, dynamic_discarded_count: int) -> None:
+        rejected = self._groups_rejected_since_step
+        inspected = self._groups_inspected_since_step
+        assert inspected > 0, "An admitted training batch requires at least one inspected completed group"
+        reason_counts = self._rejection_reasons_since_step
+        self._groups_rejected_since_step = 0
+        self._rejection_reasons_since_step = collections.Counter()
+        self._groups_inspected_since_step = 0
+        metrics = {
+            "async/rejected_count": rejected,
+            "async/rejected_rate": rejected / inspected,
+        }
+        if self._dynamic_sampling_type is DynamicSamplingType.FILTER:
+            metrics.update(
+                {
+                    "async/dynamic_sampling/candidate_count": dynamic_candidate_count,
+                    "async/dynamic_sampling/discarded_count": dynamic_discarded_count,
+                    "async/dynamic_sampling/discarded_rate": (
+                        dynamic_discarded_count / dynamic_candidate_count if dynamic_candidate_count else 0.0
+                    ),
+                }
+            )
+        metrics.update(
+            {f"async/rejected_count/{reason.value}": reason_counts[reason.value] for reason in AdmissionRejection}
+        )
+        self.all_metrics.update(metrics)
+        if rejected:
+            logger.warning(
+                f"Rejected {rejected} completed groups before step {self.global_step}; "
+                f"reasons={dict(reason_counts)}. Waiting produced a full "
+                f"{self.mini_batch_size}-group replacement batch."
+            )
+        if dynamic_discarded_count:
+            logger.info(
+                f"Dynamic sampling discarded {dynamic_discarded_count} of {dynamic_candidate_count} "
+                f"candidate groups before step {self.global_step}."
+            )
+
+    def _generation_stall_timeout(self) -> float:
+        """Adaptive deadline for receiving new groups during a generation wait.
+
+        Returns a multiple of the recent median step time (at least 10 minutes)
+        so the stall fires long before a human would notice, but never during
+        normal cadence.  When no step history exists (first step), defaults to
+        30 minutes.
+        """
+        if not self._step_time_history:
+            return 1800.0
+        sorted_times = sorted(self._step_time_history)
+        median = sorted_times[len(sorted_times) // 2]
+        return max(median * 5.0, 600.0)
+
+    def _any_trajectory_workers_alive(self) -> bool:
+        return any(not t.done() for t in self._active_trajectory_tasks)
+
+    def _check_generation_stall(self, elapsed: float) -> float:
+        """Raise ``GenerationStalledError`` if no producers remain, else extend the deadline.
+
+        Returns the new stall timeout for the next wait cycle.
+        """
+        if not self._any_trajectory_workers_alive():
+            raise GenerationStalledError(f"Generation stalled: waited {elapsed:.0f}s, no active generators")
+        logger.warning(
+            f"Generation stall watchdog: {elapsed:.0f}s since last progress, "
+            f"generators still alive — extending deadline"
+        )
+        return self._generation_stall_timeout()
+
+    def _check_admission_stall(self, elapsed: float, rejection_counts: collections.Counter[str]) -> float:
+        """Raise on rejected-only progress, or restart the admission deadline."""
+        if rejection_counts:
+            raise GenerationStalledError(
+                f"Generation stalled: no groups admitted for {elapsed:.0f}s; "
+                f"rejected completions={dict(rejection_counts)}"
+            )
+        self._check_generation_stall(elapsed)
+        return float(self.admission_stall_timeout)
+
+    def _select_dynamic_sampling_candidates(
+        self,
+        candidates: List[GeneratedOutputGroup],
+        *,
+        available_slots: int,
+    ) -> _CandidateSelection:
+        admitted_groups = []
+        discarded_groups = []
+        discarded_reasons: collections.Counter[str] = collections.Counter()
+        candidate_count = 0
+
+        for candidate_index, group in enumerate(candidates):
+            if len(admitted_groups) >= available_slots:
+                return _CandidateSelection(
+                    admitted_groups=admitted_groups,
+                    surplus_groups=candidates[candidate_index:],
+                    discarded_groups=discarded_groups,
+                    discarded_reasons=discarded_reasons,
+                    candidate_count=candidate_count,
+                )
+
+            selection_result = self._group_selection_policy.evaluate(group)
+            candidate_count += int(self._dynamic_sampling_type is DynamicSamplingType.FILTER)
+            if selection_result is GroupSelectionResult.KEEP:
+                admitted_groups.append(group)
+            else:
+                discarded_groups.append((group, selection_result))
+                discarded_reasons[selection_result.value] += 1
+
+        return _CandidateSelection(
+            admitted_groups=admitted_groups,
+            surplus_groups=[],
+            discarded_groups=discarded_groups,
+            discarded_reasons=discarded_reasons,
+            candidate_count=candidate_count,
+        )
+
+    async def _get_admitted_generation_group_mini_batch(self, queues: _GenerationQueues) -> List[GeneratedOutputGroup]:
+        """Discard or retry rejected groups and wait for a full admitted mini-batch.
+
+        Raises:
+            GenerationStalledError: No producer can make admission progress.
+            RuntimeError: Dynamic sampling exhausts its per-step candidate budget.
+        """
+        accepted_groups = []
+        loop = asyncio.get_event_loop()
+        last_admitted_progress = loop.time()
+        stall_timeout = float(self.admission_stall_timeout)
+        rejection_counts_since_admission: collections.Counter[str] = collections.Counter()
+        dynamic_candidate_count = 0
+        dynamic_discarded_count = 0
+
+        while True:
+            async with queues.condition:
+                while len(accepted_groups) < self.mini_batch_size and queues.completed.empty():
+                    elapsed = loop.time() - last_admitted_progress
+                    remaining = stall_timeout - elapsed
+                    if remaining <= 0:
+                        stall_timeout = self._check_admission_stall(elapsed, rejection_counts_since_admission)
+                        last_admitted_progress = loop.time()
+                        continue
+                    try:
+                        await asyncio.wait_for(queues.condition.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        stall_timeout = self._check_admission_stall(
+                            loop.time() - last_admitted_progress, rejection_counts_since_admission
+                        )
+                        last_admitted_progress = loop.time()
+
+                completed_groups = _drain_queue(queues.completed)
+                partition = self._partition_completed_groups(
+                    completed_groups,
+                    occupied_uids={group.uid for group in accepted_groups},
+                )
+                for group, decision in partition.rejected_groups:
+                    queues.retries.put_nowait(group.source_prompts)
+                    assert decision.primary_rejection is not None
+                    rejection_counts_since_admission[decision.primary_rejection.value] += 1
+
+                selection = self._select_dynamic_sampling_candidates(
+                    partition.accepted_groups,
+                    available_slots=self.mini_batch_size - len(accepted_groups),
+                )
+                accepted_groups.extend(selection.admitted_groups)
+                dynamic_candidate_count += selection.candidate_count
+                dynamic_discarded_this_scan = sum(selection.discarded_reasons.values())
+                dynamic_discarded_count += dynamic_discarded_this_scan
+                rejection_counts_since_admission.update(selection.discarded_reasons)
+
+                for group, decision in partition.rejected_groups:
+                    assert decision.primary_rejection is not None
+                    await self._record_generation_outcome(group, decision.primary_rejection.value)
+                for group, decision in partition.discarded_groups:
+                    assert decision.primary_rejection is not None
+                    await self._record_generation_outcome(group, decision.primary_rejection.value)
+                for group, selection_result in selection.discarded_groups:
+                    await self._record_generation_outcome(group, selection_result.value)
+                for group in selection.admitted_groups:
+                    await self._record_generation_outcome(group, "admitted")
+
+                for group in selection.surplus_groups:
+                    queues.completed.put_nowait(group)
+
+                if selection.admitted_groups:
+                    last_admitted_progress = loop.time()
+                    stall_timeout = float(self.admission_stall_timeout)
+                    rejection_counts_since_admission.clear()
+
+                if len(accepted_groups) >= self.mini_batch_size:
+                    batch = accepted_groups[: self.mini_batch_size]
+                else:
+                    batch = None
+                queues.condition.notify_all()
+
+            self._record_admission_scan(
+                partition.rejected_groups + partition.discarded_groups,
+                inspected_count=len(completed_groups),
+            )
+            discarded_count = (
+                len(partition.rejected_groups) + len(partition.discarded_groups) + dynamic_discarded_this_scan
+            )
+            if discarded_count:
+                await self._staleness_manager.on_rollouts_discarded(discarded_count)
+
+            if (
+                batch is None
+                and self._dynamic_sampling_max_candidate_groups is not None
+                and dynamic_candidate_count >= self._dynamic_sampling_max_candidate_groups
+            ):
+                raise RuntimeError(
+                    "Exiting training loop due to hitting dynamic sampling limit for filter strategy with "
+                    f"{self._dynamic_sampling_max_sample_batches} max sample batches. "
+                    f"Collected {len(accepted_groups)} of {self.mini_batch_size} required groups."
+                )
+
+            if batch is not None:
+                break
+
+        self._publish_admission_metrics(
+            dynamic_candidate_count=dynamic_candidate_count,
+            dynamic_discarded_count=dynamic_discarded_count,
+        )
+        return batch
+
+    async def _dispatch_generation_event(self, event: str, **kwargs) -> None:
+        epoch = self.global_step // max(self.num_steps_per_epoch, 1)
+        state = self._create_trainer_state(epoch)
+        self._control = await self.callback_handler.call_event_async(
+            event,
+            state,
+            self._control,
+            trainer=self,
+            **kwargs,
+        )
+
+    async def _record_generation_outcome(self, group: GeneratedOutputGroup, outcome: str) -> None:
+        await self._dispatch_generation_event(
+            "on_generation_outcome",
+            attempt=group.generation_attempt,
+            optimizer_step=self.global_step,
+            outcome=outcome,
+        )
+
+    def convert_generation_group_mini_batch_to_training_input(
+        self, cur_generation_group_mini_batch: List[GeneratedOutputGroup]
+    ) -> TrainingInputBatch:
+        """Convert one complete generated mini-batch to a training batch."""
+        assert len(cur_generation_group_mini_batch) == self.mini_batch_size, (
+            f"Expected {self.mini_batch_size} generated groups, got {len(cur_generation_group_mini_batch)}"
+        )
+        trajectory_batches = []
+        uids = []
+        stalenesses = []
+        for cur_generated_output_group in cur_generation_group_mini_batch:
+            cur_staleness = self.global_step - cur_generated_output_group.earliest_model_step
+            stalenesses.append(cur_staleness)
+            trajectory_batches.append(cur_generated_output_group.trajectory_batch)
+            group_size = len(cur_generated_output_group.trajectory_batch["response_ids"])
+            uids.extend([cur_generated_output_group.uid] * group_size)
+
+        assert max(stalenesses) <= self.max_staleness_steps, (
+            f"Fresh batch assembly returned staleness {max(stalenesses)} above max {self.max_staleness_steps}"
+        )
+
+        trajectory_batch = concatenate_trajectory_batches(
+            trajectory_batches,
+            require_rollout_logprobs=policy_loss_requires_rollout_logprobs(self.cfg.trainer.algorithm.policy_loss_type),
+            tis_lcs_alert_threshold=float(self.cfg.trainer.algorithm.tis_lcs_alert_threshold),
+        )
+        assert trajectory_batch["rollout_metrics"] is not None, "Rollout metrics should be non-null."
+        self.all_metrics.update(trajectory_batch["rollout_metrics"])
 
         # Log staleness statistics for this step
-        total_groups = len(cur_generation_group_mini_batch)
         self.all_metrics.update(
             {
                 "async/staleness_mean": sum(stalenesses) / len(stalenesses),
                 "async/staleness_max": max(stalenesses),
                 "async/staleness_min": min(stalenesses),
                 "async/staleness_ratio": sum(1 for s in stalenesses if s > 0) / len(stalenesses),
-                "async/discarded_count": discarded_count,
-                "async/discard_rate": discarded_count / total_groups if total_groups > 0 else 0.0,
-                "async/effective_batch_groups": len(generator_outputs),
-                "async/effective_batch_samples": len(generator_outputs) * group_size,
             }
         )
 
         # Convert rewards to per-token form and compute reward metrics before training conversion
-        generator_output = self.postprocess_generator_output(generator_output, uids)
+        trajectory_batch = self.postprocess_trajectory_batch(trajectory_batch, uids)
 
         # print example just for debugging
-        vis = self.tokenizer.decode(generator_output["response_ids"][0])
+        vis = self.tokenizer.decode(trajectory_batch["response_ids"][0])
         logger.debug(f"Example generated: {vis}")
 
-        return self.convert_to_training_input(generator_output, uids)
+        return self.convert_to_training_input(trajectory_batch, uids)
 
     def save_checkpoints(self):
         """

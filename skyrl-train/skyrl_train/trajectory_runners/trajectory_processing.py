@@ -1,3 +1,6 @@
+import json
+import os
+
 import torch
 from difflib import SequenceMatcher
 from typing import List, Tuple, Union, Optional, Dict, Any, Iterable, Protocol
@@ -1540,6 +1543,53 @@ def _normalize_candidate_logprobs(candidate_logprobs):
     return token_strings, floats
 
 
+def _dump_tito_decline(
+    reason,
+    messages,
+    generation_prompt_ids,
+    assistant_logprobs,
+    assistant_token_ids,
+    assistant_prompt_token_ids,
+) -> None:
+    """Write the assembler's INPUTS when it declines, for offline diagnosis.
+
+    Off unless ``SKYRL_TITO_DECLINE_DUMP`` names a directory. The retention
+    records capture assembly *outputs* -- ``output["prompt_token_ids"]`` and
+    ``output["response_ids"]`` -- which on a decline are the fallback's own
+    result, and carry no logprobs at all. Nothing persisted by a normal run can
+    therefore say why assembly declined or what the engine actually served.
+
+    One file per decline, capped, so a run that declines on every assembly does
+    not fill the volume.
+    """
+    directory = os.environ.get("SKYRL_TITO_DECLINE_DUMP")
+    if not directory:
+        return
+    global _TITO_DUMP_COUNT
+    limit = int(os.environ.get("SKYRL_TITO_DECLINE_DUMP_LIMIT", "5"))
+    if _TITO_DUMP_COUNT >= limit:
+        return
+    _TITO_DUMP_COUNT += 1
+    try:
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"tito_decline_{os.getpid()}_{_TITO_DUMP_COUNT}.json")
+        payload = {
+            "decline_reason": reason,
+            "generation_prompt_ids": list(generation_prompt_ids or []),
+            "assistant_prompt_token_ids": [list(t) for t in (assistant_prompt_token_ids or [])],
+            "assistant_token_ids": [list(t) for t in (assistant_token_ids or [])],
+            "assistant_logprobs": [list(t) for t in (assistant_logprobs or [])],
+            "messages": messages,
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, default=str)
+    except Exception as exc:  # diagnosis must never take the run down
+        logger.warning("TITO decline dump failed: %s", exc)
+
+
+_TITO_DUMP_COUNT = 0
+
+
 def _decline_tito(sink, reason: str):
     """Record why full-TITO assembly declined, then decline.
 
@@ -1551,6 +1601,27 @@ def _decline_tito(sink, reason: str):
     if sink is not None:
         sink.append(reason)
     return None
+
+
+def _decline_tito_with_inputs(
+    sink,
+    reason: str,
+    messages,
+    generation_prompt_ids,
+    assistant_logprobs,
+    assistant_token_ids,
+    assistant_prompt_token_ids,
+):
+    """Record the reason, dump the inputs behind the env var, then decline."""
+    _dump_tito_decline(
+        reason,
+        messages,
+        generation_prompt_ids,
+        assistant_logprobs,
+        assistant_token_ids,
+        assistant_prompt_token_ids,
+    )
+    return _decline_tito(sink, reason)
 
 
 def _assemble_response_ids_tito_full(
@@ -1587,27 +1658,50 @@ def _assemble_response_ids_tito_full(
     rollout_routed_experts)`` (the last two ``None`` when their inputs were ``None``).
     """
     if assistant_prompt_token_ids is None or assistant_token_ids is None:
-        return _decline_tito(decline_reason, "served id streams absent")
+        return _decline_tito_with_inputs(
+            decline_reason,
+            "served id streams absent",
+            messages,
+            generation_prompt_ids,
+            assistant_logprobs,
+            assistant_token_ids,
+            assistant_prompt_token_ids,
+        )
     n_turns = len(assistant_token_ids)
     if n_turns == 0 or len(assistant_prompt_token_ids) != n_turns:
-        return _decline_tito(
+        return _decline_tito_with_inputs(
             decline_reason,
             f"stream count mismatch: {n_turns} completion vs {len(assistant_prompt_token_ids)} prompt",
+            messages,
+            generation_prompt_ids,
+            assistant_logprobs,
+            assistant_token_ids,
+            assistant_prompt_token_ids,
         )
     assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
     if len(assistant_msgs) != n_turns:
-        return _decline_tito(
+        return _decline_tito_with_inputs(
             decline_reason,
             f"{len(assistant_msgs)} assistant messages but {n_turns} served turns",
+            messages,
+            generation_prompt_ids,
+            assistant_logprobs,
+            assistant_token_ids,
+            assistant_prompt_token_ids,
         )
     # Every turn must carry non-empty prompt + completion id streams.
     for t in range(n_turns):
         p = assistant_prompt_token_ids[t]
         c = assistant_token_ids[t]
         if not p or not isinstance(p, list) or not c or not isinstance(c, list):
-            return _decline_tito(
+            return _decline_tito_with_inputs(
                 decline_reason,
                 f"turn {t}: prompt/completion stream empty or not a list",
+                messages,
+                generation_prompt_ids,
+                assistant_logprobs,
+                assistant_token_ids,
+                assistant_prompt_token_ids,
             )
     # Prefix invariant across turns.
     for t in range(1, n_turns):
@@ -1619,9 +1713,14 @@ def _assemble_response_ids_tito_full(
             # drift in the turn fed back as text.
             limit = min(len(prev), len(cur))
             idx = next((i for i in range(limit) if cur[i] != prev[i]), limit)
-            return _decline_tito(
+            return _decline_tito_with_inputs(
                 decline_reason,
                 f"turn {t}: prefix invariant failed at index {idx} of {len(prev)} (cur len {len(cur)})",
+                messages,
+                generation_prompt_ids,
+                assistant_logprobs,
+                assistant_token_ids,
+                assistant_prompt_token_ids,
             )
     gp = list(generation_prompt_ids)
     gp_len = len(gp)
@@ -1629,9 +1728,14 @@ def _assemble_response_ids_tito_full(
     initial_prompt_len = len(p0) - gp_len
     # Turn-0 prompt must end with the generation prompt (fixes the response/prompt boundary).
     if initial_prompt_len < 0 or p0[initial_prompt_len:] != gp:
-        return _decline_tito(
+        return _decline_tito_with_inputs(
             decline_reason,
             f"turn-0 prompt (len {len(p0)}) does not end with the generation prompt (len {gp_len})",
+            messages,
+            generation_prompt_ids,
+            assistant_logprobs,
+            assistant_token_ids,
+            assistant_prompt_token_ids,
         )
     served_full = list(assistant_prompt_token_ids[-1]) + list(assistant_token_ids[-1])
     # Every completion region must sit at its expected offset in the served stream.
@@ -1639,9 +1743,14 @@ def _assemble_response_ids_tito_full(
         off = len(assistant_prompt_token_ids[t])
         comp = list(assistant_token_ids[t])
         if served_full[off : off + len(comp)] != comp:
-            return _decline_tito(
+            return _decline_tito_with_inputs(
                 decline_reason,
                 f"turn {t}: completion region absent at served offset {off} (len {len(comp)})",
+                messages,
+                generation_prompt_ids,
+                assistant_logprobs,
+                assistant_token_ids,
+                assistant_prompt_token_ids,
             )
 
     response_ids = list(served_full[initial_prompt_len:])

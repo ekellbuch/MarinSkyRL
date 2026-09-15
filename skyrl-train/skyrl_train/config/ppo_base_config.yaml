@@ -64,6 +64,7 @@ trainer:
       source_uri: null
       source_identity: null
       lm_head_compute_dtype: null
+      use_liger_kernel: false
       # Sequence chunk (tokens) for per-token log-probabilities and entropy computed
       # inside the output projection; null keeps the full-vocabulary logits path.
       logprob_chunk_size: null
@@ -256,6 +257,12 @@ trainer:
 
     num_parallel_generation_workers: 768
     admission_stall_timeout: 21600
+    # How many prompt groups may be open at once. null keeps the historical
+    # behavior, one open group per generation worker. Declared here rather than
+    # read only through OmegaConf.select, because the config is struct-mode: an
+    # undeclared key can arrive only as `+key=`, and a launcher that rewrites
+    # overrides turns that into a run that dies at Hydra parse time.
+    max_concurrent_generation_groups: null
 
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false

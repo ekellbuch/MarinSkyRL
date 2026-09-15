@@ -810,6 +810,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 model_load_retry=self.cfg.trainer.model_load_retry,
                 gdn_backend=str(self.cfg.generator.gdn_backend),
                 lm_head_compute_dtype=self.cfg.trainer.policy.model.lm_head_compute_dtype,
+                use_liger_kernel=self.cfg.trainer.policy.model.get("use_liger_kernel", False),
                 logprob_chunk_size=self.cfg.trainer.policy.model.get("logprob_chunk_size", None),
             )
             # in-place patch

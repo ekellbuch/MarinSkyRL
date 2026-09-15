@@ -56,6 +56,26 @@ class GenerationStalledError(RuntimeError):
     """Raised when generation cannot make progress (no active producers, or dataset exhausted)."""
 
 
+def _epoch_completed(global_step: int, epoch: int, num_steps_per_epoch: int) -> bool:
+    """Whether the step loop finished `epoch` rather than being cut short.
+
+    The loop exits three ways: the epoch's steps run out, `max_steps` is
+    reached, or a callback asks to stop. Only the first has finished an epoch,
+    and `global_step` is post-increment, so a completed epoch has advanced past
+    that epoch's last step.
+
+    This decides whether `on_epoch_end` fires, which is load-bearing:
+    `DataTrackingCallback.on_epoch_end_async` clears the epoch-scoped consumed
+    UID set and advances the epoch counter, and `_finalize_training` then writes
+    the final checkpoint from that tracker. Firing it after a `max_steps` stop
+    persists `consumed_uids_in_epoch=[]` beside a non-zero
+    `total_samples_consumed` -- and that final checkpoint is the one
+    `resume_mode=latest` loads, after which `_AsyncDataloader` rewinds to row 0
+    with nothing to skip and retrains prompts the previous run already trained.
+    """
+    return global_step > (1 + epoch) * num_steps_per_epoch
+
+
 def _drain_queue(queue: asyncio.Queue[_QueueItem]) -> List[_QueueItem]:
     """Remove and return every item currently available without yielding."""
     items = []
@@ -378,12 +398,53 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             or self.num_parallel_generation_workers
         )
 
+        # Simultaneously-open generation groups, i.e. head-of-pipeline work in progress.
+        #
+        # WHY THIS KNOB: a worker loop opens one prompt group and asks the trajectory
+        # runner for all `generator.n_samples_per_prompt` rollouts of it in one call, so
+        # the rollout backend is asked for `max_concurrent_generation_groups ·
+        # n_samples_per_prompt` trials while it holds only `n_concurrent_trials` seats.
+        # At 32 workers x 32 samples against 320 seats that is 3.2x oversubscription:
+        # each open group gets ~10 of its 32 seats and so closes in three serialized
+        # waves instead of one. The trainer consumes COMPLETE groups, so spreading seats
+        # across many partially-open groups buys trial occupancy at the cost of group
+        # latency, and group latency is what the optimizer waits on.
+        #
+        # Bounding open groups to what the seat pool can fill at full width
+        # (n_concurrent_trials // n_samples_per_prompt) lets each open group take all 32
+        # of its seats, and a worker opens a new group only as one closes.
+        #
+        # This bounds work in progress and nothing else. It does not touch staleness:
+        # capacity remains `min(concurrency, staleness)` in `_compute_capacity_unlocked`,
+        # so `max_staleness_steps` is still the other half of that min() and per-group
+        # freshness classification is unchanged. Worker loops still number
+        # `num_parallel_generation_workers`; the surplus ones block in
+        # `acquire_submission_slot()`, which is the state they already reach today
+        # whenever the staleness half of the min() binds.
+        #
+        # Default None => equals num_parallel_generation_workers, i.e. BYTE-IDENTICAL to
+        # today's behavior: no config change means no behavior change.
+        self.max_concurrent_generation_groups = int(
+            OmegaConf.select(cfg, "trainer.fully_async.max_concurrent_generation_groups", default=None)
+            or self.num_parallel_generation_workers
+        )
+
         assert (
             # otherwise wasted throughput
             self.mini_batch_size <= self.num_parallel_generation_workers
         ), (
             "Invalid num_parallel_generation_workers, must be >= mini_batch_size. Got: "
             f"{self.mini_batch_size=}, {self.num_parallel_generation_workers=}"
+        )
+        assert self.mini_batch_size <= self.max_concurrent_generation_groups, (
+            "Invalid max_concurrent_generation_groups: fewer groups may be open than a "
+            "mini-batch needs, so the trainer can never assemble one. Got: "
+            f"{self.mini_batch_size=}, {self.max_concurrent_generation_groups=}"
+        )
+        assert self.max_concurrent_generation_groups <= self.num_parallel_generation_workers, (
+            "Invalid max_concurrent_generation_groups: it bounds the open groups the "
+            "worker loops share, so raising it above the worker count cannot open more. "
+            f"Got: {self.max_concurrent_generation_groups=}, {self.num_parallel_generation_workers=}"
         )
         # Initialize base trainer
         super().__init__(*args, **kwargs)
@@ -423,9 +484,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.callback_handler.add_callback(self._buffer_checkpoint_callback)
         self._pending_buffer_restore_path = None
         self._staleness_manager = _AsyncStalenessManager(
-            max_concurrent_generation_groups=self.num_parallel_generation_workers,
+            max_concurrent_generation_groups=self.max_concurrent_generation_groups,
             mini_batch_size=self.mini_batch_size,
             max_staleness_steps=self.max_staleness_steps,
+        )
+        # Printed so a run's own log says which admission geometry it ran under. The
+        # A/B arms of a group-admission experiment otherwise differ only by a Hydra
+        # override that never reaches the log.
+        logger.info(
+            "fully-async admission geometry: "
+            f"workers={self.num_parallel_generation_workers} "
+            f"max_concurrent_generation_groups={self.max_concurrent_generation_groups} "
+            f"mini_batch={self.mini_batch_size} max_staleness_steps={self.max_staleness_steps}"
         )
         # Tracked at instance level so the finally block in train() can cancel
         # them even when an exception skips the per-epoch epilogue.
@@ -827,12 +897,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     break
 
             # 12. Per-epoch epilogue.
-            # Call on_epoch_end callbacks
-            epoch_state = self._create_trainer_state(epoch=epoch)
-            self._control.reset()
-            self._control = await self.callback_handler.call_event_async(
-                "on_epoch_end", epoch_state, self._control, trainer=self
-            )
+            # Call on_epoch_end callbacks, but only when the epoch actually
+            # ended -- see _epoch_completed. The rest of the epilogue still runs
+            # on the way out of a max_steps stop; it is only the callbacks that
+            # must not, because they clear state the final checkpoint is about
+            # to be written from.
+            if _epoch_completed(self.global_step, epoch, self.num_steps_per_epoch):
+                epoch_state = self._create_trainer_state(epoch=epoch)
+                self._control.reset()
+                self._control = await self.callback_handler.call_event_async(
+                    "on_epoch_end", epoch_state, self._control, trainer=self
+                )
 
             # Handle ref model update at epoch end (via RefModelUpdateCallback or direct config)
             ref_callback = self._get_ref_update_callback()

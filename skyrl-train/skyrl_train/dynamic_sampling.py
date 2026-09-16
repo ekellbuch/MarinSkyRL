@@ -71,13 +71,13 @@ def _reward_total(reward: object) -> float:
     return float(reward)
 
 
-def group_is_informative_for_dynamic_sampling(
+def dynamic_sampling_final_rewards(
     trajectory_batch: Mapping[str, object],
     row_indices: Sequence[int] | None = None,
     *,
     criteria: DynamicSamplingCriteria,
-) -> bool:
-    """Return whether a group's configured final rewards have sufficient spread."""
+) -> list[float]:
+    """Read the final outcomes used by the configured dynamic sampling filter."""
     response_ids = trajectory_batch.get("response_ids")
     if not isinstance(response_ids, Sequence) or isinstance(response_ids, (str, bytes)):
         raise ValueError("response_ids must be a sequence")
@@ -97,6 +97,17 @@ def group_is_informative_for_dynamic_sampling(
         final_outcomes.append(_reward_total(outcomes[index]))
     if not final_outcomes:
         raise ValueError("dynamic sampling group must contain at least one final trial row")
+    return final_outcomes
+
+
+def group_is_informative_for_dynamic_sampling(
+    trajectory_batch: Mapping[str, object],
+    row_indices: Sequence[int] | None = None,
+    *,
+    criteria: DynamicSamplingCriteria,
+) -> bool:
+    """Return whether a group's configured final rewards have sufficient spread."""
+    final_outcomes = dynamic_sampling_final_rewards(trajectory_batch, row_indices, criteria=criteria)
     if len(final_outcomes) == 1:
         return True
     return statistics.pstdev(final_outcomes) > criteria.min_reward_std

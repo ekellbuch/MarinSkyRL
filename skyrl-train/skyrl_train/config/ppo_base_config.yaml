@@ -257,6 +257,8 @@ trainer:
 
     num_parallel_generation_workers: 768
     admission_stall_timeout: 21600
+    # Abort when reward-spread rejections continue without admitting a group.
+    dynamic_sampling_stall_timeout: 600
     # How many prompt groups may be open at once. null keeps the historical
     # behavior, one open group per generation worker. Declared here rather than
     # read only through OmegaConf.select, because the config is struct-mode: an

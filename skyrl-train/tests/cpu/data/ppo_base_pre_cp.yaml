@@ -30,6 +30,7 @@ trainer:
     grug_query_bias_update_mode: frozen
     model:
       path: Qwen/Qwen2.5-1.5B-Instruct
+      use_liger_kernel: false
       lora:
         rank: 0
         alpha: 16
@@ -229,6 +230,8 @@ trainer:
     max_staleness_steps: 4
     num_parallel_generation_workers: 768
     admission_stall_timeout: 21600
+    dynamic_sampling_stall_timeout: 600
+    max_concurrent_generation_groups: null
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
   seed: 42

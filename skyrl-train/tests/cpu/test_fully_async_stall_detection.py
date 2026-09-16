@@ -40,6 +40,7 @@ def _bare_trainer(
     trainer = object.__new__(FullyAsyncRayPPOTrainer)
     trainer.mini_batch_size = mini_batch_size
     trainer._step_time_history = collections.deque(step_times or [], maxlen=5)
+    trainer.dynamic_sampling_stall_timeout = 600
     trainer.admission_stall_timeout = admission_stall_timeout
     trainer._active_trajectory_tasks = tasks or []
     trainer.global_step = 0

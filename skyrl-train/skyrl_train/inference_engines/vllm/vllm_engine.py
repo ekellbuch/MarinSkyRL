@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import importlib.util
 import json
 import os
 import threading
@@ -8,49 +11,10 @@ from http import HTTPStatus
 import ray
 import torch
 import asyncio
-import vllm
 from types import SimpleNamespace
-from vllm import SamplingParams
-from vllm.inputs import TokensPrompt
-from vllm.outputs import STREAM_FINISHED
 
 from skyrl_train.numa_policy import NUMA_AFFINITY_ENV
 
-# vLLM 0.16+ reorganized entrypoints into sub-packages.
-# Try new paths first, fall back to old paths for backwards compatibility.
-try:
-    # vLLM >= 0.16
-    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
-    from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-    from vllm.entrypoints.openai.models.protocol import BaseModelPath
-    from vllm.entrypoints.openai.chat_completion.protocol import (
-        ChatCompletionRequest,
-        ChatCompletionResponse,
-    )
-    from vllm.entrypoints.openai.completion.protocol import (
-        CompletionRequest,
-        CompletionResponse,
-    )
-    from vllm.entrypoints.openai.engine.protocol import ErrorResponse
-except ImportError:
-    # vLLM < 0.16 (old flat layout)
-    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-    from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
-    from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
-    from vllm.entrypoints.openai.protocol import (
-        ChatCompletionRequest,
-        ChatCompletionResponse,
-        ErrorResponse,
-        CompletionRequest,
-        CompletionResponse,
-    )
-
-try:
-    from vllm.v1.metrics.loggers import LoggingStatLogger
-except ImportError:
-    LoggingStatLogger = None  # Not available in all vLLM versions
-from vllm.lora.request import LoRARequest
 from torch.distributed import destroy_process_group
 from skyrl_train.distributed.utils import init_custom_process_group
 from uuid import uuid4
@@ -78,6 +42,51 @@ from skyrl_train.utils import get_tcp_url, str_to_torch_dtype, torch_dtype_to_st
 from skyrl_train.utils.tensor_fingerprint import canonical_tensor_fingerprint
 import time
 from packaging import version
+
+
+# CPU diagnostics and admission bookkeeping do not require an installed GPU runtime.
+VLLM_AVAILABLE = importlib.util.find_spec("vllm") is not None
+if VLLM_AVAILABLE:
+    import vllm
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+    from vllm.outputs import STREAM_FINISHED
+
+    # vLLM 0.16+ reorganized entrypoints into sub-packages.
+    # Try new paths first, fall back to old paths for backwards compatibility.
+    try:
+        # vLLM >= 0.16
+        from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+        from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+        from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.openai.models.protocol import BaseModelPath
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+            ChatCompletionResponse,
+        )
+        from vllm.entrypoints.openai.completion.protocol import (
+            CompletionRequest,
+            CompletionResponse,
+        )
+        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+    except ImportError:
+        # vLLM < 0.16 (old flat layout)
+        from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+        from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+        from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+        from vllm.entrypoints.openai.protocol import (
+            ChatCompletionRequest,
+            ChatCompletionResponse,
+            ErrorResponse,
+            CompletionRequest,
+            CompletionResponse,
+        )
+
+    try:
+        from vllm.v1.metrics.loggers import LoggingStatLogger
+    except ImportError:
+        LoggingStatLogger = None  # Not available in all vLLM versions
+    from vllm.lora.request import LoRARequest
 
 
 def _parse_vllm_version() -> version.Version:
@@ -2345,6 +2354,9 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
     """Base class containing shared logic between sync and async VLLM engines."""
 
     def __init__(self, *args, bundle_indices: list = None, **kwargs):
+        if not VLLM_AVAILABLE:
+            raise ModuleNotFoundError("Constructing a vLLM engine requires the vllm runtime extra", name="vllm")
+        self._stream_finished = STREAM_FINISHED
         setup_envvars_for_vllm(kwargs, bundle_indices)
         lm_head_compute_dtype = kwargs.pop("lm_head_compute_dtype", None)
         # vLLM may construct the model in a separate EngineCore process, so the
@@ -2630,287 +2642,291 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
         return await asyncio.to_thread(engine.collective_rpc, "destroy_weights_update_group")
 
 
-class V1LoggingStatLoggerFixed(LoggingStatLogger):
-    """
-    A fixed version of LoggingStatLogger that actually logs during the record method.
-    The log method is otherwise not called in the VLLM codebase.
+if VLLM_AVAILABLE:
 
-    Also stores aggregated stats in a class-level registry for programmatic access
-    (used by VLLMStatsCallback to bypass Ray log-to-driver unreliability).
-
-    Stats are accumulated throughout a step:
-    - Request counts (running, waiting): track peak and median values
-    - Throughput metrics: track peak and median values observed during active periods
-    - Cache metrics: track peak and median usage
-    """
-
-    # Class-level registry mapping engine IDs to their accumulated stats
-    _stats_registry: Dict[int, Dict[str, Any]] = {}
-    _registry_lock = threading.Lock()
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.log_interval = 5
-        self._engine_id: Optional[int] = None
-
-    def set_engine_id(self, engine_id: int) -> None:
-        """Set the engine ID for this stat logger instance."""
-        self._engine_id = engine_id
-
-    def record(self, *args: Any, **kwargs: Any) -> None:
-        # Call parent with original arguments - important to preserve vLLM's calling convention
-        super().record(*args, **kwargs)
-
-        # Accumulate stats in registry if engine ID is set
-        if self._engine_id is not None:
-            # Extract scheduler_stats from vLLM v1 API:
-            # vLLM calls record(scheduler_stats, iteration_stats, ...) with positional args
-            # or record(scheduler_stats=..., iteration_stats=...) with keyword args
-            scheduler_stats = None
-            if args:
-                scheduler_stats = args[0]
-            elif "scheduler_stats" in kwargs:
-                scheduler_stats = kwargs["scheduler_stats"]
-
-            current_running = 0
-            current_waiting = 0
-            current_cache_usage = 0.0
-            prefix_cache_stats = None
-
-            if scheduler_stats is not None:
-                current_running = getattr(scheduler_stats, "num_running_reqs", 0)
-                current_waiting = getattr(scheduler_stats, "num_waiting_reqs", 0)
-                current_cache_usage = getattr(scheduler_stats, "kv_cache_usage", 0.0) * 100.0  # Convert to percentage
-                prefix_cache_stats = scheduler_stats.prefix_cache_stats
-
-            # Extract iteration_stats (second positional arg) for per-request latency data
-            iteration_stats = None
-            if len(args) > 1:
-                iteration_stats = args[1]
-            elif "iteration_stats" in kwargs:
-                iteration_stats = kwargs["iteration_stats"]
-
-            # Collect per-request latency samples from finished requests
-            finished_prefill_times: List[float] = []
-            finished_decode_times: List[float] = []
-            finished_e2e_latencies: List[float] = []
-            finished_queued_times: List[float] = []
-            finished_ttfts: List[float] = []
-            finished_num_preempted = 0
-            if iteration_stats is not None:
-                # Time-to-first-token samples from this iteration
-                ttft_iter = getattr(iteration_stats, "time_to_first_tokens_iter", None)
-                if ttft_iter:
-                    finished_ttfts.extend(ttft_iter)
-                # Preemption count
-                finished_num_preempted = getattr(iteration_stats, "num_preempted_reqs", 0)
-                # Per-request stats from completed requests
-                for req in getattr(iteration_stats, "finished_requests", []):
-                    prefill_t = getattr(req, "prefill_time", 0.0)
-                    decode_t = getattr(req, "decode_time", 0.0)
-                    e2e_t = getattr(req, "e2e_latency", 0.0)
-                    queued_t = getattr(req, "queued_time", 0.0)
-                    if prefill_t > 0:
-                        finished_prefill_times.append(prefill_t)
-                    if decode_t > 0:
-                        finished_decode_times.append(decode_t)
-                    if e2e_t > 0:
-                        finished_e2e_latencies.append(e2e_t)
-                    if queued_t > 0:
-                        finished_queued_times.append(queued_t)
-
-            # Throughput is computed by parent class LoggingStatLogger after super().record()
-            # These are stored as instance attributes
-            current_prompt_tp = getattr(self, "last_prompt_throughput", 0.0) or 0.0
-            current_gen_tp = getattr(self, "last_generation_throughput", 0.0) or 0.0
-
-            is_active = current_running > 0 or current_waiting > 0
-
-            with V1LoggingStatLoggerFixed._registry_lock:
-                existing = V1LoggingStatLoggerFixed._stats_registry.get(self._engine_id)
-
-                if existing is None:
-                    # Initialize with sample lists for median calculation
-                    existing = {
-                        # Sample lists for computing median (only active samples)
-                        "_samples_prompt_tp": [current_prompt_tp] if is_active else [],
-                        "_samples_gen_tp": [current_gen_tp] if is_active else [],
-                        "_samples_running": [current_running] if is_active else [],
-                        "_samples_waiting": [current_waiting] if is_active else [],
-                        "_samples_cache": [current_cache_usage] if is_active else [],
-                        "_prefix_hit": PrefixCacheHitRateAccumulator(),
-                        # Per-request latency samples (accumulated from finished requests)
-                        "_samples_prefill_time": list(finished_prefill_times),
-                        "_samples_decode_time": list(finished_decode_times),
-                        "_samples_e2e_latency": list(finished_e2e_latencies),
-                        "_samples_queued_time": list(finished_queued_times),
-                        "_samples_ttft": list(finished_ttfts),
-                        "_total_preempted": finished_num_preempted,
-                        # Peak values
-                        "_peak_prompt_tp": current_prompt_tp,
-                        "_peak_gen_tp": current_gen_tp,
-                        "_peak_running": current_running,
-                        "_peak_waiting": current_waiting,
-                        "_peak_cache": current_cache_usage,
-                        # Counters
-                        "_num_samples": 1,
-                        "_num_active_samples": 1 if is_active else 0,
-                        "timestamp": time.time(),
-                    }
-                    V1LoggingStatLoggerFixed._stats_registry[self._engine_id] = existing
-                else:
-                    # Update peak values
-                    existing["_peak_prompt_tp"] = max(existing["_peak_prompt_tp"], current_prompt_tp)
-                    existing["_peak_gen_tp"] = max(existing["_peak_gen_tp"], current_gen_tp)
-                    existing["_peak_running"] = max(existing["_peak_running"], current_running)
-                    existing["_peak_waiting"] = max(existing["_peak_waiting"], current_waiting)
-                    existing["_peak_cache"] = max(existing["_peak_cache"], current_cache_usage)
-
-                    # Accumulate per-request latency samples
-                    existing["_samples_prefill_time"].extend(finished_prefill_times)
-                    existing["_samples_decode_time"].extend(finished_decode_times)
-                    existing["_samples_e2e_latency"].extend(finished_e2e_latencies)
-                    existing["_samples_queued_time"].extend(finished_queued_times)
-                    existing["_samples_ttft"].extend(finished_ttfts)
-                    existing["_total_preempted"] += finished_num_preempted
-
-                    # Append to sample lists (only for active samples to get meaningful medians)
-                    if is_active:
-                        existing["_samples_prompt_tp"].append(current_prompt_tp)
-                        existing["_samples_gen_tp"].append(current_gen_tp)
-                        existing["_samples_running"].append(current_running)
-                        existing["_samples_waiting"].append(current_waiting)
-                        existing["_samples_cache"].append(current_cache_usage)
-                        existing["_num_active_samples"] += 1
-
-                    existing["_num_samples"] += 1
-                    existing["timestamp"] = time.time()
-
-                existing["_prefix_hit"].observe(prefix_cache_stats, is_active=is_active)
-
-        now = time.monotonic()
-        if now - self.last_log_time > self.log_interval:
-            self.log()
-            self.last_log_time = now
-
-    @staticmethod
-    def _compute_median(samples: List[float]) -> float:
-        """Compute median of a list of samples."""
-        if not samples:
-            return 0.0
-        sorted_samples = sorted(samples)
-        n = len(sorted_samples)
-        mid = n // 2
-        if n % 2 == 0:
-            return (sorted_samples[mid - 1] + sorted_samples[mid]) / 2.0
-        return sorted_samples[mid]
-
-    @classmethod
-    def get_stats_by_engine_id(cls, engine_id: int, reset: bool = True) -> Optional[Dict[str, Any]]:
-        """Get the accumulated stats for a given engine ID.
-
-        Args:
-            engine_id: The engine ID to get stats for.
-            reset: If True, reset the accumulated stats after reading (default True).
-                   This ensures each training step gets fresh stats.
-
-        Returns:
-            Dict with accumulated stats, or None if no stats recorded yet.
-            Includes peak values, median values, and computed averages.
+    class V1LoggingStatLoggerFixed(LoggingStatLogger):
         """
-        with cls._registry_lock:
-            stats = cls._stats_registry.get(engine_id)
-            if stats is None:
-                return None
+        A fixed version of LoggingStatLogger that actually logs during the record method.
+        The log method is otherwise not called in the VLLM codebase.
 
-            # Compute medians from sample lists
-            median_prompt_tp = cls._compute_median(stats["_samples_prompt_tp"])
-            median_gen_tp = cls._compute_median(stats["_samples_gen_tp"])
-            median_running = cls._compute_median(stats["_samples_running"])
-            median_waiting = cls._compute_median(stats["_samples_waiting"])
-            median_cache = cls._compute_median(stats["_samples_cache"])
-            median_prefix_hit = cls._compute_median(stats["_prefix_hit"].samples)
+        Also stores aggregated stats in a class-level registry for programmatic access
+        (used by VLLMStatsCallback to bypass Ray log-to-driver unreliability).
 
-            # Compute means from sample lists
-            num_active = stats["_num_active_samples"]
-            if num_active > 0:
-                mean_prompt_tp = sum(stats["_samples_prompt_tp"]) / num_active
-                mean_gen_tp = sum(stats["_samples_gen_tp"]) / num_active
-            else:
-                mean_prompt_tp = 0.0
-                mean_gen_tp = 0.0
+        Stats are accumulated throughout a step:
+        - Request counts (running, waiting): track peak and median values
+        - Throughput metrics: track peak and median values observed during active periods
+        - Cache metrics: track peak and median usage
+        """
 
-            # Compute per-request latency statistics
-            prefill_samples = stats["_samples_prefill_time"]
-            decode_samples = stats["_samples_decode_time"]
-            e2e_samples = stats["_samples_e2e_latency"]
-            queued_samples = stats["_samples_queued_time"]
-            ttft_samples = stats["_samples_ttft"]
+        # Class-level registry mapping engine IDs to their accumulated stats
+        _stats_registry: Dict[int, Dict[str, Any]] = {}
+        _registry_lock = threading.Lock()
 
-            def _mean(s: List[float]) -> float:
-                return sum(s) / len(s) if s else 0.0
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.log_interval = 5
+            self._engine_id: Optional[int] = None
 
-            def _p90(s: List[float]) -> float:
-                if not s:
-                    return 0.0
-                sorted_s = sorted(s)
-                idx = int(len(sorted_s) * 0.9)
-                return sorted_s[min(idx, len(sorted_s) - 1)]
+        def set_engine_id(self, engine_id: int) -> None:
+            """Set the engine ID for this stat logger instance."""
+            self._engine_id = engine_id
 
-            result = {
-                # Peak values
-                "peak_prompt_throughput": stats["_peak_prompt_tp"],
-                "peak_generation_throughput": stats["_peak_gen_tp"],
-                "peak_running_reqs": stats["_peak_running"],
-                "peak_waiting_reqs": stats["_peak_waiting"],
-                "peak_gpu_cache_usage_perc": stats["_peak_cache"],
-                "peak_prefix_cache_hit_rate": stats["_prefix_hit"].peak,
-                # Median values
-                "median_prompt_throughput": median_prompt_tp,
-                "median_generation_throughput": median_gen_tp,
-                "median_running_reqs": median_running,
-                "median_waiting_reqs": median_waiting,
-                "median_gpu_cache_usage_perc": median_cache,
-                "median_prefix_cache_hit_rate": median_prefix_hit,
-                # Mean values
-                "mean_prompt_throughput": mean_prompt_tp,
-                "mean_generation_throughput": mean_gen_tp,
-                # Per-request latency stats (seconds)
-                "latency_prefill_mean": _mean(prefill_samples),
-                "latency_prefill_median": cls._compute_median(prefill_samples),
-                "latency_prefill_p90": _p90(prefill_samples),
-                "latency_decode_mean": _mean(decode_samples),
-                "latency_decode_median": cls._compute_median(decode_samples),
-                "latency_decode_p90": _p90(decode_samples),
-                "latency_e2e_mean": _mean(e2e_samples),
-                "latency_e2e_median": cls._compute_median(e2e_samples),
-                "latency_e2e_p90": _p90(e2e_samples),
-                "latency_queued_mean": _mean(queued_samples),
-                "latency_queued_median": cls._compute_median(queued_samples),
-                "latency_queued_p90": _p90(queued_samples),
-                "latency_ttft_mean": _mean(ttft_samples),
-                "latency_ttft_median": cls._compute_median(ttft_samples),
-                "latency_ttft_p90": _p90(ttft_samples),
-                "latency_num_finished_requests": len(e2e_samples),
-                "total_preempted_reqs": stats["_total_preempted"],
-                # Legacy field names for backwards compatibility (use peak values)
-                "avg_prompt_throughput": stats["_peak_prompt_tp"],
-                "avg_generation_throughput": stats["_peak_gen_tp"],
-                "num_running_reqs": stats["_peak_running"],
-                "num_waiting_reqs": stats["_peak_waiting"],
-                "gpu_cache_usage_perc": stats["_peak_cache"],
-                "prefix_cache_hit_rate": stats["_prefix_hit"].peak,
-                # Metadata
-                "timestamp": stats["timestamp"],
-                "num_samples": stats["_num_samples"],
-                "num_active_samples": stats["_num_active_samples"],
-            }
+        def record(self, *args: Any, **kwargs: Any) -> None:
+            # Call parent with original arguments - important to preserve vLLM's calling convention
+            super().record(*args, **kwargs)
 
-            if reset:
-                # Reset for next step
-                del cls._stats_registry[engine_id]
+            # Accumulate stats in registry if engine ID is set
+            if self._engine_id is not None:
+                # Extract scheduler_stats from vLLM v1 API:
+                # vLLM calls record(scheduler_stats, iteration_stats, ...) with positional args
+                # or record(scheduler_stats=..., iteration_stats=...) with keyword args
+                scheduler_stats = None
+                if args:
+                    scheduler_stats = args[0]
+                elif "scheduler_stats" in kwargs:
+                    scheduler_stats = kwargs["scheduler_stats"]
 
-            return result
+                current_running = 0
+                current_waiting = 0
+                current_cache_usage = 0.0
+                prefix_cache_stats = None
+
+                if scheduler_stats is not None:
+                    current_running = getattr(scheduler_stats, "num_running_reqs", 0)
+                    current_waiting = getattr(scheduler_stats, "num_waiting_reqs", 0)
+                    current_cache_usage = (
+                        getattr(scheduler_stats, "kv_cache_usage", 0.0) * 100.0
+                    )  # Convert to percentage
+                    prefix_cache_stats = scheduler_stats.prefix_cache_stats
+
+                # Extract iteration_stats (second positional arg) for per-request latency data
+                iteration_stats = None
+                if len(args) > 1:
+                    iteration_stats = args[1]
+                elif "iteration_stats" in kwargs:
+                    iteration_stats = kwargs["iteration_stats"]
+
+                # Collect per-request latency samples from finished requests
+                finished_prefill_times: List[float] = []
+                finished_decode_times: List[float] = []
+                finished_e2e_latencies: List[float] = []
+                finished_queued_times: List[float] = []
+                finished_ttfts: List[float] = []
+                finished_num_preempted = 0
+                if iteration_stats is not None:
+                    # Time-to-first-token samples from this iteration
+                    ttft_iter = getattr(iteration_stats, "time_to_first_tokens_iter", None)
+                    if ttft_iter:
+                        finished_ttfts.extend(ttft_iter)
+                    # Preemption count
+                    finished_num_preempted = getattr(iteration_stats, "num_preempted_reqs", 0)
+                    # Per-request stats from completed requests
+                    for req in getattr(iteration_stats, "finished_requests", []):
+                        prefill_t = getattr(req, "prefill_time", 0.0)
+                        decode_t = getattr(req, "decode_time", 0.0)
+                        e2e_t = getattr(req, "e2e_latency", 0.0)
+                        queued_t = getattr(req, "queued_time", 0.0)
+                        if prefill_t > 0:
+                            finished_prefill_times.append(prefill_t)
+                        if decode_t > 0:
+                            finished_decode_times.append(decode_t)
+                        if e2e_t > 0:
+                            finished_e2e_latencies.append(e2e_t)
+                        if queued_t > 0:
+                            finished_queued_times.append(queued_t)
+
+                # Throughput is computed by parent class LoggingStatLogger after super().record()
+                # These are stored as instance attributes
+                current_prompt_tp = getattr(self, "last_prompt_throughput", 0.0) or 0.0
+                current_gen_tp = getattr(self, "last_generation_throughput", 0.0) or 0.0
+
+                is_active = current_running > 0 or current_waiting > 0
+
+                with V1LoggingStatLoggerFixed._registry_lock:
+                    existing = V1LoggingStatLoggerFixed._stats_registry.get(self._engine_id)
+
+                    if existing is None:
+                        # Initialize with sample lists for median calculation
+                        existing = {
+                            # Sample lists for computing median (only active samples)
+                            "_samples_prompt_tp": [current_prompt_tp] if is_active else [],
+                            "_samples_gen_tp": [current_gen_tp] if is_active else [],
+                            "_samples_running": [current_running] if is_active else [],
+                            "_samples_waiting": [current_waiting] if is_active else [],
+                            "_samples_cache": [current_cache_usage] if is_active else [],
+                            "_prefix_hit": PrefixCacheHitRateAccumulator(),
+                            # Per-request latency samples (accumulated from finished requests)
+                            "_samples_prefill_time": list(finished_prefill_times),
+                            "_samples_decode_time": list(finished_decode_times),
+                            "_samples_e2e_latency": list(finished_e2e_latencies),
+                            "_samples_queued_time": list(finished_queued_times),
+                            "_samples_ttft": list(finished_ttfts),
+                            "_total_preempted": finished_num_preempted,
+                            # Peak values
+                            "_peak_prompt_tp": current_prompt_tp,
+                            "_peak_gen_tp": current_gen_tp,
+                            "_peak_running": current_running,
+                            "_peak_waiting": current_waiting,
+                            "_peak_cache": current_cache_usage,
+                            # Counters
+                            "_num_samples": 1,
+                            "_num_active_samples": 1 if is_active else 0,
+                            "timestamp": time.time(),
+                        }
+                        V1LoggingStatLoggerFixed._stats_registry[self._engine_id] = existing
+                    else:
+                        # Update peak values
+                        existing["_peak_prompt_tp"] = max(existing["_peak_prompt_tp"], current_prompt_tp)
+                        existing["_peak_gen_tp"] = max(existing["_peak_gen_tp"], current_gen_tp)
+                        existing["_peak_running"] = max(existing["_peak_running"], current_running)
+                        existing["_peak_waiting"] = max(existing["_peak_waiting"], current_waiting)
+                        existing["_peak_cache"] = max(existing["_peak_cache"], current_cache_usage)
+
+                        # Accumulate per-request latency samples
+                        existing["_samples_prefill_time"].extend(finished_prefill_times)
+                        existing["_samples_decode_time"].extend(finished_decode_times)
+                        existing["_samples_e2e_latency"].extend(finished_e2e_latencies)
+                        existing["_samples_queued_time"].extend(finished_queued_times)
+                        existing["_samples_ttft"].extend(finished_ttfts)
+                        existing["_total_preempted"] += finished_num_preempted
+
+                        # Append to sample lists (only for active samples to get meaningful medians)
+                        if is_active:
+                            existing["_samples_prompt_tp"].append(current_prompt_tp)
+                            existing["_samples_gen_tp"].append(current_gen_tp)
+                            existing["_samples_running"].append(current_running)
+                            existing["_samples_waiting"].append(current_waiting)
+                            existing["_samples_cache"].append(current_cache_usage)
+                            existing["_num_active_samples"] += 1
+
+                        existing["_num_samples"] += 1
+                        existing["timestamp"] = time.time()
+
+                    existing["_prefix_hit"].observe(prefix_cache_stats, is_active=is_active)
+
+            now = time.monotonic()
+            if now - self.last_log_time > self.log_interval:
+                self.log()
+                self.last_log_time = now
+
+        @staticmethod
+        def _compute_median(samples: List[float]) -> float:
+            """Compute median of a list of samples."""
+            if not samples:
+                return 0.0
+            sorted_samples = sorted(samples)
+            n = len(sorted_samples)
+            mid = n // 2
+            if n % 2 == 0:
+                return (sorted_samples[mid - 1] + sorted_samples[mid]) / 2.0
+            return sorted_samples[mid]
+
+        @classmethod
+        def get_stats_by_engine_id(cls, engine_id: int, reset: bool = True) -> Optional[Dict[str, Any]]:
+            """Get the accumulated stats for a given engine ID.
+
+            Args:
+                engine_id: The engine ID to get stats for.
+                reset: If True, reset the accumulated stats after reading (default True).
+                       This ensures each training step gets fresh stats.
+
+            Returns:
+                Dict with accumulated stats, or None if no stats recorded yet.
+                Includes peak values, median values, and computed averages.
+            """
+            with cls._registry_lock:
+                stats = cls._stats_registry.get(engine_id)
+                if stats is None:
+                    return None
+
+                # Compute medians from sample lists
+                median_prompt_tp = cls._compute_median(stats["_samples_prompt_tp"])
+                median_gen_tp = cls._compute_median(stats["_samples_gen_tp"])
+                median_running = cls._compute_median(stats["_samples_running"])
+                median_waiting = cls._compute_median(stats["_samples_waiting"])
+                median_cache = cls._compute_median(stats["_samples_cache"])
+                median_prefix_hit = cls._compute_median(stats["_prefix_hit"].samples)
+
+                # Compute means from sample lists
+                num_active = stats["_num_active_samples"]
+                if num_active > 0:
+                    mean_prompt_tp = sum(stats["_samples_prompt_tp"]) / num_active
+                    mean_gen_tp = sum(stats["_samples_gen_tp"]) / num_active
+                else:
+                    mean_prompt_tp = 0.0
+                    mean_gen_tp = 0.0
+
+                # Compute per-request latency statistics
+                prefill_samples = stats["_samples_prefill_time"]
+                decode_samples = stats["_samples_decode_time"]
+                e2e_samples = stats["_samples_e2e_latency"]
+                queued_samples = stats["_samples_queued_time"]
+                ttft_samples = stats["_samples_ttft"]
+
+                def _mean(s: List[float]) -> float:
+                    return sum(s) / len(s) if s else 0.0
+
+                def _p90(s: List[float]) -> float:
+                    if not s:
+                        return 0.0
+                    sorted_s = sorted(s)
+                    idx = int(len(sorted_s) * 0.9)
+                    return sorted_s[min(idx, len(sorted_s) - 1)]
+
+                result = {
+                    # Peak values
+                    "peak_prompt_throughput": stats["_peak_prompt_tp"],
+                    "peak_generation_throughput": stats["_peak_gen_tp"],
+                    "peak_running_reqs": stats["_peak_running"],
+                    "peak_waiting_reqs": stats["_peak_waiting"],
+                    "peak_gpu_cache_usage_perc": stats["_peak_cache"],
+                    "peak_prefix_cache_hit_rate": stats["_prefix_hit"].peak,
+                    # Median values
+                    "median_prompt_throughput": median_prompt_tp,
+                    "median_generation_throughput": median_gen_tp,
+                    "median_running_reqs": median_running,
+                    "median_waiting_reqs": median_waiting,
+                    "median_gpu_cache_usage_perc": median_cache,
+                    "median_prefix_cache_hit_rate": median_prefix_hit,
+                    # Mean values
+                    "mean_prompt_throughput": mean_prompt_tp,
+                    "mean_generation_throughput": mean_gen_tp,
+                    # Per-request latency stats (seconds)
+                    "latency_prefill_mean": _mean(prefill_samples),
+                    "latency_prefill_median": cls._compute_median(prefill_samples),
+                    "latency_prefill_p90": _p90(prefill_samples),
+                    "latency_decode_mean": _mean(decode_samples),
+                    "latency_decode_median": cls._compute_median(decode_samples),
+                    "latency_decode_p90": _p90(decode_samples),
+                    "latency_e2e_mean": _mean(e2e_samples),
+                    "latency_e2e_median": cls._compute_median(e2e_samples),
+                    "latency_e2e_p90": _p90(e2e_samples),
+                    "latency_queued_mean": _mean(queued_samples),
+                    "latency_queued_median": cls._compute_median(queued_samples),
+                    "latency_queued_p90": _p90(queued_samples),
+                    "latency_ttft_mean": _mean(ttft_samples),
+                    "latency_ttft_median": cls._compute_median(ttft_samples),
+                    "latency_ttft_p90": _p90(ttft_samples),
+                    "latency_num_finished_requests": len(e2e_samples),
+                    "total_preempted_reqs": stats["_total_preempted"],
+                    # Legacy field names for backwards compatibility (use peak values)
+                    "avg_prompt_throughput": stats["_peak_prompt_tp"],
+                    "avg_generation_throughput": stats["_peak_gen_tp"],
+                    "num_running_reqs": stats["_peak_running"],
+                    "num_waiting_reqs": stats["_peak_waiting"],
+                    "gpu_cache_usage_perc": stats["_peak_cache"],
+                    "prefix_cache_hit_rate": stats["_prefix_hit"].peak,
+                    # Metadata
+                    "timestamp": stats["timestamp"],
+                    "num_samples": stats["_num_samples"],
+                    "num_active_samples": stats["_num_active_samples"],
+                }
+
+                if reset:
+                    # Reset for next step
+                    del cls._stats_registry[engine_id]
+
+                return result
 
 
 class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
@@ -3262,7 +3278,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         finished = False
         while not finished:
             request_output = queue.get_nowait() or await queue.get()
-            if request_output is STREAM_FINISHED:
+            if request_output is self._stream_finished:
                 break
             final_output = request_output
             finished = request_output.finished
@@ -3290,7 +3306,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                     queues.append(
                         await self.llm.add_request(
                             request_id=request_id,
-                            prompt=TokensPrompt(prompt_token_ids=prompt),
+                            prompt={"prompt_token_ids": prompt},
                             params=sampling_params,
                             lora_request=lora_request,
                         )

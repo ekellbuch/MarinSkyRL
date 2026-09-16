@@ -55,6 +55,7 @@ class _LLM:
 async def test_async_vllm_admits_a_logical_batch_before_collecting(monkeypatch):
     engine = object.__new__(AsyncVLLMInferenceEngine)
     engine.llm = _LLM()
+    engine._stream_finished = object()
     engine._is_lora = False
     engine._batch_admission_lock = asyncio.Lock()
     sampling_params = object()
@@ -79,6 +80,7 @@ async def test_async_vllm_admits_a_logical_batch_before_collecting(monkeypatch):
 async def test_async_vllm_resumes_and_aborts_after_partial_admission(monkeypatch):
     engine = object.__new__(AsyncVLLMInferenceEngine)
     engine.llm = _LLM()
+    engine._stream_finished = object()
     engine._is_lora = False
     engine._batch_admission_lock = asyncio.Lock()
     request_ids = iter(["first", "second"])
@@ -94,3 +96,21 @@ async def test_async_vllm_resumes_and_aborts_after_partial_admission(monkeypatch
 
     assert [event[0] for event in engine.llm.events] == ["pause", "add", "add", "resume", "abort"]
     assert engine.llm.events[-1] == ("abort", ("first", "second"))
+
+
+def test_real_engine_requires_the_optional_runtime(monkeypatch):
+    """CPU importability does not permit constructing an engine without vLLM."""
+    from skyrl_train.inference_engines.vllm import vllm_engine
+
+    monkeypatch.setattr(vllm_engine, "VLLM_AVAILABLE", False)
+    with pytest.raises(ModuleNotFoundError, match="vllm runtime extra"):
+        AsyncVLLMInferenceEngine()
+
+
+@pytest.mark.asyncio
+async def test_stream_completion_marker_is_not_returned_as_output():
+    """The runtime completion sentinel terminates output collection without a result."""
+    engine = object.__new__(AsyncVLLMInferenceEngine)
+    marker = SimpleNamespace(value="stream-finished")
+    engine._stream_finished = marker
+    assert await engine._collect_admitted_output(_Queue(marker, [])) is None

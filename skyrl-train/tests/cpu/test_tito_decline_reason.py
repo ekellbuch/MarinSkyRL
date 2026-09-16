@@ -101,9 +101,4 @@ def test_turn_zero_without_the_generation_prompt_is_named() -> None:
 
 
 def test_reason_is_optional_so_existing_callers_are_unaffected() -> None:
-    assert (
-        _assemble_response_ids_tito_full(
-            [], None, GEN_PROMPT, None, None, None, None, None, None, None
-        )
-        is None
-    )
+    assert _assemble_response_ids_tito_full([], None, GEN_PROMPT, None, None, None, None, None, None, None) is None

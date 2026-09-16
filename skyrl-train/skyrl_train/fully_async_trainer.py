@@ -13,6 +13,9 @@ High-level notes:
 
 import asyncio
 import collections
+import json
+import math
+import statistics
 import sys
 from loguru import logger
 from skyrl_train.trainer import RayPPOTrainer
@@ -42,6 +45,7 @@ from skyrl_train.dynamic_sampling import (
     GroupSelectionPolicy,
     GroupSelectionResult,
     resolve_dynamic_sampling_criteria,
+    dynamic_sampling_final_rewards,
 )
 from skyrl_train.group_admission import AdmissionDecision, AdmissionRejection, GroupAdmissionPolicy
 from skyrl_train.utils.algorithm_registry import policy_loss_requires_rollout_logprobs
@@ -354,6 +358,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.admission_stall_timeout = int(cfg.trainer.fully_async.admission_stall_timeout)
         if self.admission_stall_timeout <= 0:
             raise ValueError("trainer.fully_async.admission_stall_timeout must be positive")
+        self.dynamic_sampling_stall_timeout = float(cfg.trainer.fully_async.dynamic_sampling_stall_timeout)
+        if not math.isfinite(self.dynamic_sampling_stall_timeout) or self.dynamic_sampling_stall_timeout <= 0:
+            raise ValueError("trainer.fully_async.dynamic_sampling_stall_timeout must be finite and positive")
         self._group_selection_policy = GroupSelectionPolicy.for_fully_async(
             cfg.trainer.algorithm.dynamic_sampling.type,
             criteria=resolve_dynamic_sampling_criteria(
@@ -1324,6 +1331,20 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self._check_generation_stall(elapsed)
         return float(self.admission_stall_timeout)
 
+    def _dynamic_sampling_admission_deadline(
+        self,
+        elapsed: float,
+        rejection_counts: collections.Counter[str],
+        report: dict,
+    ) -> float:
+        # Require a minibatch worth of reward-spread rejections since the last admission.
+        if rejection_counts[GroupSelectionResult.INSUFFICIENT_REWARD_SPREAD.value] < self.mini_batch_size:
+            return float(self.admission_stall_timeout)
+        if elapsed >= self.dynamic_sampling_stall_timeout:
+            report["seconds_since_last_admissible"] = elapsed
+            raise GenerationStalledError("DYNAMIC_SAMPLING_NO_ADMISSIBLE_GROUPS: " + json.dumps(report, sort_keys=True))
+        return min(self.admission_stall_timeout, self.dynamic_sampling_stall_timeout)
+
     def _select_dynamic_sampling_candidates(
         self,
         candidates: List[GeneratedOutputGroup],
@@ -1375,11 +1396,22 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         rejection_counts_since_admission: collections.Counter[str] = collections.Counter()
         dynamic_candidate_count = 0
         dynamic_discarded_count = 0
+        reward_std_sum = 0.0
+        reward_std_min = math.inf
+        reward_std_max = 0.0
+        constant_zero_groups = 0
+        constant_one_groups = 0
+        report = {}
 
         while True:
             async with queues.condition:
                 while len(accepted_groups) < self.mini_batch_size and queues.completed.empty():
                     elapsed = loop.time() - last_admitted_progress
+                    stall_timeout = self._dynamic_sampling_admission_deadline(
+                        elapsed,
+                        rejection_counts_since_admission,
+                        report,
+                    )
                     remaining = stall_timeout - elapsed
                     if remaining <= 0:
                         stall_timeout = self._check_admission_stall(elapsed, rejection_counts_since_admission)
@@ -1388,6 +1420,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     try:
                         await asyncio.wait_for(queues.condition.wait(), timeout=remaining)
                     except asyncio.TimeoutError:
+                        if not queues.completed.empty():
+                            continue
+                        self._dynamic_sampling_admission_deadline(
+                            loop.time() - last_admitted_progress,
+                            rejection_counts_since_admission,
+                            report,
+                        )
                         stall_timeout = self._check_admission_stall(
                             loop.time() - last_admitted_progress, rejection_counts_since_admission
                         )
@@ -1412,6 +1451,37 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 dynamic_discarded_this_scan = sum(selection.discarded_reasons.values())
                 dynamic_discarded_count += dynamic_discarded_this_scan
                 rejection_counts_since_admission.update(selection.discarded_reasons)
+                if self._dynamic_sampling_type is DynamicSamplingType.FILTER:
+                    inspected = selection.admitted_groups + [group for group, _ in selection.discarded_groups]
+                    for group in inspected:
+                        rewards = dynamic_sampling_final_rewards(
+                            group.trajectory_batch,
+                            criteria=self._group_selection_policy.criteria,
+                        )
+                        spread = statistics.pstdev(rewards)
+                        reward_std_sum += spread
+                        reward_std_min = min(reward_std_min, spread)
+                        reward_std_max = max(reward_std_max, spread)
+                        constant_zero_groups += all(reward == 0 for reward in rewards)
+                        constant_one_groups += all(reward == 1 for reward in rewards)
+                    if dynamic_candidate_count:
+                        report = {
+                            "stats_scope": "current_minibatch",
+                            "candidate_groups": dynamic_candidate_count,
+                            "admissible_groups": len(accepted_groups),
+                            "discard_count": dynamic_discarded_count,
+                            "discard_reasons": {
+                                GroupSelectionResult.INSUFFICIENT_REWARD_SPREAD.value: dynamic_discarded_count
+                            },
+                            "reward_source": self._group_selection_policy.criteria.reward_source.value,
+                            "reward_std": {
+                                "min": reward_std_min,
+                                "mean": reward_std_sum / dynamic_candidate_count,
+                                "max": reward_std_max,
+                            },
+                            "all_constant_zero": constant_zero_groups == dynamic_candidate_count,
+                            "all_constant_one": constant_one_groups == dynamic_candidate_count,
+                        }
 
                 for group, decision in partition.rejected_groups:
                     assert decision.primary_rejection is not None
@@ -1436,6 +1506,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     batch = accepted_groups[: self.mini_batch_size]
                 else:
                     batch = None
+                    # Decide while holding the completion lock, before accounting can yield to producers.
+                    self._dynamic_sampling_admission_deadline(
+                        loop.time() - last_admitted_progress,
+                        rejection_counts_since_admission,
+                        report,
+                    )
                 queues.condition.notify_all()
 
             self._record_admission_scan(

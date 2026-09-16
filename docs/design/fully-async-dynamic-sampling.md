@@ -6,9 +6,9 @@ Fully asynchronous training supports `trainer.algorithm.dynamic_sampling.type=fi
 groups whose task outcomes have zero variance, requests fresh prompt groups, and waits until it has exactly
 `policy_mini_batch_size` admissible groups. It never retries the rejected prompt and never trains a smaller batch.
 
-The filter uses `unshaped_rewards`, which represent verifier outcomes before reward shaping. Optimization rewards are
-not an admissible filter metric. Length penalties and other shaping terms can vary within an all-failure group and
-would otherwise make that group appear useful for group-relative advantage estimation.
+The filter reads the reward source selected by `dynamic_sampling.informative_on` (`shaped` by default).
+Select `unshaped` to filter on verifier outcomes before reward shaping. Length penalties and other shaping terms
+can vary within an all-failure group and make it pass a filter configured to use shaped rewards.
 
 `dynamic_sampling.type=replace` remains unsupported in fully asynchronous training. Replacement duplicates successful
 groups inside a batch. It has different data-consumption and importance-weighting semantics from DAPO filtering.
@@ -47,9 +47,11 @@ The barrier evaluates completed groups in this order:
 1. Apply algorithm-independent eligibility rules, including staleness, masking, physical group size, the configured
    group-advantage floor, and required behavior logprobs.
 2. Route an ineligible group to same-prompt retry.
-3. For an otherwise eligible group, compute outcome variance from `unshaped_rewards`.
-4. Consume a uniform-outcome group and let a rollout worker draw a fresh prompt.
-5. Admit a non-uniform group and continue until the exact mini-batch size is available.
+3. For an otherwise eligible group, read final outcomes from the configured reward source.
+4. Consume groups whose population reward standard deviation does not exceed `min_reward_std`, and draw fresh prompts.
+5. Admit groups that pass the filter and continue until the exact mini-batch size is available.
+
+A group with only one final outcome remains informative, matching the existing filter behavior.
 
 The barrier can hold accepted surplus groups for the next optimizer step. Existing buffer checkpointing remains the
 owner of completed groups and same-prompt retries. Checkpoints occur at optimizer-step boundaries, so the DAPO sample
@@ -83,3 +85,18 @@ CPU regression tests cover:
 
 The synchronous filter and the fully asynchronous filter must use the same outcome definition. Existing synchronous
 dynamic-sampling tests remain part of the CPU gate.
+
+## No-admission watchdog
+
+For fully asynchronous filtering, `trainer.fully_async.dynamic_sampling_stall_timeout` defaults to 600 seconds.
+The watchdog arms only after at least `policy_mini_batch_size` completed candidate groups have failed the
+reward-spread filter since the last admission. It checks both arriving groups and an empty completion queue.
+A newly admitted group resets the deadline and evidence count. With no completed filter evidence, the existing
+generic admission and generation watchdogs retain their behavior.
+
+When the armed deadline expires, the trainer raises `GenerationStalledError` with the machine-readable
+`DYNAMIC_SAMPLING_NO_ADMISSIBLE_GROUPS` JSON diagnostic: candidate and admissible group counts, discarded
+count/reasons, configured reward source, minimum/mean/maximum reward standard deviation, whether every observed
+candidate is constant-zero or constant-one, and seconds since the last admission. Counts and reward summaries span
+the current minibatch assembly. Check the scoring/parser outputs and recorded reward source before rerunning.
+This operational bound does not change `min_reward_std`, group selection, or the required optimizer batch size.

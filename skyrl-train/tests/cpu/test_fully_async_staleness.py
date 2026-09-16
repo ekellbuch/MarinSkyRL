@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import json
 
 import pytest
 import torch
@@ -87,6 +88,7 @@ def _batch_assembly_state(
     trainer._dynamic_sampling_max_sample_batches = max_sample_batches
     trainer._dynamic_sampling_max_candidate_groups = max_sample_batches * mini_batch_size
     trainer._step_time_history = collections.deque([1000.0], maxlen=5)
+    trainer.dynamic_sampling_stall_timeout = 600
     trainer.admission_stall_timeout = 21_600
     trainer._active_generator_tasks = []
     trainer._staleness_manager = _AsyncStalenessManager(
@@ -400,3 +402,113 @@ async def test_batch_assembly_rejected_only_progress_terminates_instead_of_livel
 
     with pytest.raises(GenerationStalledError):
         await trainer._get_admitted_generation_group_mini_batch(queues)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reward", [0.0, 1.0])
+@pytest.mark.parametrize("wait_for_deadline", [False, True])
+async def test_constant_reward_groups_fail_before_generic_admission_timeout(reward, wait_for_deadline, monkeypatch):
+    """A full minibatch of uninformative candidates produces actionable diagnostics."""
+    trainer, queues = _batch_assembly_state(
+        mini_batch_size=2, accepted=2, dynamic_sampling_type="filter", informative_on="unshaped"
+    )
+    # Only the operational deadline changes; the reward threshold stays fixed.
+    trainer.dynamic_sampling_stall_timeout = 600 if wait_for_deadline else 0
+    loop = asyncio.get_running_loop()
+    original_time = loop.time
+    clock_offset = 0
+    monkeypatch.setattr(loop, "time", lambda: original_time() + clock_offset)
+    for index in range(2):
+        queues.completed.put_nowait(
+            _generated_group(str(index), earliest_model_step=10, unshaped_rewards=[reward, reward])
+        )
+    pending = asyncio.create_task(trainer._get_admitted_generation_group_mini_batch(queues))
+    if wait_for_deadline:
+        # Let batch assembly enter its condition wait, then advance only the clock.
+        await asyncio.wait({pending}, timeout=0)
+        clock_offset = 601
+        async with queues.condition:
+            queues.condition.notify_all()
+    with pytest.raises(GenerationStalledError, match="DYNAMIC_SAMPLING_NO_ADMISSIBLE_GROUPS") as failure:
+        await asyncio.wait_for(pending, timeout=1)
+    report = json.loads(str(failure.value).split(": ", 1)[1])
+    assert report["stats_scope"] == "current_minibatch"
+    assert report["candidate_groups"] == 2
+    assert report["admissible_groups"] == 0
+    assert report["discard_count"] == 2
+    assert report["discard_reasons"] == {"insufficient_reward_spread": 2}
+    assert report["reward_std"] == {"min": 0.0, "mean": 0.0, "max": 0.0}
+    assert report["all_constant_zero"] == (reward == 0)
+    assert report["all_constant_one"] == (reward == 1)
+    assert report["seconds_since_last_admissible"] >= trainer.dynamic_sampling_stall_timeout
+
+
+@pytest.mark.asyncio
+async def test_dynamic_sampling_waits_for_minibatch_evidence_before_failing():
+    """One uninformative candidate does not abort a larger minibatch."""
+    trainer, queues = _batch_assembly_state(
+        mini_batch_size=2, accepted=3, dynamic_sampling_type="filter", informative_on="unshaped"
+    )
+    trainer.dynamic_sampling_stall_timeout = 0.0
+    queues.completed.put_nowait(_generated_group("zero", 10, unshaped_rewards=[0.0, 0.0]))
+    pending = asyncio.create_task(trainer._get_admitted_generation_group_mini_batch(queues))
+    done, _ = await asyncio.wait({pending}, timeout=0)
+    assert pending not in done
+    async with queues.condition:
+        queues.completed.put_nowait(_generated_group("mixed-1", 10))
+        queues.completed.put_nowait(_generated_group("mixed-2", 10))
+        queues.condition.notify_all()
+    batch = await asyncio.wait_for(pending, timeout=1)
+    assert [group.uid for group in batch] == ["mixed-1", "mixed-2"]
+
+
+@pytest.mark.asyncio
+async def test_partial_admission_resets_dynamic_sampling_evidence(monkeypatch):
+    """An admitted group clears earlier rejection evidence before the next deadline."""
+    trainer, queues = _batch_assembly_state(
+        mini_batch_size=2, accepted=4, dynamic_sampling_type="filter", informative_on="unshaped"
+    )
+    loop = asyncio.get_running_loop()
+    original_time = loop.time
+    clock_offset = 0
+    monkeypatch.setattr(loop, "time", lambda: original_time() + clock_offset)
+    for uid in ["zero-1", "zero-2"]:
+        queues.completed.put_nowait(_generated_group(uid, 10, unshaped_rewards=[0.0, 0.0]))
+    pending = asyncio.create_task(trainer._get_admitted_generation_group_mini_batch(queues))
+    await asyncio.wait({pending}, timeout=0)
+    clock_offset = 500
+    async with queues.condition:
+        queues.completed.put_nowait(_generated_group("mixed-1", 10))
+        queues.condition.notify_all()
+    await asyncio.wait({pending}, timeout=0)
+    # Advance beyond the first deadline; no new reward-spread rejection exists.
+    clock_offset = 1101
+    async with queues.condition:
+        queues.completed.put_nowait(_generated_group("mixed-2", 10))
+        queues.condition.notify_all()
+    batch = await asyncio.wait_for(pending, timeout=1)
+    assert [group.uid for group in batch] == ["mixed-1", "mixed-2"]
+
+
+@pytest.mark.asyncio
+async def test_ready_informative_groups_are_admitted_at_watchdog_deadline(monkeypatch):
+    """Ready useful completions take precedence over an expired no-progress clock."""
+    trainer, queues = _batch_assembly_state(
+        mini_batch_size=2, accepted=4, dynamic_sampling_type="filter", informative_on="unshaped"
+    )
+    loop = asyncio.get_running_loop()
+    original_time = loop.time
+    clock_offset = 0
+    monkeypatch.setattr(loop, "time", lambda: original_time() + clock_offset)
+    for uid in ["zero-1", "zero-2"]:
+        queues.completed.put_nowait(_generated_group(uid, 10, unshaped_rewards=[0.0, 0.0]))
+    pending = asyncio.create_task(trainer._get_admitted_generation_group_mini_batch(queues))
+    await asyncio.wait({pending}, timeout=0)
+    # Publish the completed batch atomically with advancing the deadline.
+    async with queues.condition:
+        clock_offset = 601
+        for uid in ["mixed-1", "mixed-2"]:
+            queues.completed.put_nowait(_generated_group(uid, 10))
+        queues.condition.notify_all()
+    batch = await asyncio.wait_for(pending, timeout=1)
+    assert [group.uid for group in batch] == ["mixed-1", "mixed-2"]

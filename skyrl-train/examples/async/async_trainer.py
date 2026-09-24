@@ -5,11 +5,10 @@ from loguru import logger
 from skyrl_train.trainer import RayPPOTrainer
 from skyrl_train.utils.progress import tqdm
 from skyrl_train.utils import Timer
-from skyrl_train.utils.ppo_utils import normalize_advantages_dict
 from skyrl_train.training_batch import TrainingInputBatch
-from skyrl_train.generators.base import GeneratorOutput
+from skyrl_train.trajectory_runners.base import TrajectoryBatch
 from skyrl_train.utils.trainer_utils import ResumeMode
-from skyrl_train.generators.utils import prepare_generator_input
+from skyrl_train.trajectory_runners.trajectory_processing import prepare_trajectory_request
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
 
 
@@ -92,8 +91,7 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
                     with Timer("save_checkpoints", self.all_timings):
                         self.save_checkpoints()
                 if self.cfg.trainer.hf_save_interval > 0 and self.global_step % self.cfg.trainer.hf_save_interval == 0:
-                    with Timer("save_hf_model", self.all_timings):
-                        self.save_models()
+                    self.handle_hf_export()
                 self.tracker.log({"timing/" + k: v for k, v in self.all_timings.items()}, step=self.global_step)
                 self.all_timings = {}
                 self.global_step += 1
@@ -111,21 +109,19 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
                 self.save_checkpoints()
                 logger.info("Saved final checkpoint.")
         if self.cfg.trainer.hf_save_interval > 0:
-            with Timer("save_hf_model", self.all_timings):
-                self.save_models()
-                logger.info("Saved final model.")
+            self.handle_hf_export()
         logger.info("Training done!")
 
     async def _run_training(self, generation_buffer):
         # Get a generation future and await on the object
-        generator_output, uids = await generation_buffer.get()  # GeneratorOutput, List[str]
+        trajectory_batch, uids = await generation_buffer.get()  # TrajectoryBatch, List[str]
 
         # print example just for debugging
-        vis = self.tokenizer.decode(generator_output["response_ids"][0])
+        vis = self.tokenizer.decode(trajectory_batch["response_ids"][0])
         logger.debug(f"Example generated: {vis}")
 
         with Timer("convert_to_training_input", self.all_timings):
-            training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
+            training_input: TrainingInputBatch = self.convert_to_training_input(trajectory_batch, uids)
 
         # inference and calculate values, log probs, rewards, kl divergence
         with Timer("fwd_logprobs_values_reward", self.all_timings):
@@ -139,13 +135,7 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
         # calculate advantages and returns / along with tensorboard logging
         with Timer("compute_advantages_and_returns", self.all_timings):
             training_input = self.compute_advantages_and_returns(training_input)
-            # remove some unwanted keys
-            for key in ["rewards"]:
-                training_input.pop(key)
-            training_input.metadata.pop("uids")
-
-            if self.cfg.trainer.algorithm.advantage_batch_normalize:
-                training_input = normalize_advantages_dict(training_input)
+            training_input = self.finalize_advantages_for_training(training_input)
 
         if self.cfg.trainer.dump_data_batch:
             # dump data to file
@@ -163,7 +153,7 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
             for i, rand_prompts in enumerate(self.train_dataloader):
                 # truncate data to have even shards
                 rand_prompts = self._remove_tail_data(rand_prompts)
-                generator_input, uids = prepare_generator_input(
+                trajectory_request, uids = prepare_trajectory_request(
                     rand_prompts,
                     self.cfg.generator.n_samples_per_prompt,
                     get_sampling_params_for_backend(self.cfg.generator.backend, self.cfg.generator.sampling_params),
@@ -174,11 +164,11 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
 
                 # generation phase
                 async with Timer("generate", self.all_timings):
-                    generator_output: GeneratorOutput = await self.generate(generator_input)
-                    generator_output = self.postprocess_generator_output(generator_output, uids)
+                    trajectory_batch: TrajectoryBatch = await self.generate(trajectory_request)
+                    trajectory_batch = self.postprocess_trajectory_batch(trajectory_batch, uids)
 
                 # Add to generation buffer
-                await generation_buffer.put((generator_output, uids))
+                await generation_buffer.put((trajectory_batch, uids))
 
                 # If the buffer is full, start weight sync
                 # Don't weight sync in the first step, because we let the generator run one step ahead

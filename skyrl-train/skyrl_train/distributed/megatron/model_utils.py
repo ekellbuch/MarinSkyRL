@@ -214,9 +214,16 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        # Keep exactly one full gradient buffer. Retaining every chunk and then
-        # concatenating them doubles the [B, S, V_local] peak on long packed RL batches.
-        grad_input = torch.zeros_like(vocab_parallel_logits, dtype=torch.float32)
+        # Autograd must receive one [B, S, V_local] gradient, but it need not be
+        # fp32: the model activation is bf16/fp16 and PyTorch accumulates its
+        # gradient in that dtype.  Every sequence chunk below overwrites its
+        # destination exactly once, so ``empty_like`` is safe and avoids the
+        # extra full fp32 buffer (12.9 GiB in the failing 30B RL batch).
+        #
+        # The temporary log-softmax and chosen-token mask remain fp32 *inside*
+        # the bounded chunk loop; only the returned activation gradient uses
+        # the model's native dtype.
+        grad_input = torch.empty_like(vocab_parallel_logits)
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -572,14 +579,11 @@ class _VocabParallelEntropy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
         vocab_parallel_logits, softmax_logits, sum_softmax_times_logits = ctx.saved_tensors
-        # reuse softmax_logits as grad
-        vocab_parallel_logits.sub_(sum_softmax_times_logits)
-        softmax_logits.mul_(vocab_parallel_logits)
-        softmax_logits.mul_(grad_output.unsqueeze(dim=-1))
-        # recover vocab_parallel_logits
-        vocab_parallel_logits.add_(sum_softmax_times_logits)
-        softmax_logits.mul_(-1)
-        return softmax_logits
+        grad_input = vocab_parallel_logits.sub(sum_softmax_times_logits)
+        grad_input.mul_(softmax_logits)
+        grad_input.mul_(grad_output.unsqueeze(dim=-1))
+        grad_input.neg_()
+        return grad_input
 
 
 def vocab_parallel_entropy(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:

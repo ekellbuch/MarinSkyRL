@@ -6,10 +6,10 @@ ensuring that training can resume exactly where it left off.
 
 Run with:
 For FSDP and DeepSpeed, run:
-uv run --isolated --extra dev --extra deepspeed --extra vllm pytest tests/gpu/gpu_ci/test_trainer_full_checkpointing.py -m "not megatron"
+uv run --isolated --group dev --extra deepspeed --extra vllm pytest tests/gpu/gpu_ci/test_trainer_full_checkpointing.py -m "not megatron"
 
 For Megatron, run:
-uv run --isolated --extra dev --extra mcore --extra vllm pytest tests/gpu/gpu_ci/test_trainer_full_checkpointing.py -m "megatron"
+uv run --isolated --group dev --extra vllm --extra megatron pytest tests/gpu/gpu_ci/test_trainer_full_checkpointing.py -m "megatron"
 """
 
 import ray
@@ -105,8 +105,7 @@ def create_minimal_trainer(cfg: DictConfig):
     # Create dummy dataset
     train_dataset = DummyDataset(size=4)  # Small dataset for quick testing
 
-    # Create mock generator for testing
-    mock_generator = MagicMock()
+    mock_trajectory_runner = MagicMock()
 
     # Create tracker
     tracker = Tracking(
@@ -124,7 +123,7 @@ def create_minimal_trainer(cfg: DictConfig):
         train_dataset=train_dataset,
         eval_dataset=None,
         inference_engine_client=None,
-        generator=mock_generator,
+        trajectory_runner=mock_trajectory_runner,
     )
 
     return trainer

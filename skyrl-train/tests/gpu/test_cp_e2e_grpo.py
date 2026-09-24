@@ -1,5 +1,7 @@
 """Stage 6 (FSDP2 CP) — E2E GRPO parity + long-context OOM->OK (the ship gate).
 
+Jupiter-only SIF test: the documented Apptainer commands target Jupiter's Slurm runtime.
+
 This is the make-or-break integration test for torch-native Context Parallel on
 the FSDP2 backend. It proves CP works end-to-end in a REAL GRPO step and that the
 feature delivers its reason for existing (a sequence that OOMs at cp=1 trains at
@@ -49,10 +51,13 @@ import traceback
 
 import torch
 import torch.distributed as dist
+from omegaconf import OmegaConf
 
 import skyrl_train.model_wrapper as _mw
+from skyrl_train.utils.policy_losses import ppo_policy_loss
 import skyrl_train.distributed.cp_utils as _cp
 from skyrl_train.model_wrapper import HFModelWrapper
+from tests.distributed_runtime_constants import GPU_TEST_PROCESS_GROUP_TIMEOUT_SECONDS
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
@@ -139,10 +144,6 @@ def _grpo_step(model, input_ids, attention_mask, num_actions, lr=1e-4, cp_group=
     all_gather backward reduce-scatters each token's grad to its OWNING cp rank, so
     each rank holds only its shard's contribution; summing across the cp group
     reconstructs the full-sequence gradient (== the cp=1 gradient)."""
-    import torch.distributed as _dist
-    from omegaconf import OmegaConf
-    from skyrl_train.utils.ppo_utils import ppo_policy_loss
-
     model.model.train()
     opt = torch.optim.SGD(model.model.parameters(), lr=lr)  # SGD = deterministic, no state
 
@@ -170,10 +171,16 @@ def _grpo_step(model, input_ids, attention_mask, num_actions, lr=1e-4, cp_group=
             "use_tis": False,
             "tis_imp_ratio_cap": 2.0,
             "max_seq_len": 64,
-            "global_loss_denom": float(B * 64),
         }
     )
-    loss, _ = ppo_policy_loss(action_log_probs, old_log_probs, advantages, cfg, loss_mask=loss_mask)
+    loss, _ = ppo_policy_loss(
+        action_log_probs,
+        old_log_probs,
+        advantages,
+        cfg,
+        loss_mask=loss_mask,
+        global_loss_denom=float(B * 64),
+    )
     opt.zero_grad()
     loss.backward()
     if cp_group is not None:
@@ -182,7 +189,7 @@ def _grpo_step(model, input_ids, attention_mask, num_actions, lr=1e-4, cp_group=
         # shard's grad after the unshard's reduce-scatter backward.
         for p in model.model.parameters():
             if p.grad is not None:
-                _dist.all_reduce(p.grad, op=_dist.ReduceOp.SUM, group=cp_group)
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=cp_group)
     gnorm = _grad_norm(model)
     opt.step()
     return loss.float().item(), gnorm
@@ -385,7 +392,13 @@ def test3_cp_ep_moe(world_size, rank):
     # exercises the expert-DTensor slice over a 4-D mesh (the Stage-3 concern);
     # experts shard over the ep submesh (fsdp is size-1 here).
     try:
-        mesh4d = create_device_mesh(world_size=world_size, fsdp_size=1, ep_size=2, cp_size=2)
+        mesh4d = create_device_mesh(
+            world_size=world_size,
+            fsdp_size=1,
+            timeout_seconds=GPU_TEST_PROCESS_GROUP_TIMEOUT_SECONDS,
+            ep_size=2,
+            cp_size=2,
+        )
     except Exception as e:
         if rank == 0:
             print(f"[TEST3] create_device_mesh(4-D) FAILED: {e!r}")

@@ -27,6 +27,8 @@ from skyrl_train.utils.io import io
 
 from safetensors.torch import save_file
 
+from skyrl_train import hf_model_io
+
 
 def _z3_params_to_fetch(param_list):
     return [p for p in param_list if hasattr(p, "ds_id") and p.ds_status == ZeroParamStatus.NOT_AVAILABLE]
@@ -250,8 +252,7 @@ class DeepspeedStrategy(DistributedStrategy):
         scheduler=None,
         tag=None,
         load_module_strict=True,
-        load_optimizer_states=True,
-        load_lr_scheduler_states=True,
+        load_training_state=True,
     ):
         if isinstance(model, HFModelWrapper):
             model = model.model
@@ -264,15 +265,15 @@ class DeepspeedStrategy(DistributedStrategy):
                 read_dir,
                 tag,
                 load_module_strict=load_module_strict,
-                load_optimizer_states=load_optimizer_states,
-                load_lr_scheduler_states=load_lr_scheduler_states,  # DeepSpeed handles this automatically
+                load_optimizer_states=load_training_state,
+                load_lr_scheduler_states=load_training_state,  # DeepSpeed handles this automatically
             )
 
         if load_path is None:
             raise Exception(f"[deepspeed] failed to resume from checkpoint {ckpt_dir}")
 
         # Load RNG state for reproducibility (if present)
-        if "rng" in states:
+        if load_training_state and "rng" in states:
             self.load_rng_state(states["rng"])
             if self.is_rank_0():
                 self.print(f"[rank-{self.get_rank()}]: Loaded RNG state from checkpoint")
@@ -320,16 +321,13 @@ class DeepspeedStrategy(DistributedStrategy):
             if getattr(unwrapped_model.config, "tie_word_embeddings", False) and "lm_head.weight" in full_state_dict:
                 full_state_dict.pop("lm_head.weight", None)
 
-            # Only rank 0 writes; use io.local_work_dir for local→remote sync
-            with io.local_work_dir(output_dir) as work_dir:
-                save_file(full_state_dict, os.path.join(work_dir, "model.safetensors"))
+            with hf_model_io.local_hf_model_dir(output_dir) as work_dir:
+                save_file(full_state_dict, os.path.join(work_dir, hf_model_io.HF_WEIGHT_FILENAME))
                 unwrapped_model.config.save_pretrained(work_dir)
                 if tokenizer is not None:
                     tokenizer.save_pretrained(work_dir)
 
-        # Final barrier so others wait for upload to complete
-        if is_dist:
-            dist.barrier()
+        # The Ray caller waits for every rank result; no collective needs to span rank 0's upload.
 
     def _set_bf16_config(self, ds_config):
         # torch_autocast.enabled should be set in the config file

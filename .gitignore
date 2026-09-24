@@ -22,6 +22,9 @@ docs/_spelling/
 .cache/
 .pytest_cache/
 
+# Ignore generated credentials from google-github-actions/auth
+gha-creds-*.json
+
 # NOTE (sumanthrh): Don't add .env to gitignore. .env file when passed to uv is used to set env vars for each ray worker process. 
 # If it's in .gitignore then it won't be a part of the working directory shipped by uv and your env vars will not be set.
 # This will just appear as a warning (silent failure) and you're gonna have a bad time.
@@ -46,11 +49,14 @@ trials/
 
 # uv lock files
 uv.lock
+!/uv.lock
 
 # temp directory
 /temp/
 
 # build directories
 /_build*
-# gpu-rl prebuilt wheels (fetched at build time, not committed)
+/.git-worktrees/
+# gpu-rl prebuilt wheelhouse (fetched at build time, not committed)
 docker/wheelhouse/*.whl
+docker/wheelhouse/MANIFEST

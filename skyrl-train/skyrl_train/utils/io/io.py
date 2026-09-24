@@ -12,14 +12,23 @@ Uses fsspec for cloud storage abstraction.
 import os
 import tempfile
 from contextlib import contextmanager
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Protocol
+
 import fsspec
 from loguru import logger
-from .s3fs import get_s3_fs, s3_refresh_if_expiring, call_with_s3_retry, ClientError
+from marinskyrl.resource_locator import is_cloud_uri
+from .s3fs import get_s3_fs, s3_refresh_if_expiring, call_with_s3_retry
+
+
+class DirectoryPublisher(Protocol):
+    def __call__(self, local_path: str, cloud_path: str) -> None: ...
 
 
 def is_cloud_path(path: str) -> bool:
     """Check if the given path is a cloud storage path."""
-    return path.startswith(("s3://", "gs://", "gcs://"))
+    return is_cloud_uri(path)
 
 
 def _get_filesystem(path: str):
@@ -42,17 +51,47 @@ def open_file(path: str, mode: str = "rb"):
 
     fs = _get_filesystem(path)
     norm = fs._strip_protocol(path)
+    if path.startswith("s3://"):
+        return call_with_s3_retry(fs, fs.open, norm, mode)
+    return fs.open(norm, mode)
+
+
+def write_bytes_atomic(path: str, payload: bytes) -> None:
+    """Write one object; local paths use fsync plus atomic replacement."""
+    if is_cloud_path(path):
+        with open_file(path, "wb") as destination:
+            destination.write(payload)
+        return
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_path = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
     try:
-        return fs.open(norm, mode)
-    except ClientError as e:
-        code = getattr(e, "response", {}).get("Error", {}).get("Code")
-        if code in {"ExpiredToken", "ExpiredTokenException", "RequestExpired"} and hasattr(fs, "connect"):
-            try:
-                fs.connect(refresh=True)
-            except Exception:
-                pass
-            return fs.open(norm, mode)
-        raise
+        with os.fdopen(file_descriptor, "wb") as temporary:
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, destination)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+def read_bytes(path: str) -> bytes:
+    """Read one local or cloud object."""
+    with open_file(path, "rb") as source:
+        return source.read()
+
+
+def find_files(path: str) -> dict[str, int]:
+    """Return recursive file paths and sizes below a local or cloud prefix."""
+    filesystem = _get_filesystem(path)
+    normalized = filesystem._strip_protocol(path) if is_cloud_path(path) else path
+    if path.startswith("s3://"):
+        details = call_with_s3_retry(filesystem, filesystem.find, normalized, detail=True, withdirs=False)
+    else:
+        details = filesystem.find(normalized, detail=True, withdirs=False)
+    return {str(file_path): int(detail["size"]) for file_path, detail in details.items()}
 
 
 def makedirs(path: str, exist_ok: bool = True) -> None:
@@ -100,16 +139,26 @@ def remove(path: str) -> None:
         fs.rm(path)
 
 
-def upload_directory(local_path: str, cloud_path: str) -> None:
-    """Upload a local directory to cloud storage."""
+def _upload(local_path: str, cloud_path: str, *, recursive: bool) -> None:
     if not is_cloud_path(cloud_path):
         raise ValueError(f"Destination must be a cloud path, got: {cloud_path}")
-
-    fs = _get_filesystem(cloud_path)
-    if cloud_path.startswith("s3://"):
-        call_with_s3_retry(fs, fs.put, local_path, fs._strip_protocol(cloud_path), recursive=True)
+    filesystem = _get_filesystem(cloud_path)
+    is_s3_path = cloud_path.startswith("s3://")
+    destination = filesystem._strip_protocol(cloud_path) if is_s3_path else cloud_path
+    if is_s3_path:
+        call_with_s3_retry(filesystem, filesystem.put, local_path, destination, recursive=recursive)
     else:
-        fs.put(local_path, cloud_path, recursive=True)
+        filesystem.put(local_path, destination, recursive=recursive)
+
+
+def upload_file(local_path: str, cloud_path: str) -> None:
+    """Upload one local file to cloud storage."""
+    _upload(local_path, cloud_path, recursive=False)
+
+
+def upload_directory(local_path: str, cloud_path: str) -> None:
+    """Upload a local directory to cloud storage."""
+    _upload(local_path.rstrip("/") + "/", cloud_path, recursive=True)
     logger.info(f"Uploaded {local_path} to {cloud_path}")
 
 
@@ -119,45 +168,84 @@ def download_directory(cloud_path: str, local_path: str) -> None:
         raise ValueError(f"Source must be a cloud path, got: {cloud_path}")
 
     fs = _get_filesystem(cloud_path)
+    # The trailing separator makes fsspec copy the directory CONTENTS instead of
+    # nesting the directory under the destination. It must be appended AFTER
+    # _strip_protocol, which rstrips separators and would silently undo it.
     if cloud_path.startswith("s3://"):
-        call_with_s3_retry(fs, fs.get, fs._strip_protocol(cloud_path), local_path, recursive=True)
+        source_path = fs._strip_protocol(cloud_path) + "/"
+        call_with_s3_retry(fs, fs.get, source_path, local_path, recursive=True)
     else:
-        fs.get(cloud_path, local_path, recursive=True)
+        fs.get(cloud_path.rstrip("/") + "/", local_path, recursive=True)
+    logger.info(f"Downloaded {cloud_path} to {local_path}")
+
+
+def download_file(cloud_path: str, local_path: str) -> None:
+    """Download one cloud object atomically to a local file."""
+    if not is_cloud_path(cloud_path):
+        raise ValueError(f"Source must be a cloud path, got: {cloud_path}")
+
+    fs = _get_filesystem(cloud_path)
+    local_dir = os.path.dirname(local_path)
+    if local_dir:
+        os.makedirs(local_dir, exist_ok=True)
+    partial_path = f"{local_path}.partial"
+    try:
+        if cloud_path.startswith("s3://"):
+            call_with_s3_retry(fs, fs.get, fs._strip_protocol(cloud_path), partial_path, recursive=False)
+        else:
+            fs.get(cloud_path, partial_path, recursive=False)
+        os.replace(partial_path, local_path)
+    finally:
+        if os.path.exists(partial_path):
+            os.remove(partial_path)
     logger.info(f"Downloaded {cloud_path} to {local_path}")
 
 
 @contextmanager
-def local_work_dir(output_path: str):
-    """
-    Context manager that provides a local working directory.
+def local_read_files(input_paths: Sequence[str]):
+    """Stage an explicit set of cloud objects locally without reading sibling objects."""
+    paths = list(input_paths)
+    cloud_paths = [is_cloud_path(path) for path in paths]
+    if any(cloud_paths) and not all(cloud_paths):
+        raise ValueError("input_paths must be entirely local or entirely cloud-backed")
 
-    For local paths, returns the path directly.
-    For cloud paths, creates a temporary directory and uploads content at the end.
+    if not any(cloud_paths):
+        missing_paths = [path for path in paths if not exists(path)]
+        if missing_paths:
+            raise FileNotFoundError(f"Paths do not exist: {missing_paths}")
+        yield paths
+        return
 
-    Args:
-        output_path: The final destination path (local or cloud)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        local_paths = []
+        for index, input_path in enumerate(paths):
+            local_path = os.path.join(temp_dir, str(index), os.path.basename(input_path))
+            download_file(input_path, local_path)
+            local_paths.append(local_path)
+        yield local_paths
 
-    Yields:
-        str: Local directory path to work with
 
-    Example:
-        with local_work_dir("s3://bucket/model") as work_dir:
-            # Save files to work_dir
-            model.save_pretrained(work_dir)
-            # Files are automatically uploaded to s3://bucket/model at context exit
-    """
+@contextmanager
+def local_output_dir(
+    output_path: str,
+    publisher: DirectoryPublisher,
+):
+    """Yield ``output_path`` locally, or temporary staging that publishes cloud output on success."""
     if is_cloud_path(output_path):
         with tempfile.TemporaryDirectory() as temp_dir:
-            try:
-                yield temp_dir
-            finally:
-                # Upload everything from temp_dir to cloud path
-                upload_directory(temp_dir, output_path)
-                logger.info(f"Uploaded directory contents to {output_path}")
-    else:
-        # For local paths, ensure directory exists and use it directly
-        makedirs(output_path, exist_ok=True)
-        yield output_path
+            yield temp_dir
+            publisher(temp_dir, output_path)
+        return
+
+    makedirs(output_path, exist_ok=True)
+    yield output_path
+
+
+@contextmanager
+def local_work_dir(output_path: str):
+    """Yield direct local output or cloud staging that uploads on success."""
+    with local_output_dir(output_path, upload_directory) as work_dir:
+        yield work_dir
 
 
 @contextmanager

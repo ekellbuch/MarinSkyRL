@@ -9,22 +9,17 @@ Regression guard for the r5 engine-starvation investigation
 (agent_logs/2026-07-03_r5_engine_starvation_rootcause.md).
 """
 
-import os
-import sys
-
 import pytest
 from omegaconf import OmegaConf
 
-# The builder lives under examples/ (not an installed package).
-_EXAMPLES = os.path.join(os.path.dirname(__file__), "..", "..", "examples")
-if _EXAMPLES not in sys.path:
-    sys.path.insert(0, _EXAMPLES)
-
-# The builder pulls in the harbor/terminal_bench agentic-RL stack, which the CPU
-# dev extra deliberately does not install. Skip the module where it is absent
-# (it still runs in the agentic RL env where harbor is present).
+# The trainer CPU gate installs Harbor through the dedicated harbor-test group.
+# Keep the import guard for minimal launcher environments that collect this file.
 try:
-    from terminal_bench.harbor_config import AGENT_SCHEMA, HarborConfigBuilder  # noqa: E402
+    from skyrl_train.trajectory_runners.harbor.configuration import (
+        AGENT_SCHEMA,
+        HarborConfigBuilder,
+        get_exposed_harbor_fields,
+    )
 except ImportError:
     pytest.skip("harbor deps unavailable (agentic RL extra not installed)", allow_module_level=True)
 
@@ -55,3 +50,106 @@ def test_yaml_false_is_honored_no_falsy_bug():
     # The r5 case: explicit `false` must NOT be swallowed by the default.
     kwargs = _agent_kwargs({"name": "terminus-2", "record_terminal_session": False})
     assert kwargs["record_terminal_session"] is False
+
+
+def test_max_turns_reaches_the_agent_without_deprecated_max_episodes():
+    kwargs = _agent_kwargs({"name": "terminus-2", "max_turns": 30})
+    assert kwargs["max_turns"] == 30
+    assert "max_episodes" not in kwargs
+
+
+def test_passthrough_exceptions_are_never_retried():
+    cfg = OmegaConf.create(
+        {
+            "harbor": {
+                "passthrough_exceptions": ["AgentTimeoutError"],
+                "exclude_exceptions": ["VerifierTimeoutError"],
+            }
+        }
+    )
+
+    retry_config = HarborConfigBuilder(cfg).build_retry_config()
+
+    assert retry_config.exclude_exceptions == {"AgentTimeoutError", "VerifierTimeoutError"}
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {"harbor": {"override_timeout_sec": 123}},
+        {"override_timeout_sec": 123},
+    ],
+)
+def test_agent_timeout_resolution_supports_nested_and_legacy_layouts(cfg):
+    assert HarborConfigBuilder(OmegaConf.create(cfg)).get_agent_timeout_seconds() == 123
+
+
+def _trial_config(harbor_cfg: dict):
+    return HarborConfigBuilder(OmegaConf.create({"harbor": harbor_cfg})).build_trial_config(
+        task_path="/tmp/task",
+        trials_dir="/tmp/trials",
+        model_name="hosted_vllm/model",
+        api_base="http://localhost:8000/v1",
+        session_id="session",
+    )
+
+
+def test_trial_attempt_timeout_reaches_harbor_trial_config():
+    trial_config = _trial_config({"trial_attempt_timeout_sec": 1900})
+
+    assert trial_config.trial_attempt_timeout_sec == 1900
+    assert "trial_attempt_timeout_sec" in get_exposed_harbor_fields()["trial"]
+
+
+def test_trial_attempt_timeout_remains_unset_when_omitted():
+    assert _trial_config({}).trial_attempt_timeout_sec is None
+
+
+def test_environment_kwargs_reach_the_backend_constructor():
+    trial_config = _trial_config(
+        {
+            "environment_type": "gke",
+            "env_cpu": 4,
+            "environment_kwargs": {
+                "project_id": "soe-hazy-gemini",
+                "cluster_name": "harbor-tb21",
+                "region": "asia-northeast3",
+                "cpu": 99,
+            },
+        }
+    )
+
+    assert trial_config.environment.type.value == "gke"
+    assert trial_config.environment.kwargs["project_id"] == "soe-hazy-gemini"
+    assert trial_config.environment.kwargs["cluster_name"] == "harbor-tb21"
+    assert trial_config.environment.kwargs["region"] == "asia-northeast3"
+    # The schema-named field keeps precedence over the passthrough dict.
+    assert trial_config.environment.kwargs["cpu"] == 4
+
+
+def test_custom_agent_import_path_and_kwargs_reach_harbor():
+    trial_config = _trial_config(
+        {
+            "name": "terminus-2",
+            "agent_import_path": "overfit_tbench.agents.terminus_2_edit:Terminus2Edit",
+            "agent_kwargs": {
+                "prompt_variant": "task_completion_discouraged",
+                "prompt_options": {"require_evidence": True},
+                "api_base": "http://wrong.example/v1",
+                "max_turns": 99,
+            },
+            "max_turns": 12,
+        }
+    )
+
+    assert trial_config.agent.name is None
+    assert trial_config.agent.import_path == "overfit_tbench.agents.terminus_2_edit:Terminus2Edit"
+    assert trial_config.agent.kwargs["prompt_variant"] == "task_completion_discouraged"
+    assert trial_config.agent.kwargs["prompt_options"] == {"require_evidence": True}
+    # Runtime-owned and schema-named kwargs keep precedence over the passthrough dict.
+    assert trial_config.agent.kwargs["api_base"] == "http://localhost:8000/v1"
+    assert trial_config.agent.kwargs["max_turns"] == 12
+
+
+def test_registered_agent_name_is_kept_without_import_path():
+    assert _trial_config({"name": "terminus-2"}).agent.name == "terminus-2"

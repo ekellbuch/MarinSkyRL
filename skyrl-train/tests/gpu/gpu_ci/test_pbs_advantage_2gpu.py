@@ -13,7 +13,7 @@ Validates on real GPUs (2 GPUs, deepspeed policy worker):
      take the identical loss code path; only the advantage values differ.
 
 Run with:
-    uv run --isolated --extra dev --extra deepspeed pytest \
+    uv run --isolated --group dev --extra deepspeed pytest \
         tests/gpu/gpu_ci/test_pbs_advantage_2gpu.py
 """
 
@@ -27,7 +27,8 @@ from omegaconf import DictConfig
 
 from tests.gpu.utils import init_worker_with_type, get_test_actor_config, validate_cfg
 from skyrl_train.training_batch import TrainingInputBatch
-from skyrl_train.utils import ppo_utils
+from skyrl_train.group_admission import GroupAdvantageInvariant
+from skyrl_train.utils.advantage_estimators import compute_advantages_and_returns
 
 
 @pytest.fixture
@@ -35,19 +36,24 @@ def cfg() -> DictConfig:
     cfg = get_test_actor_config()
     cfg.trainer.update_epochs_per_batch = 1
     cfg.trainer.micro_train_batch_size_per_gpu = 1
-    cfg.trainer.policy_mini_batch_size = 2
-    cfg.generator.n_samples_per_prompt = 1
+    cfg.trainer.policy_mini_batch_size = 1
+    cfg.generator.n_samples_per_prompt = 2
     cfg.trainer.placement.policy_num_gpus_per_node = 2
     cfg.trainer.logger = "console"
     cfg.generator.inference_engine_tensor_parallel_size = 2
     cfg.trainer.algorithm.advantage_estimator = "rloo_n_pbs"
+    cfg.trainer.algorithm.group_advantage_min_size = 2
     cfg.trainer.algorithm.enable_token_reward_channel = True
     validate_cfg(cfg)
     return cfg
 
 
 def _adv_cfg():
-    return type("C", (), {"rloo_n_min_group_size": 2, "rloo_n_filter_zero_reward_groups": False})()
+    return type("C", (), {"rloo_n_filter_zero_reward_groups": False})()
+
+
+def _group_invariant():
+    return GroupAdvantageInvariant.minimum_baseline_eligible(physical_group_size=2, minimum_group_size=2)
 
 
 def test_pbs_dispatcher_on_gpu(ray_init_fixture):
@@ -61,18 +67,19 @@ def test_pbs_dispatcher_on_gpu(ray_init_fixture):
     index = np.array(["g0", "g0", "g1", "g1"])
 
     # Pure RLOO-N reference (no shaping channel).
-    base, _ = ppo_utils.compute_advantages_and_returns(
+    base, _ = compute_advantages_and_returns(
         token_level_rewards=tlr,
         response_mask=rm,
         index=index,
         adv_estimator="rloo_n",
         config=_adv_cfg(),
         values=None,
+        group_advantage_invariant=_group_invariant(),
     )
 
     # rloo_n_pbs with zeros channel == base (byte-identical).
     zeros = torch.zeros_like(rm)
-    adv_zeros, _ = ppo_utils.compute_advantages_and_returns(
+    adv_zeros, _ = compute_advantages_and_returns(
         token_level_rewards=tlr,
         response_mask=rm,
         index=index,
@@ -80,13 +87,14 @@ def test_pbs_dispatcher_on_gpu(ray_init_fixture):
         config=_adv_cfg(),
         values=None,
         token_level_shaping=zeros,
+        group_advantage_invariant=_group_invariant(),
     )
     assert torch.equal(adv_zeros, base), "zeros channel must reproduce pure RLOO-N"
 
     # rloo_n_pbs with a positive edit-token shaping on sample 0, token 2.
     shaping = torch.zeros_like(rm)
     shaping[0, 2] = 0.25
-    adv_pbs, _ = ppo_utils.compute_advantages_and_returns(
+    adv_pbs, _ = compute_advantages_and_returns(
         token_level_rewards=tlr,
         response_mask=rm,
         index=index,
@@ -94,6 +102,7 @@ def test_pbs_dispatcher_on_gpu(ray_init_fixture):
         config=_adv_cfg(),
         values=None,
         token_level_shaping=shaping,
+        group_advantage_invariant=_group_invariant(),
     )
     edit_adv = adv_pbs[0, 2].item()
     non_edit = [adv_pbs[0, j].item() for j in range(seqlen) if j != 2]

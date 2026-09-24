@@ -9,13 +9,15 @@ else, exposed as a single ``torch.optim.Optimizer``-compatible object so the res
 of SkyRL (scheduler, grad-clip, CPU offload, checkpoint save/load, StaleClip
 lr-scaling) keeps working unchanged.
 
-Implementation: a thin composite over two real child optimizers —
-``torch.optim.Muon`` (2-D hidden weights) and ``torch.optim.AdamW`` (everything
-else). The composite proxies ``param_groups`` and ``state`` to the children so
+Implementation: a thin composite over two child optimizers — ``torch.optim.Muon``
+(2-D hidden weights) and MarinSkyRL's selected AdamW implementation (everything
+else). BF16 parameters use stochastic rounding by default; FP32 parameters and
+the explicit nearest mode use ``torch.optim.AdamW``. The composite proxies
+``param_groups`` and ``state`` to the children so
 that code which iterates ``optimizer.param_groups`` (scheduler lr, StaleClip lr
 scaling) and ``optimizer.state[param]`` (CPU offload/backload) operates on the
 union transparently. We deliberately reuse the shipped optimizers rather than
-re-implement their kernels.
+wrapping their state or changing their external optimizer contract.
 
 FSDP2 note: under FSDP2 the 2-D weights arrive as row-sharded ``DTensor``s. The
 Newton-Schulz iteration (``G @ G.T`` plus a global ``.norm()``) runs correctly on
@@ -26,12 +28,14 @@ full-tensor NS result within bf16 tolerance.
 
 from collections.abc import Mapping
 from itertools import chain
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable, Optional
 
 import torch
 from torch import Tensor
-from torch.optim import AdamW, Muon
+from torch.optim import Muon
 from torch.optim.optimizer import Optimizer
+
+from skyrl_train.distributed.bf16_adamw import BFloat16UpdateMode, build_adamw, parse_bf16_update_mode
 
 
 class _MergedState(Mapping):
@@ -75,6 +79,38 @@ class _MergedState(Mapping):
         return any(len(c.state) for c in self._children)
 
 
+class _CompositeOptimizer(Optimizer):
+    """Expose child optimizers through one scheduler and offload surface."""
+
+    def __init__(self, children: Iterable[Optimizer], defaults: dict[str, Any]) -> None:
+        self._children = tuple(children)
+        if not self._children:
+            raise ValueError("a composite optimizer requires at least one child")
+        all_params = list(
+            chain.from_iterable(group["params"] for child in self._children for group in child.param_groups)
+        )
+        super().__init__(all_params, defaults=defaults)
+        self._refresh_composite_views()
+
+    def _refresh_composite_views(self) -> None:
+        self.param_groups = list(chain.from_iterable(child.param_groups for child in self._children))
+        self.state = _MergedState(self._children)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for child in self._children:
+            child.step()
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True):
+        for child in self._children:
+            child.zero_grad(set_to_none=set_to_none)
+
+
 def is_muon_param(name: str, param: Tensor) -> bool:
     """Return True iff ``param`` should be optimized by Muon.
 
@@ -98,14 +134,13 @@ def is_muon_param(name: str, param: Tensor) -> bool:
     return True
 
 
-class HybridMuon(Optimizer):
+class HybridMuon(_CompositeOptimizer):
     """Composite optimizer: Muon on 2-D hidden weights, AdamW on the rest.
 
     Subclasses ``torch.optim.Optimizer`` (required: ``LRScheduler`` does an
     ``isinstance(optimizer, Optimizer)`` check) but delegates ``step``,
     ``param_groups`` and ``state`` to two child optimizers (``torch.optim.Muon``
-    + ``torch.optim.AdamW``) so we reuse the shipped kernels rather than
-    re-implementing them. The call-sites SkyRL uses are: ``step``, ``zero_grad``,
+    + selected AdamW implementation). The call-sites SkyRL uses are: ``step``, ``zero_grad``,
     ``param_groups`` (read + per-group ``lr`` mutation by scheduler/StaleClip),
     ``state`` (per-param tensor offload), ``state_dict``/``load_state_dict``.
     """
@@ -115,17 +150,20 @@ class HybridMuon(Optimizer):
         muon_params: Iterable[Tensor],
         adamw_params: Iterable[Tensor],
         *,
-        muon_lr: float = 0.02,
+        lr: float,
+        muon_lr: float | None = None,
         muon_weight_decay: float = 0.0,
         muon_momentum: float = 0.95,
         muon_nesterov: bool = True,
         ns_steps: int = 5,
         muon_eps: float = 1e-7,
         adjust_lr_fn: Optional[str] = None,
-        adamw_lr: float = 8e-6,
+        adamw_lr: float | None = None,
         adamw_betas: tuple = (0.9, 0.999),
         adamw_eps: float = 1e-8,
         adamw_weight_decay: float = 0.0,
+        bf16_update_mode: BFloat16UpdateMode = BFloat16UpdateMode.STOCHASTIC,
+        seed: int,
     ) -> None:
         muon_params = [p for p in muon_params]
         adamw_params = [p for p in adamw_params]
@@ -134,6 +172,10 @@ class HybridMuon(Optimizer):
                 "HybridMuon constructed with zero Muon params — classification found "
                 "no 2-D hidden weights. Refusing to silently degrade to AdamW-only."
             )
+        if muon_lr is None:
+            muon_lr = lr
+        if adamw_lr is None:
+            adamw_lr = lr
 
         self.muon = Muon(
             muon_params,
@@ -148,8 +190,10 @@ class HybridMuon(Optimizer):
         # AdamW group may legitimately be empty in some toy models; only build it
         # if there are params, but keep a stable child list either way.
         self.adamw = (
-            AdamW(
+            build_adamw(
                 adamw_params,
+                update_mode=bf16_update_mode,
+                seed=seed,
                 lr=adamw_lr,
                 betas=adamw_betas,
                 eps=adamw_eps,
@@ -159,35 +203,8 @@ class HybridMuon(Optimizer):
             else None
         )
 
-        # Satisfy Optimizer's bookkeeping with the union of params, then delegate
-        # param_groups/state to the children so per-group lr mutation + per-param
-        # offload route to the real child optimizers.
-        all_params = list(chain(muon_params, adamw_params))
-        super().__init__(all_params, defaults={"lr": muon_lr})
-        # ``param_groups`` is a plain list whose *elements* are the children's
-        # live group dicts → pg["lr"] = x and group.setdefault("initial_lr", ..)
-        # mutate the child group in place.
-        self.param_groups = list(chain.from_iterable(c.param_groups for c in self._children))
-        self.state = _MergedState(self._children)
-
-    # --- children iteration helper ----------------------------------------
-    @property
-    def _children(self) -> List[torch.optim.Optimizer]:
-        return [c for c in (self.muon, self.adamw) if c is not None]
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        for c in self._children:
-            c.step()
-        return loss
-
-    def zero_grad(self, set_to_none: bool = True):
-        for c in self._children:
-            c.zero_grad(set_to_none=set_to_none)
+        children = [child for child in (self.muon, self.adamw) if child is not None]
+        super().__init__(children, defaults={"lr": lr})
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -199,17 +216,18 @@ class HybridMuon(Optimizer):
         self.muon.load_state_dict(sd["muon"])
         if self.adamw is not None and sd.get("adamw") is not None:
             self.adamw.load_state_dict(sd["adamw"])
+        self._refresh_composite_views()
 
 
-def build_hybrid_muon(named_parameters, optim_config) -> HybridMuon:
+def build_hybrid_muon(named_parameters, optim_config, *, seed: int) -> HybridMuon:
     """Split ``named_parameters`` into Muon (2-D hidden weights) vs AdamW (rest)
     groups and construct a :class:`HybridMuon` from ``optim_config``.
 
     ``optim_config`` is the policy ``optimizer_config`` mapping. Recognized keys:
-      - ``lr``: AdamW-group LR (kept identical to the AdamW baseline).
+      - ``lr``: master LR inherited by every optimizer route.
       - ``adam_betas``, ``weight_decay``: AdamW-group hyperparameters.
       - ``optimizer_kwargs`` (Muon-group overrides):
-          ``muon_lr`` (default 0.02), ``muon_momentum`` (default 0.95),
+          ``muon_lr`` (default = ``lr``), ``muon_momentum`` (default 0.95),
           ``ns_steps`` (default 5), ``muon_weight_decay`` (default = ``weight_decay``),
           ``muon_nesterov`` (default True), ``adjust_lr_fn`` (default None).
     """
@@ -226,23 +244,25 @@ def build_hybrid_muon(named_parameters, optim_config) -> HybridMuon:
             adamw_names.append(name)
 
     extra = dict(optim_config.get("optimizer_kwargs", {}) or {})
-    adamw_lr = float(optim_config.lr)
+    master_learning_rate = float(optim_config.lr)
     adamw_wd = float(optim_config.get("weight_decay", 0.0))
     adamw_betas = tuple(optim_config.get("adam_betas", (0.9, 0.999)))
 
     opt = HybridMuon(
         muon_params,
         adamw_params,
-        muon_lr=float(extra.get("muon_lr", 0.02)),
+        lr=master_learning_rate,
+        muon_lr=float(extra["muon_lr"]) if "muon_lr" in extra else None,
         muon_weight_decay=float(extra.get("muon_weight_decay", adamw_wd)),
         muon_momentum=float(extra.get("muon_momentum", 0.95)),
         muon_nesterov=bool(extra.get("muon_nesterov", True)),
         ns_steps=int(extra.get("ns_steps", 5)),
         adjust_lr_fn=extra.get("adjust_lr_fn", None),
-        adamw_lr=adamw_lr,
         adamw_betas=adamw_betas,
         adamw_eps=float(extra.get("adamw_eps", 1e-8)),
         adamw_weight_decay=adamw_wd,
+        bf16_update_mode=parse_bf16_update_mode(optim_config.get("bf16_update_mode", None)),
+        seed=seed,
     )
     opt._muon_param_names = muon_names  # type: ignore[attr-defined]
     opt._adamw_param_names = adamw_names  # type: ignore[attr-defined]

@@ -16,13 +16,13 @@ nothing regresses.
 Gate
 ----
 By default the mode is auto-detected from ``sys.stderr.isatty()`` — this covers
-CoreWeave AND SLURM with no launcher wiring. It can be forced via the
-``SKYRL_PROGRESS_MODE`` env var (``tqdm`` | ``logging`` | ``auto``).
+CoreWeave AND SLURM with no launcher wiring. ``trainer.progress.mode`` can force
+``tqdm``, ``logging``, or ``auto``.
 
 Throttling (bounds log volume — this environment has had disk-brick incidents from
 log floods): a progress line is emitted only when a new percent-bucket is crossed OR
 a heartbeat interval elapses (and a per-emit minimum interval is respected), PLUS a
-guaranteed final 100% line. Tunable via ``SKYRL_PROGRESS_*`` env vars.
+guaranteed final 100% line. The thresholds live under ``trainer.progress``.
 
 API
 ---
@@ -39,9 +39,9 @@ Drop-in for the subset of the tqdm API SkyRL uses:
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 import time
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 from tqdm import tqdm as _std_tqdm
@@ -53,23 +53,35 @@ except Exception:  # pragma: no cover - defensive
     _loguru_logger = None
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return default
+@dataclass(frozen=True)
+class _ProgressSettings:
+    mode: str
+    min_interval_seconds: float
+    heartbeat_seconds: float
+    percent_step: float
+    count_step: float
 
 
-# Throttle knobs (overridable for ops safety).
-_MIN_INTERVAL = _env_float("SKYRL_PROGRESS_MIN_INTERVAL_S", 0.5)  # never emit faster than this
-_HEARTBEAT = _env_float("SKYRL_PROGRESS_HEARTBEAT_S", 15.0)  # emit even without a bucket change
-_PCT_STEP = max(1.0, _env_float("SKYRL_PROGRESS_PCT_STEP", 5.0))  # bucket width, percent
-_COUNT_STEP = max(1.0, _env_float("SKYRL_PROGRESS_COUNT_STEP", 1000.0))  # bucket width when total unknown
+_SETTINGS: _ProgressSettings | None = None
+
+
+def configure_progress(config) -> None:
+    """Install process-local progress settings from ``trainer.progress``."""
+    global _SETTINGS
+    _SETTINGS = _ProgressSettings(
+        mode=str(config.mode),
+        min_interval_seconds=float(config.min_interval_seconds),
+        heartbeat_seconds=float(config.heartbeat_seconds),
+        percent_step=float(config.percent_step),
+        count_step=float(config.count_step),
+    )
 
 
 def _use_real_tqdm() -> bool:
     """Return True iff we should delegate to the real tqdm (interactive TTY)."""
-    mode = os.environ.get("SKYRL_PROGRESS_MODE", "auto").strip().lower()
+    if _SETTINGS is None:
+        return True
+    mode = _SETTINGS.mode
     if mode == "tqdm":
         return True
     if mode == "logging":
@@ -133,14 +145,16 @@ class _LoggingProgress:
         self._last_emit_n = -1
         self._last_bucket: Optional[int] = None
         self._closed = False
+        assert _SETTINGS is not None, "configure_progress must run before logging progress is constructed"
+        self._settings = _SETTINGS
         # Initial line so operators immediately see the bar exists (and its total).
         self._maybe_emit(force=True)
 
     # --- bucketing ---------------------------------------------------------
     def _bucket(self) -> Optional[int]:
         if self.total and self.total > 0:
-            return int((self.n * 100.0 / self.total) // _PCT_STEP)
-        return int(self.n // _COUNT_STEP)
+            return int((self.n * 100.0 / self.total) // self._settings.percent_step)
+        return int(self.n // self._settings.count_step)
 
     def _should_emit(self, now: float, force: bool) -> bool:
         if self.disable:
@@ -149,16 +163,16 @@ class _LoggingProgress:
             return True
         if self._last_emit_t == 0.0:
             return True
-        if (now - self._last_emit_t) < _MIN_INTERVAL:
+        if (now - self._last_emit_t) < self._settings.min_interval_seconds:
             return False
         # Heartbeat is checked BEFORE the unchanged-counter early-return below: a
         # FROZEN counter must still emit periodically, otherwise a stalled bar goes
         # silent and becomes indistinguishable in the log from a healthy idle one.
         # That silence is exactly what hid the v0d generation-buffer wedge (stuck at
-        # 31/64 for ~4h with zero log lines). Emitting "31/64 [Xs]" every _HEARTBEAT
+        # 31/64 for ~4h with zero log lines). Emitting "31/64 [Xs]" every heartbeat
         # keeps a stall visible + greppable (same n, growing elapsed). Env-tunable via
-        # SKYRL_PROGRESS_HEARTBEAT_S.
-        if (now - self._last_emit_t) >= _HEARTBEAT:
+        # trainer.progress.heartbeat_seconds.
+        if (now - self._last_emit_t) >= self._settings.heartbeat_seconds:
             return True
         if self.n == self._last_emit_n:
             return False

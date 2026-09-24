@@ -8,7 +8,7 @@ on. Stage 4 re-adds the ``@expert_parallel`` decorator and DeepEP dispatch.
 
 What was lifted / changed vs prime-rl:
   * ``GroupedExperts`` — kept; the ``_forward_deepep`` / ``ep_comm_backend``
-    surface is restored. The for-loop impl ``_run_experts_for_loop`` is the EP=1
+    surface is restored. The for-loop helper ``run_experts_for_loop`` is the EP=1
     PARITY DEFAULT (fp32-capable, matches HF eager exactly). ``torch._grouped_mm``
     is a bf16/SM90-only perf path kept behind ``use_grouped_mm`` (validated
     separately, not the parity oracle). On the torch-EP path the grouped-mm runs
@@ -18,12 +18,12 @@ What was lifted / changed vs prime-rl:
     collapse (+ ALIGN_SIZE_M pad) to the decorator. Mirrors prime-rl exactly
     (``@expert_parallel`` grouped-mm whose inner ``_impl`` does only
     ``cumsum -> _grouped_mm``; the DeepEP path calls ``_impl`` bare).
-  * ``TokenChoiceTopKRouter`` — kept as-is. Its native ``routed_experts`` arg
-    (gather ``top_scores = scores.gather(1, routed_experts)``) IS the R3 replay
-    hook: it re-gathers weights from the LIVE ``self.gate(x)`` softmax, exactly
-    the Stage-2 monkeypatch semantics. ``expert_bias`` / ``force_balanced`` kept
-    for API compatibility but unused on the swap path.
-  * ``TokenReorderer`` — kept verbatim.
+  * ``TokenChoiceTopKRouter`` — its native ``routed_experts`` arg is the R3
+    replay hook. Both native selection and replay gather weights from the LIVE
+    ``self.gate(x)`` scores so activation-checkpoint recomputation records the
+    same autograd operations. ``expert_bias`` / ``force_balanced`` are kept for
+    API compatibility but unused on the swap path.
+  * token reorder/combine — shared with native Grug through ``moe_routing``.
   * ``MoE`` — adapted: ``MoEArgs`` / ``ep_comm_backend`` / DeepEP /
     aux-loss-free ``expert_bias`` / ``tokens_per_expert`` / ``routing_confidence``
     bookkeeping all dropped. The shared expert is OPTIONAL (vanilla Qwen3-MoE
@@ -37,6 +37,11 @@ via ``get_active_replay()`` and pulls its per-layer ``[N, K]`` target slice,
 threading it into the native router's ``routed_experts`` arg. The
 ``model_wrapper.forward`` replay-install seam is therefore UNCHANGED between the
 eager (3a) and grouped (3b) paths.
+
+Activation-checkpoint recomputation uses a separate, forward-local replay path:
+the checkpoint context records this forward's selected indices and feeds them
+back through the same ``routed_experts`` hook during backward. This preserves
+expert-parallel collective split sizes without enabling rollout-time R3.
 """
 
 from __future__ import annotations
@@ -47,6 +52,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
+
+from skyrl_train.distributed import collective_phase_diagnostics as _phase_diagnostics
+from skyrl_train.models.ep_gradient import ExpertGradientAveraging
+from skyrl_train.models.router_instrumentation import NativeRouterObserverEmitter, emit_router_forward
+from skyrl_train.models.layers.moe_routing import (
+    TokenReorderer,
+    grouped_expert_contributions,
+    run_experts_for_loop,
+)
+from skyrl_train.models.layers.moe_checkpoint import get_recomputed_routes, record_forward_routes
 
 # torchtitan's expert-parallel wrapper (pinned a1fdd7e). On the torch-EP path it
 # does the DTensor->local convert + generate_permute_indices (cross-rank
@@ -95,34 +110,6 @@ def _log_experts_path(experts, path: str) -> None:
         pass
 
 
-def _run_experts_for_loop(
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w3: torch.Tensor,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
-) -> torch.Tensor:
-    """EP=1 parity default: per-expert gated-MLP via a Python for-loop.
-
-    fp32-capable; numerically matches HF eager ``down(silu(gate(x)) * up(x))``.
-    """
-    # NOTE: incurs a device/host sync (tolist) — acceptable on the parity path.
-    # histc returns float counts; split/sum need ints.
-    counts = num_tokens_per_expert.to(torch.int64).tolist()
-    num_padding = x.shape[0] - sum(counts)
-
-    x_splits = torch.split(x[: sum(counts)], split_size_or_sections=counts, dim=0)
-    out_experts_splits = []
-    for expert_idx, x_expert in enumerate(x_splits):
-        h = F.silu(torch.matmul(x_expert, w1[expert_idx].transpose(-2, -1)))
-        h = h * torch.matmul(x_expert, w3[expert_idx].transpose(-2, -1))
-        h = torch.matmul(h, w2[expert_idx].transpose(-2, -1))
-        out_experts_splits.append(h)
-    out = torch.cat(out_experts_splits, dim=0)
-    out = torch.vstack((out, out.new_zeros((num_padding, out.shape[-1]))))
-    return out
-
-
 def _run_experts_grouped_mm_impl(
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -145,6 +132,9 @@ def _run_experts_grouped_mm_impl(
     h = F.silu(torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets))
     h = h * torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
+    routed_rows = int(offsets[-1])
+    if out.shape[0] > routed_rows:
+        out[routed_rows:].zero_()
     return out
 
 
@@ -183,7 +173,7 @@ def _run_experts_grouped_mm(
     return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert)
 
 
-class GroupedExperts(nn.Module):
+class GroupedExperts(nn.Module, ExpertGradientAveraging):
     """Stacked per-expert gated-MLP weights, run grouped over tokens.
 
     Parameter layout matches the prime-rl converter target:
@@ -206,6 +196,7 @@ class GroupedExperts(nn.Module):
         self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
         self.use_grouped_mm = use_grouped_mm
         self.ep_comm_backend: EPCommBackend = "torch"
+        self.ep_size = 1
 
     def set_ep_comm_backend(self, backend: EPCommBackend) -> None:
         self.ep_comm_backend = backend
@@ -228,7 +219,7 @@ class GroupedExperts(nn.Module):
             _log_experts_path(self, "grouped_mm_deepep")
             return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert)
         _log_experts_path(self, "for_loop_deepep")
-        return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
+        return run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
 
     def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
         # DeepEP backend: dispatch/permute happened upstream in MoE; run local experts.
@@ -251,7 +242,7 @@ class GroupedExperts(nn.Module):
             _log_experts_path(self, "grouped_mm")
             return _run_experts_grouped_mm(self.w1, self.w2, self.w3, x, num_tokens_per_expert)
         _log_experts_path(self, "for_loop")
-        return _run_experts_for_loop(self.w1, self.w2, self.w3, x, num_tokens_per_expert)
+        return run_experts_for_loop(self.w1, self.w2, self.w3, x, num_tokens_per_expert)
 
     def init_weights(self, init_std: float = 0.02):
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02)
@@ -277,7 +268,7 @@ class FeedForward(nn.Module):
 # --------------------------------------------------------------------------- #
 
 
-class TokenChoiceTopKRouter(nn.Module):
+class TokenChoiceTopKRouter(nn.Module, NativeRouterObserverEmitter):
     """Token-choice top-K router. The ``routed_experts`` arg forces the top-k
     expert selection while re-gathering ``top_scores`` from the LIVE softmax —
     the R3 crux (gradients flow through ``self.gate``)."""
@@ -316,27 +307,36 @@ class TokenChoiceTopKRouter(nn.Module):
         assert routed_experts is None or routed_experts.shape[-1] == self.top_k, (
             f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
         )
-        scores = self.gate(x)
+        selection_logits = self.gate(x)
 
         # softmax/sigmoid in float32 to match HF and avoid loss explosion.
         if self.score_func == "sigmoid":
-            scores = torch.sigmoid(scores.to(torch.float32))
+            scores = torch.sigmoid(selection_logits.to(torch.float32))
         elif self.score_func == "softmax":
-            scores = F.softmax(scores.to(torch.float32), dim=1)
+            scores = F.softmax(selection_logits.to(torch.float32), dim=1)
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
-        if routed_experts is not None:
-            # R3 replay: indices forced; weights re-gathered from the LIVE softmax.
-            top_scores = scores.gather(dim=1, index=routed_experts)
-            selected_experts_indices = routed_experts
-        else:
-            top_scores, selected_experts_indices = torch.topk(scores, k=self.top_k, dim=1)
+        _, native_experts_indices = torch.topk(scores, k=self.top_k, dim=1)
+        selected_experts_indices = native_experts_indices if routed_experts is None else routed_experts
+
+        # Native selection and checkpoint replay must record the same autograd
+        # operations. Replay changes only which indices supply the live weights.
+        top_scores = scores.gather(dim=1, index=selected_experts_indices)
 
         if self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
         top_scores = top_scores * self.route_scale
+
+        emit_router_forward(
+            router=self,
+            router_inputs=x,
+            selection_logits=selection_logits,
+            natural_selected_experts=native_experts_indices,
+            selected_experts=selected_experts_indices,
+            combine_weights=top_scores,
+        )
 
         num_tokens_per_expert = torch.histc(
             selected_experts_indices.reshape(-1).float(),
@@ -349,35 +349,6 @@ class TokenChoiceTopKRouter(nn.Module):
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
-
-
-class TokenReorderer(nn.Module):
-    """Reorder token indices to match expert ordering for grouped expert compute."""
-
-    def __init__(self, num_experts: int, top_k: int):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-
-    def forward(
-        self,
-        top_scores: torch.Tensor,
-        selected_experts_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        selected_experts_indices = selected_experts_indices.reshape(-1)
-        # int64 counts: the for-loop path needs ints (tolist→split), and the EP
-        # all_to_all dispatch (torchtitan _token_dispatch) requires INTEGER split
-        # sizes — a float histc here makes NCCL alltoall_base reject the splits.
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.float(),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
-        ).to(torch.int64)
-        token_indices_experts_sorted = torch.argsort(selected_experts_indices, stable=True)
-        top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
-        token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
-        return top_scores_experts_sorted, token_indices_experts_sorted, num_tokens_per_expert
 
 
 # --------------------------------------------------------------------------- #
@@ -531,21 +502,6 @@ class MoE(nn.Module):
         routed_output = routed_outputs[0] if len(routed_outputs) == 1 else torch.cat(routed_outputs, dim=0)
         return routed_output if shared_output is None else shared_output + routed_output
 
-    def _run_routed_experts(
-        self,
-        x: torch.Tensor,
-        token_indices_experts_sorted: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
-        top_scores_experts_sorted: torch.Tensor,
-    ) -> torch.Tensor:
-        dim = x.shape[-1]
-        routed_indices = token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim)
-        routed_input = torch.gather(x, dim=0, index=routed_indices)
-        routed_output = self.experts(routed_input, num_tokens_per_expert)
-        # Scale AFTER experts (HF eager multiplies the expert output by routing_weights).
-        routed_output = (routed_output.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)).to(x.dtype)
-        return routed_output
-
     def forward(
         self,
         x: torch.Tensor,
@@ -558,23 +514,25 @@ class MoE(nn.Module):
         Returns:
             (bs, slen, dim).
         """
-        # Collective-count diagnostic (default OFF): log this rank's default-PG count
-        # at the FIRST MoE-EP all-to-all of the current forward region (the torch-EP
-        # dispatch/combine fires inside the experts call below). Rate-limited to once
-        # per forward -> O(1), not O(MoE layers). See distributed/collective_count_diag.
-        from skyrl_train.distributed import collective_count_diag as _ccdiag
-
-        _ccdiag.log_moe_ep_boundary_once()
+        # The optional phase diagnostic snapshots process-group counters at the first
+        # MoE boundary in each forward or backward phase. It reads existing counters
+        # without issuing a collective.
+        _phase_diagnostics.log_moe_ep_boundary_once()
 
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
 
+        checkpoint_routes = get_recomputed_routes(self)
+        if checkpoint_routes is not None:
+            routed_experts = checkpoint_routes
+
         if routed_experts is not None:
-            _, _, top_k = routed_experts.shape
-            # Reshape here because the source [bs, slen, top_k] is non-contiguous.
-            routed_experts = routed_experts.reshape(-1, top_k)
+            # The public hook receives [batch, sequence, top_k]. Checkpoint replay
+            # is already flattened because that is the router's native layout.
+            routed_experts = routed_experts.reshape(-1, routed_experts.shape[-1])
 
         top_scores, selected_experts_indices, _ = self.router(x, routed_experts=routed_experts)
+        record_forward_routes(self, selected_experts_indices, self.experts.num_experts)
 
         if self.ep_comm_backend == "deepep":
             # DeepEP drives dispatch→local-experts→combine; combine already
@@ -582,17 +540,12 @@ class MoE(nn.Module):
             routed_output = self._run_deepep_routed_experts(x, selected_experts_indices, top_scores)
             return routed_output.reshape(bs, slen, dim)
 
-        (
-            top_scores_experts_sorted,
-            token_indices_experts_sorted,
-            num_tokens_per_expert,
-        ) = self.reorderer(top_scores, selected_experts_indices)
-
-        routed_output = self._run_routed_experts(
+        routed_indices, routed_output = grouped_expert_contributions(
+            self.experts,
             x,
-            token_indices_experts_sorted,
-            num_tokens_per_expert,
-            top_scores_experts_sorted,
+            top_scores,
+            selected_experts_indices,
+            self.reorderer,
         )
 
         if self.shared_expert is not None:
@@ -602,7 +555,6 @@ class MoE(nn.Module):
         else:
             out = torch.zeros_like(x)
 
-        routed_indices = token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim)
         out = out.scatter_add(dim=0, index=routed_indices, src=routed_output)
         out = out.reshape(bs, slen, dim)
         return out

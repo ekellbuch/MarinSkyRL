@@ -8,55 +8,35 @@ from null (unchunked) to 1024, which routes both the policy and ref logprob forw
 through `ChunkedDistributedLogprob` (per-position log-softmax, chunked along the
 sequence dim), bounding peak memory regardless of sequence length.
 
-These tests pin the two properties that make that default flip safe:
+These tests pin the properties that make the Megatron logprob and entropy paths safe:
   1. The chunked path is numerically identical to the unchunked path — in both the
      forward log-probs AND the backward gradient — so turning it on cannot change
      training results. (Log-softmax is per-position over vocab; chunking only splits
      the independent sequence positions, so it is exact, not approximate.)
   2. The composed base config defaults `logprob_chunk_size` to 1024 for BOTH the
      policy and ref megatron_config (the two keys the workers read).
+  3. Entropy and logprob losses can backpropagate through the same logits tensor,
+     and their combined gradient matches an independent PyTorch reference.
 
 `model_utils` imports `megatron.core.parallel_state` at module load, but the functions
-under test never touch it, so when megatron is not installed (the CPU CI env) we stub
-that one submodule — only if megatron is genuinely absent, so a real-megatron env is
-left untouched.
+under test only need one tensor-parallel group lookup. When megatron is not installed
+(the CPU CI env), the shared tests/cpu/util.py helper stubs the import and the entropy
+test supplies the real single-rank process group. A real-megatron env is left untouched.
 """
-
-import importlib.util
-import os
-import sys
-import types
 
 import pytest
 import torch
-import torch.distributed as dist
 
-if importlib.util.find_spec("megatron") is None:
-    for _name in ("megatron", "megatron.core", "megatron.core.parallel_state"):
-        sys.modules.setdefault(_name, types.ModuleType(_name))
+from tests.cpu.util import stub_megatron_modules
 
+stub_megatron_modules()
+
+from skyrl_train.distributed.megatron import model_utils  # noqa: E402
 from skyrl_train.distributed.megatron.model_utils import (  # noqa: E402
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    vocab_parallel_entropy,
 )
-
-
-@pytest.fixture(scope="module")
-def single_rank_group():
-    """A world-size-1 gloo process group so the TP all-reduces inside the logprob
-    kernels are no-ops (vocab_start=0, vocab_end=full vocab) and the computation runs
-    on a single CPU process."""
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29591")
-    created = False
-    if not dist.is_initialized():
-        dist.init_process_group("gloo", rank=0, world_size=1)
-        created = True
-    try:
-        yield dist.group.WORLD
-    finally:
-        if created:
-            dist.destroy_process_group()
 
 
 def _logprobs(logits, targets, group, chunk_size, inference_only):
@@ -145,7 +125,64 @@ def test_chunked_bf16_model_output_matches_lossless_fp32_output(single_rank_grou
 
     direct_logprobs.sum().backward()
     old_logprobs.sum().backward()
+    # The custom backward must return the model activation dtype. Returning a
+    # full fp32 [B, S, V_local] buffer is the late-step RL OOM this test guards.
+    assert direct_bf16.grad.dtype is torch.bfloat16
     assert torch.equal(direct_bf16.grad, old_fp32_input.grad)
+
+
+def test_chunked_backward_does_not_allocate_a_full_fp32_gradient(single_rank_group, monkeypatch):
+    """Chunked backward may only allocate full-vocab storage in model dtype.
+
+    ``torch.zeros_like(..., dtype=float32)`` was an overlooked second full
+    vocab-parallel reconstruction: its 12.9 GiB allocation killed the r6
+    Pymethods and r9 OpenCode arms after several healthy steps.  The output
+    gradient is filled chunk-by-chunk, so a zeroed fp32 destination is neither
+    necessary nor safe at this sequence length.
+    """
+    torch.manual_seed(4)
+    logits = torch.randn(1, 9, 16, dtype=torch.bfloat16).requires_grad_(True)
+    targets = torch.randint(0, 16, (1, 9))
+
+    def reject_full_fp32_zeros_like(*args, **kwargs):
+        if kwargs.get("dtype") is torch.float32:
+            raise AssertionError("chunked backward allocated a full fp32 gradient")
+        return original_zeros_like(*args, **kwargs)
+
+    original_zeros_like = model_utils.torch.zeros_like
+    monkeypatch.setattr(model_utils.torch, "zeros_like", reject_full_fp32_zeros_like)
+
+    _logprobs(logits, targets, single_rank_group, chunk_size=3, inference_only=False).sum().backward()
+    assert logits.grad is not None
+    assert logits.grad.dtype is torch.bfloat16
+
+
+def test_vocab_parallel_entropy_and_logprob_share_logits_without_corrupting_backward(single_rank_group, monkeypatch):
+    """Entropy and policy losses must backpropagate through the same logits tensor."""
+    monkeypatch.setattr(model_utils.mpu, "get_tensor_model_parallel_group", lambda: single_rank_group, raising=False)
+    torch.manual_seed(5)
+    base_logits = torch.randn(2, 7, 16, dtype=torch.float32)
+    targets = torch.randint(0, base_logits.shape[-1], (base_logits.shape[0], base_logits.shape[1]))
+
+    parallel_logits = base_logits.clone().requires_grad_(True)
+    parallel_logprobs = _logprobs(
+        parallel_logits,
+        targets,
+        single_rank_group,
+        chunk_size=3,
+        inference_only=False,
+    )
+    parallel_entropy = vocab_parallel_entropy(parallel_logits)
+    (parallel_logprobs.sum() + 0.003 * parallel_entropy.sum()).backward()
+
+    reference_logits = base_logits.clone().requires_grad_(True)
+    reference_log_probs = reference_logits.log_softmax(dim=-1)
+    rolled_targets = targets.roll(shifts=-1, dims=-1)
+    reference_chosen = reference_log_probs.gather(-1, rolled_targets.unsqueeze(-1)).squeeze(-1)[:, :-1]
+    reference_entropy = -(reference_log_probs.exp() * reference_log_probs).sum(dim=-1)
+    (reference_chosen.sum() + 0.003 * reference_entropy.sum()).backward()
+
+    assert torch.allclose(parallel_logits.grad, reference_logits.grad, atol=1e-6, rtol=1e-6)
 
 
 def test_packed_logprobs_preserve_left_padded_action_positions(single_rank_group):

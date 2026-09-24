@@ -1,4 +1,5 @@
 #!/bin/bash
+# Jupiter-only SIF test: this manual Slurm job runs against Jupiter's Apptainer runtime.
 #SBATCH --account=reformo
 #SBATCH --reservation=reformo
 #SBATCH --partition=booster
@@ -43,7 +44,6 @@ export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export SKYRL_CP_REQUIRE_RIGHT_ALIGN=1
 
 RUNLOG="/e/scratch/jureap59/feuer1/stage6_cp_e2e_${SLURM_JOB_ID}.log"
 echo "=== Stage 6 CP e2e launch (nproc=${NPROC}) ==="
@@ -56,7 +56,6 @@ srun apptainer exec --nv \
   --overlay "$OVERLAY":ro \
   --env PYTHONPATH="$WT/skyrl-train" \
   --env LIBRARY_PATH=/.singularity.d/libs \
-  --env SKYRL_CP_REQUIRE_RIGHT_ALIGN=1 \
   --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 \
   "$SIF" \
   torchrun --nproc-per-node="${NPROC}" tests/gpu/test_cp_e2e_grpo.py 2>&1 | tee "$RUNLOG"

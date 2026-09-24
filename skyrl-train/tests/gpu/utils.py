@@ -21,13 +21,12 @@ from skyrl_train.training_batch import TensorBatch, TrainingInputBatch, Training
 from skyrl_train.entrypoints.main_base import config_dir
 from skyrl_train.utils import get_ray_pg_ready_with_timeout
 from skyrl_train.distributed.dispatch import concatenate_outputs_after_mesh_dispatch
-from skyrl_train.generators.base import GeneratorInput, ConversationType
+from skyrl_train.trajectory_runners.base import TrajectoryRequestBatch, ConversationType
 from skyrl_train.utils.utils import peer_access_supported, print_mem, initialize_ray, validate_cfg
 from skyrl_train.inference_engines.ray_wrapped_inference_engine import create_ray_wrapped_inference_engines
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.base import InferenceEngineInput
 from skyrl_train.inference_engines.remote_inference_engine import create_remote_inference_engines
-from skyrl_train.utils.constants import SKYRL_PYTHONPATH_EXPORT
 
 TEST_DATA_PATH = os.path.expanduser("~/data/gsm8k/validation.parquet")
 
@@ -119,7 +118,13 @@ def import_worker(strategy: str, worker_type: str):
 
 
 def init_worker_with_type(
-    worker_type: str, shared_pg=None, colocate_all=False, num_gpus_per_node=1, num_nodes=1, cfg=None
+    worker_type: str,
+    shared_pg=None,
+    colocate_all=False,
+    num_gpus_per_node=1,
+    num_nodes=1,
+    cfg=None,
+    worker_cls=None,
 ) -> PPORayActorGroup:
     if cfg is None:
         cfg = get_test_actor_config()
@@ -133,7 +138,7 @@ def init_worker_with_type(
         get_ray_pg_ready_with_timeout(pg, timeout=30)
         num_gpus_per_actor = 0.75
 
-    worker_cls = import_worker(cfg.trainer.strategy, worker_type)
+    worker_cls = worker_cls or import_worker(cfg.trainer.strategy, worker_type)
     model = PPORayActorGroup(
         cfg,
         num_nodes=num_nodes,
@@ -259,7 +264,7 @@ def get_test_prompts(model: str, num_samples: int = 20) -> List[ConversationType
     return prompts
 
 
-def get_test_generator_input(
+def get_test_trajectory_request(
     model: str,
     num_prompts: int = 20,
     n_samples_per_prompt: int = 1,
@@ -287,7 +292,7 @@ def get_test_generator_input(
 
     env_classes = [env_class] * len(prompts)
 
-    input_batch: GeneratorInput = {
+    input_batch: TrajectoryRequestBatch = {
         "prompts": prompts,
         "env_classes": env_classes,
         "env_extras": env_extras,
@@ -331,8 +336,7 @@ def ray_init_for_tests():
         env_vars = {"NCCL_P2P_DISABLE": "1", "NCCL_SHM_DISABLE": "1"}
     # TODO (erictang000): refactor this to use the same prepare_runtime_environment function as in utils.py for tests
     # to remove duplicate code
-    if SKYRL_PYTHONPATH_EXPORT:
-        env_vars["PYTHONPATH"] = os.environ.get("PYTHONPATH")
+    env_vars["PYTHONPATH"] = os.environ.get("PYTHONPATH", "")
     env_vars["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     env_vars["NVTE_FUSED_ATTN"] = "0"
     env_vars["LD_LIBRARY_PATH"] = os.environ.get("LD_LIBRARY_PATH")
@@ -377,16 +381,19 @@ def init_inference_engines(
         tensor_parallel_size=tp_size,
         model_dtype="bfloat16",
         pretrain=model,
+        lm_head_compute_dtype=cfg.trainer.policy.model.lm_head_compute_dtype,
         seed=42,
         vllm_v1_disable_multiproc=True,
         enable_prefix_caching=True,
         enforce_eager=True,
         shared_pg=pg,
+        engine_init_timeout_seconds=cfg.generator.engine_init_timeout_seconds,
         gpu_memory_utilization=gpu_memory_utilization,
         inference_engine_enable_sleep=sleep,
         async_engine=async_engine,
         max_num_batched_tokens=8192,
         max_num_seqs=max_num_seqs,
+        max_logprobs=cfg.generator.get("max_logprobs", 1),
         tokenizer=tokenizer,
         backend=backend,
         sleep_level=sleep_level,

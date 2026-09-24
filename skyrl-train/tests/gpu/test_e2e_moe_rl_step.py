@@ -21,7 +21,7 @@ into the EP inference engine (the G4-4 oracle).
 
 Run (pytest)::
 
-    uv run --isolated --extra dev --extra vllm pytest tests/gpu/test_e2e_moe_rl_step.py
+    uv run --isolated --group dev --extra vllm pytest tests/gpu/test_e2e_moe_rl_step.py
 
 Or directly (no pytest, e.g. the cluster RL venv), from the ``skyrl-train`` dir::
 
@@ -114,6 +114,7 @@ def init_ray_inference_engines(backend, tp_size, shared_pg, config) -> Inference
         enable_prefix_caching=True,
         enforce_eager=True,
         shared_pg=shared_pg,
+        engine_init_timeout_seconds=config.generator.engine_init_timeout_seconds,
         gpu_memory_utilization=config.generator.gpu_memory_utilization,
         inference_engine_enable_sleep=config.trainer.placement.colocate_all,
         async_engine=True,

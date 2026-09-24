@@ -1,0 +1,13 @@
+
+prm:
+  name: null
+  window_size: 6
+  similarity_threshold: 0.5
+  min_turns: 10
+  check_interval: 3
+
+trace_upload:
+  enabled: false
+  repo_org: DCAgent
+  episodes: last
+  dataset_type: SFT

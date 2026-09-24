@@ -171,6 +171,7 @@ def main():
             vllm_v1_disable_multiproc=True,
             enable_prefix_caching=False,
             enforce_eager=True,
+            engine_init_timeout_seconds=cfg.generator.engine_init_timeout_seconds,
             shared_pg=None,  # DISAGGREGATED
             gpu_memory_utilization=cfg.generator.gpu_memory_utilization,
             inference_engine_enable_sleep=False,  # not colocated -> no sleep
@@ -183,7 +184,7 @@ def main():
         client = InferenceEngineClient(engines, tokenizer, cfg)
 
         # ---- GEOMETRY PROOF: engine node disjoint from policy nodes ----
-        pol_geo = ray.get(policy.async_run_ray_method("pass_through", "diag_ep8_geometry"))
+        pol_geo = ray.get(policy.async_run_ray_method("pass_through", "diag_ep_geometry"))
         pol_geo = sorted([g for g in pol_geo if isinstance(g, dict)], key=lambda d: d["rank"])
         pol_hosts = sorted(set(g["host"] for g in pol_geo))
         rank0_host = next(g["host"] for g in pol_geo if g["rank"] == 0)

@@ -1,9 +1,7 @@
 """
 # Run only vllm tests (requires vllm extra):
-uv run --isolated --extra dev --extra vllm pytest tests/gpu/gpu_ci/test_engine_generation.py -m "vllm"
+uv run --isolated --group dev --extra vllm pytest tests/gpu/gpu_ci/test_engine_generation.py -m "vllm"
 
-# Run only sglang tests (requires sglang extra):
-uv run --isolated --extra dev --extra sglang pytest tests/gpu/gpu_ci/test_engine_generation.py -m "sglang"
 """
 
 import pytest
@@ -54,6 +52,7 @@ def init_ray_inference_engines(
         vllm_v1_disable_multiproc=True,
         enable_prefix_caching=True,
         enforce_eager=True,
+        engine_init_timeout_seconds=config.generator.engine_init_timeout_seconds,
         shared_pg=None,
         gpu_memory_utilization=0.8,
         inference_engine_enable_sleep=False,

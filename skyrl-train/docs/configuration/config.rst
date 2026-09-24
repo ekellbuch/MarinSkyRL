@@ -104,7 +104,7 @@ Checkpoint Configuration
     max_ckpts_to_keep: -1 # -1 to keep all checkpoints, N to keep the last N checkpoints
     ckpt_interval: 10  # Save full training checkpoint every `ckpt_interval` steps.
     hf_save_interval: -1  # Save HF format model(s)every `hf_save_interval` steps.
-    export_path: "${oc.env:HOME}/exports/" # Path for exported artifacts (HF models, debug dumps, etc.)
+    export_path: "${oc.env:HOME}/exports" # Path for exported artifacts (HF models, debug dumps, etc.)
     project_name: "skyrl"
     run_name: "test_run"
     logger: "wandb"
@@ -251,6 +251,9 @@ This section configures the policy model used for training, including optimizer,
 .. code-block:: yaml
 
    policy:
+     grug_query_bias_update_mode: "frozen"
+     grug_query_bias_interpolation_weight: null
+     grug_query_bias_update_rate: null
      model:
        path: "Qwen/Qwen2.5-1.5B-Instruct"  # Hugging Face model path for the policy model
        lora:
@@ -281,6 +284,9 @@ This section configures the policy model used for training, including optimizer,
      record_memory: false  # Dump memory snapshot for debugging
 
 - ``policy.deepspeed_config``: To be customized if using ``trainer.strategy='deepspeed'``.
+- ``policy.grug_query_bias_update_mode``: Grug's external router-bias update. ``frozen`` preserves the checkpoint bias, ``replace`` and ``interpolate`` apply Quantile Balancing, and ``loss_free`` applies the signed load-error update from `Loss-Free Balancing <https://arxiv.org/abs/2408.15664>`_. This option applies only to Grug under FSDP2.
+- ``policy.grug_query_bias_interpolation_weight``: Fraction of the Quantile Balancing target applied after each successful optimizer step. Required only for ``interpolate``.
+- ``policy.grug_query_bias_update_rate``: Positive bias step size used by ``loss_free``. Required only for that mode; the reference implementation uses ``0.001``.
 - ``policy.optimizer_config``: Optimizer configuration for the policy model
 - ``policy.fsdp_config``: FSDP configuration, applicable if ``trainer.strategy='fsdp'``.
 - ``policy.sequence_parallel_size``: Sequence parallel size. We implement `Ulysses sequence parallelism <https://arxiv.org/abs/2309.14509>`_
@@ -446,7 +452,7 @@ Algorithm Configuration
 
   - ``regular``: Vanilla PPO loss with token-level importance sampling
   - ``dual_clip``: Dual clip PPO loss proposed in `this paper <https://arxiv.org/pdf/1912.09729>`_
-  - ``gspo``: `Group Sequence Policy Optimization <https://arxiv.org/abs/2507.18071>`_ with sequence-level importance sampling for improved training stability. Implements the "GSPO-token" variant from the paper.
+  - ``gspo``: `Group Sequence Policy Optimization <https://arxiv.org/abs/2507.18071>`_ with sequence-level importance sampling for improved training stability. Implements the "GSPO-token" variant from the paper and requires ``algorithm.loss_reduction=sequence_mean``.
   - ``clip_cov``: Clip-Cov combines standard PPO clipping with covariance-based correction masking for improved stability. Based on `this paper <https://arxiv.org/abs/2505.22617>`_.
   - ``kl_cov``: KL-Cov applies KL regularization to tokens selected based on covariance values. Based on `this paper <https://arxiv.org/abs/2505.22617>`_.
   - ``cispo``: Clipped Importance Sampling Weight Policy Optimization (CISPO) proposed in `MiniMax-M1 <https://arxiv.org/abs/2506.13585>`_.
@@ -467,8 +473,8 @@ Algorithm Configuration
 - ``algorithm.clip_ratio_c``: Clip ratio for dual clip PPO loss.
 - ``algorithm.value_clip``: Clip value for value loss.
 - ``algorithm.dynamic_sampling``: Dynamic sampling configuration.
-  - ``algorithm.dynamic_sampling.type``: Type of dynamic sampling to use. Currently, we support ``filter`` (`DAPO <https://dapo-sia.github.io/>`_), ``replace`` (`POLARIS <https://hkunlp.github.io/blog/2025/Polaris/>`_ / `WebSailor <https://arxiv.org/abs/2507.02592>`_), or ``null`` for no dynamic sampling.
-  - ``algorithm.dynamic_sampling.max_sample_batches``: Maximum number of batches to sample before stopping. Set to ``-1`` to sample forever.
+  - ``algorithm.dynamic_sampling.type``: Type of dynamic sampling to use. We support ``filter`` (`DAPO <https://dapo-sia.github.io/>`_), ``replace`` (`POLARIS <https://hkunlp.github.io/blog/2025/Polaris/>`_ / `WebSailor <https://arxiv.org/abs/2507.02592>`_), or ``null`` for no dynamic sampling. Fully asynchronous training supports ``filter`` and ``null``; ``replace`` is synchronous only. The filter uses unshaped verifier outcomes and draws a fresh prompt for every uniform-outcome group.
+  - ``algorithm.dynamic_sampling.max_sample_batches``: Maximum number of batches to sample before stopping. Set to ``-1`` to sample forever. Fully asynchronous training converts this to a per-step candidate-group limit of ``max_sample_batches * train_batch_size`` and never shortens the training batch.
   - ``algorithm.dynamic_sampling.min_replace_ratio``: Minimum proportion of good samples with which to replace bad samples for ``replace`` strategy.
 - ``algorithm.use_tis``: Whether to use Truncated Importance Sampling (TIS) as proposed in `this blog <https://fengyao.notion.site/off-policy-rl>`_. 
 - ``algorithm.tis_imp_ratio_cap``: Cap parameter for the importance ratio in TIS.
@@ -506,20 +512,31 @@ It can be helpful to understand the final loss formulation to see how the differ
       advantages: torch.Tensor,
       config: DictConfig, # trainer.algorithm config
       loss_mask: Optional[torch.Tensor] = None,
-  ) -> torch.Tensor:
+  ) -> tuple[torch.Tensor, dict[str, float]]:
 
       ratio = (log_probs - old_log_probs).exp()
       surr1 = ratio * advantages
       surr2 = ratio.clamp(1 - config.eps_clip_low, 1 + config.eps_clip_high) * advantages
       loss = -torch.min(surr1, surr2)
-      clip_ratio = masked_mean((-surr2 > -surr1).float(), loss_mask).mean().detach().item()
+      clip_metrics = clipping_metrics(
+          ratio,
+          -surr2 > -surr1,
+          loss_mask,
+          eps_clip_low=config.eps_clip_low,
+          eps_clip_high=config.eps_clip_high,
+      )
       clip_pg_losses1 = loss
       if config.policy_loss_type == "dual_clip":
         pg_losses3 = -advantages * config.clip_ratio_c
         clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
         loss = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
       loss = reduce_loss(loss, loss_mask, config.loss_reduction)
-      return loss, clip_ratio
+      return loss, clip_metrics
+
+Workers retain ``policy/ppo_clip_ratio`` as the pooled clipping fraction and also emit
+``policy/ppo_clip_ratio_low`` and ``policy/ppo_clip_ratio_high`` for the bound that changed the objective.
+``policy/ppo_clip_pressure_low`` and ``policy/ppo_clip_pressure_high`` report the fraction of ratios outside each
+bound before the loss decides whether clipping binds for that token.
 
 
 Generator Configuration
@@ -582,9 +599,56 @@ Generator Configuration
     # number of samples per prompt for evaluation
     eval_n_samples_per_prompt: 1
 
-    zero_reward_on_non_stop: false
+    trajectory_reward_shaping:
+      schema_version: 2
+      enabled: false
+      loop:
+        max_period_tokens: 64
+        tail_tokens: 256
+        minimum_occurrences: 4
+        advantage_penalty_per_token: 0.0
+        max_advantage_penalty: 0.2
+      non_termination:
+        penalty: 0.0
+        accepted_stop_reasons: [stop, complete, eos, end_turn]
+      overlong:
+        l_max: ${generator.sampling_params.max_generate_length}
+        l_cache: 0
+      successful_length:
+        free_tokens: 0
+        penalty_per_token: 0.0
+        max_penalty: 0.2
+
+    trajectory_retention:
+      enabled: true
+      output_path: ${trainer.export_path}/training_trajectories
+      run_id: ${trainer.run_name}
+      phases: [train]
+      sample_count_per_step: 1
+      sample_fraction: 0.0
+      always_retain_failures: true
+      always_retain_non_terminating: true
+      always_retain_loops: true
+      accepted_stop_reasons: ${generator.trajectory_reward_shaping.non_termination.accepted_stop_reasons}
+      reward_below: null
+      reward_above: null
+      max_bytes_per_step: 8388608
+      max_bytes_per_run: 268435456
+      required: false
+      redact_fields: []
+      model_path: ${trainer.policy.model.path}
+      model_source_identity: ${trainer.policy.model.source_identity}
+      resume_path: ${trainer.resume_path}
+      inference_backend: ${generator.backend}
 
     apply_overlong_filtering: false
+
+``trajectory_retention`` runs after every generator has produced the common normalized output. It writes gzip-compressed,
+content-addressed JSON records for selected training or evaluation trajectories. Count and fraction sampling are deterministic;
+failure, non-termination, loop, and reward-threshold selectors retain diagnostic cases independently. The persistent ledger makes
+resume idempotent and enforces compressed-byte limits before each write. Set ``required: true`` when a retention write failure must
+stop training; best-effort mode instead reports ``generate/trajectory_retention/write_errors``. Iris derives a durable path under
+the job's ``trace_jobs`` directory unless the launch configuration supplies an explicit path.
 
 
 Inference Engine Placement Configuration
@@ -642,12 +706,13 @@ Generation Parameters
 - ``generator.engine_init_kwargs``: Inference engine arguments passed directly to the vLLM or SGLang engine. To specify an engine arg in the CLI override, use the format: +generator.engine_init_kwargs.[arg_name]=value. If duplicate kwargs are passed or kwargs clash with existing generator arguments (e.g., ``tensor_parallel_size``), an error is raised.
 - ``generator.chat_template``: Custom chat template configuration if needed.
     - ``generator.chat_template.source``: Source of the chat template. Can be either ``name`` or ``file``.
-    - ``generator.chat_template.name_or_path``: Name or path of the chat template. If the source is ``name``, then it should be one of the supported templates in :code_link:`skyrl_train/generators/utils.py`. If the source is ``file``, then this field should be a path to a Jinja2 template file.
+    - ``generator.chat_template.name_or_path``: Name or path of the chat template. If the source is ``name``, then it should be one of the supported templates in :code_link:`skyrl_train/trajectory_runners/trajectory_processing.py`. If the source is ``file``, then this field should be a path to a Jinja2 template file.
 - ``generator.chat_template_kwargs``: Chat templating kwargs to pass to ``tokenizer.apply_chat_template``. Applicable only for non-batched generation with ``generator.batched=false``.
 
 Misc Configuration
 ~~~~~~~~~~~~~~~~~~
 
-- ``generator.zero_reward_on_non_stop``: Whether to set the reward to 0 if the `stop_reason` is not `stop`. Cases where this is useful: Often, we have format rewards for the LLM to follow, but in cases where the LLM didn't finish the response, we typically don't want to reward it. This is a general setting for all environments.
+- ``generator.trajectory_reward_shaping``: Generator-independent optimization shaping applied after trajectory normalization. ``non_termination`` penalizes stop reasons outside its accepted set. ``overlong`` applies DAPO's outcome-independent linear penalty to the full trajectory between ``l_max - l_cache`` and ``l_max``; the penalty is stored on the final row, and ``l_cache=0`` disables it. The default ``l_max`` follows the generation limit, so multi-turn runners should set it to their intended full-trajectory token budget. ``successful_length`` penalizes trainable response tokens beyond ``free_tokens`` only when the raw task outcome is positive. ``loop`` searches the final trainable segment's tail for the smallest repeating period, then emits capped negative per-token advantage credit for the excess repetitions. This loop credit is applied after advantage normalization and never enters the outcome reward or its group statistics. The raw outcome remains in ``unshaped_rewards`` for pass-rate and verifier-accuracy metrics. ``schema_version`` is stored with the run configuration and emitted on each shaped trajectory.
+- ``generator.trajectory_retention``: Generator-independent bounded capture of normalized training trajectories. It samples deterministically per step, always retains configured anomalies, and writes content-addressed compressed records plus a resume-safe ledger. ``required=false`` reports storage failures without stopping training; ``required=true`` fails the run.
 - ``generator.apply_overlong_filtering``: Whether to apply DAPO Overlong Filtering to the loss masks. For each trajectory that exceeds the max length (i.e., truncated and does not end with an EOS token), this masks out every token in the loss mask.
 - ``trainer.step_wise_training``: Whether to use step-wise training. If ``true``, then the generator will return multi-turn generations with each turn being a separate trajectory. Advantages are computed based on the last step of each trajectory and propagated to the previous steps.

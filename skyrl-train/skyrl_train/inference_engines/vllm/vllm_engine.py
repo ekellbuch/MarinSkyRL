@@ -12,6 +12,9 @@ import vllm
 from types import SimpleNamespace
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
+from vllm.outputs import STREAM_FINISHED
+
+from skyrl_train.numa_policy import NUMA_AFFINITY_ENV
 
 # vLLM 0.16+ reorganized entrypoints into sub-packages.
 # Try new paths first, fall back to old paths for backwards compatibility.
@@ -59,8 +62,20 @@ from skyrl_train.inference_engines.base import (
     NamedWeightsUpdateRequest,
 )
 from skyrl_train.weight_sync import WeightLoader
-from skyrl_train.inference_engines.vllm.utils import pop_openai_kwargs, ensure_token_ids_in_sse_chunk
-from skyrl_train.utils import str_to_torch_dtype, get_tcp_url
+from skyrl_train.models.grug_moe import is_grug_router_bias
+from skyrl_train.models.lm_head_precision import (
+    VLLM_LM_HEAD_COMPUTE_DTYPE_ENV,
+    configure_vllm_model_instance_lm_head_compute_dtype,
+    configure_vllm_qwen3_5_lm_head_compute_dtype,
+)
+from skyrl_train.models.qwen3_5_vlm import qwen3_5_vllm_internal_weight_candidates
+from skyrl_train.inference_engines.vllm.utils import (
+    pop_openai_kwargs,
+    ensure_token_ids_in_sse_chunk,
+    PrefixCacheHitRateAccumulator,
+)
+from skyrl_train.utils import get_tcp_url, str_to_torch_dtype, torch_dtype_to_str
+from skyrl_train.utils.tensor_fingerprint import canonical_tensor_fingerprint
 import time
 from packaging import version
 
@@ -224,7 +239,7 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
     executor_backend = kwargs.get("distributed_executor_backend")
     logger.info(
         f"setup_envvars_for_vllm: distributed_executor_backend={executor_backend}, "
-        f"SKYRL_ENABLE_NUMA_AFFINITY={os.environ.get('SKYRL_ENABLE_NUMA_AFFINITY', '<unset>')}, "
+        f"{NUMA_AFFINITY_ENV}={os.environ.get(NUMA_AFFINITY_ENV, '<unset>')}, "
         f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}, "
         f"VLLM_ENABLE_V1_MULTIPROCESSING={os.environ.get('VLLM_ENABLE_V1_MULTIPROCESSING', '<unset>')}"
     )
@@ -249,6 +264,12 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
                         set_numa_affinity_for_gpu(gpu_ids[0])
         except Exception as e:
             logger.warning(f"setup_envvars_for_vllm: NUMA affinity setup failed: {e}")
+
+
+def _refresh_vllm_lm_head_compute_dtype(model) -> None:
+    dtype_name = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
+    if dtype_name is not None:
+        configure_vllm_model_instance_lm_head_compute_dtype(model, dtype_name)
 
 
 class WorkerWrap:
@@ -319,16 +340,14 @@ class WorkerWrap:
         )
 
     @staticmethod
-    def _apply_fp8_weight_loader_patches():
+    def _apply_fp8_weight_loader_patches(*, fuse_weights: bool = False):
         """Patch Fp8LinearMethod.process_weights_after_loading to preserve weight_loader.
 
         Following verl's approach: after FP8 processing creates new Parameter objects,
         copy custom attributes (weight_loader, output_dim, input_dim, subclass_type)
         from the original specialized parameter so weight sync can reload weights.
         """
-        import os
-
-        if os.environ.get("SKYRL_FUSE_WEIGHTS", "0") != "1":
+        if not fuse_weights:
             return
 
         try:
@@ -446,7 +465,7 @@ class WorkerWrap:
         Materializes + runs ``process_weights_after_loading`` over the WHOLE weight
         set exactly once -> re-applies the FlashInfer-CUTLASS ``swap_w13_to_w31`` the
         per-chunk ``model.load_weights`` skips. Must be called after every chunk's
-        ``load_weights`` (and after ``end_weight_update``'s flush, SKYRL_FUSE path).
+        ``load_weights`` (and after ``end_weight_update``'s fused flush).
         """
         if not getattr(self, "_skyrl_weight_update_active", False):
             raise RuntimeError("skyrl_begin_weight_reload must be called before skyrl_finish_weight_reload.")
@@ -460,11 +479,12 @@ class WorkerWrap:
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             finalize_layerwise_reload(model, self.model_config)
         self._skyrl_weight_update_active = False
+        _refresh_vllm_lm_head_compute_dtype(model)
 
     def begin_weight_update(self) -> None:
         """Start accumulating weights for batched load_weights call.
 
-        When SKYRL_FUSE_WEIGHTS=1, weights are accumulated instead of loaded
+        When fused loading is requested, weights are accumulated instead of loaded
         immediately. Call end_weight_update() to flush and apply them all at once
         via model.load_weights(), which handles packed module mapping (qkv_proj, gate_up_proj).
         Weights are stored on CPU to avoid GPU OOM during accumulation.
@@ -638,6 +658,8 @@ class WorkerWrap:
                 torch.cuda.empty_cache()
             else:
                 model.load_weights(weights=iter(self._accumulated_weights))
+            if not getattr(self, "_skyrl_weight_update_active", False):
+                _refresh_vllm_lm_head_compute_dtype(model)
             self._accumulated_weights.clear()
             del self._accumulated_weights
             gc.collect()
@@ -650,7 +672,7 @@ class WorkerWrap:
 
         This method is called via collective_rpc from VLLMWeightLoader.
 
-        When SKYRL_FUSE_WEIGHTS=1 and begin_weight_update() was called,
+        When fused loading is requested and begin_weight_update() was called,
         weights are accumulated on CPU instead of loaded immediately.
 
         Args:
@@ -668,6 +690,10 @@ class WorkerWrap:
         else:
             # Immediate mode (default): load right away
             self.model_runner.model.load_weights(weights=weight_list)
+            if not getattr(self, "_skyrl_weight_update_active", False) and any(
+                name == "lm_head.weight" or name.endswith("embed_tokens.weight") for name, _ in weight_list
+            ):
+                _refresh_vllm_lm_head_compute_dtype(self.model_runner.model)
             for weight in weight_list:
                 del weight
 
@@ -678,31 +704,39 @@ class WorkerWrap:
             return
         destroy_process_group(self._model_update_group)
 
-    def read_named_weights(self, hf_names, dump_inventory: bool = False):
-        """TEST-ONLY (Stage 6 weight-equality gate): read engine-side weights back
+    def read_named_weights(
+        self,
+        hf_names,
+        dump_inventory: bool = False,
+        expected_shapes=None,
+    ):
+        """Read engine-side weights back
         from the live vLLM model, reconstructed under the HF parameter names the
         trainer broadcasts.
 
         This is the symmetric inverse of ``load_weights`` (vLLM consumes HF-named
         tensors in ``model.load_weights`` and maps them into its internal
         fused/sharded params; here we read those internal params back and rebuild
-        the HF view so the trainer's post-step HF tensors can be compared
-        tensor-by-tensor). Returns, per requested HF name, this worker's
-        contribution as a CPU fp32 tensor plus the rank coordinates so the caller
-        can assemble across TP/EP shards.
+        the HF view). It returns CPU fp32 tensors for the established MoE
+        diagnostics.
 
         Supported HF name forms (Qwen1.5-MoE / Qwen2MoE vLLM layout):
           * ``model.embed_tokens.weight``                       -> VocabParallelEmbedding (TP vocab-sharded)
           * ``model.layers.{i}.mlp.gate.weight`` (router)       -> ReplicatedLinear (full copy every rank)
           * ``model.layers.{i}.self_attn.o_proj.weight``        -> RowParallelLinear (TP input-sharded)
-          * ``model.layers.{i}.mlp.experts.{j}.gate_proj.weight`` -> FusedMoE w13_weight[local_e, :I]  (EP expert-sharded)
-          * ``...experts.{j}.up_proj.weight``                   -> FusedMoE w13_weight[local_e, I:]
-          * ``...experts.{j}.down_proj.weight``                 -> FusedMoE w2_weight[local_e]
+          * ``model.layers.{i}.mlp.experts.{j}.gate_proj.weight`` -> RoutedExperts w13_weight[local_e, :I]
+          * ``...experts.{j}.up_proj.weight``                   -> RoutedExperts w13_weight[local_e, I:]
+          * ``...experts.{j}.down_proj.weight``                 -> RoutedExperts w2_weight[local_e]
 
         Args:
             hf_names: list of HF parameter names to read back.
             dump_inventory: if True, also returns the full ``named_parameters()``
                 name->shape inventory under key ``__inventory__`` (first run aid).
+            expected_shapes: optional HF name-to-shape mapping used to reconstruct
+                dense projections stored in fused vLLM parameters.
+        The Qwen3.5 multimodal shell accepts the sender-side broadcast namespace
+        ``model.language_model.*``. It is resolved to vLLM's internal
+        ``language_model.model.*`` namespace before direct lookup.
         """
         import re
         import torch as _torch
@@ -725,9 +759,10 @@ class WorkerWrap:
         except Exception:
             ep_rank, ep_size = 0, 1
 
-        def _cpu(t):
-            return t.detach().to("cpu", dtype=_torch.float32).contiguous()
+        def _payload(tensor):
+            return {"tensor": tensor.detach().to("cpu", dtype=_torch.float32).contiguous()}
 
+        expected_shapes = expected_shapes or {}
         out = {}
         if dump_inventory:
             out["__inventory__"] = {n: list(p.shape) for n, p in all_params.items()}
@@ -739,20 +774,116 @@ class WorkerWrap:
             entry = {"found": False}
             try:
                 # 1. Direct (replicated) match: router gate, norms, etc.
-                if name in all_params:
-                    entry = {"found": True, "mode": "direct", "tensor": _cpu(all_params[name])}
+                language_model = getattr(model, "language_model", None)
+                language_config = getattr(language_model, "config", None)
+                candidates = qwen3_5_vllm_internal_weight_candidates(
+                    name,
+                    tied_word_embeddings=bool(getattr(language_config, "tie_word_embeddings", False)),
+                )
+                direct_name = next((candidate for candidate in candidates if candidate in all_params), name)
+                if direct_name in all_params:
+                    tensor = all_params[direct_name]
+                    entry = {
+                        "data_ptr": tensor.data_ptr(),
+                        "found": True,
+                        "parameter_id": id(tensor),
+                        "mode": "direct",
+                        "internal_name": direct_name,
+                        "dtype": torch_dtype_to_str(tensor.dtype),
+                        **_payload(tensor),
+                    }
                     out[name] = entry
                     continue
 
-                # 2. Routed expert -> FusedMoE fused weights.
+                # 2. Dense stacked projections. At TP=1, rebuild the exact HF
+                # tensor view from vLLM's fused storage without transferring the
+                # fused tensor through Ray. The real Qwen3.5 parity smoke uses
+                # one engine rank; other TP layouts are reported as unsupported
+                # rather than silently compared with the wrong shard.
+                stacked_groups = (
+                    (("q_proj", "k_proj", "v_proj"), "qkv_proj"),
+                    (("gate_proj", "up_proj"), "gate_up_proj"),
+                    (("in_proj_qkv", "in_proj_z"), "in_proj_qkvz"),
+                    (("in_proj_b", "in_proj_a"), "in_proj_ba"),
+                )
+                stacked_match = None
+                if ".experts." not in name:
+                    for shard_names, fused_name in stacked_groups:
+                        for shard_index, shard_name in enumerate(shard_names):
+                            marker = f".{shard_name}."
+                            if marker not in name:
+                                continue
+                            internal_name = next(
+                                (
+                                    candidate.replace(marker, f".{fused_name}.")
+                                    for candidate in candidates
+                                    if candidate.replace(marker, f".{fused_name}.") in all_params
+                                ),
+                                None,
+                            )
+                            if internal_name is not None:
+                                stacked_match = (shard_names, shard_index, shard_name, internal_name)
+                            break
+                        if stacked_match is not None:
+                            break
+                if stacked_match is not None:
+                    shard_names, shard_index, shard_name, internal_name = stacked_match
+                    if tp_size != 1:
+                        out[name] = {
+                            "found": False,
+                            "mode": "stacked",
+                            "internal_name": internal_name,
+                            "note": f"full stacked reconstruction requires tp_size=1, got {tp_size}",
+                        }
+                        continue
+                    expected_shape = expected_shapes.get(name)
+                    peer_shapes = [
+                        expected_shapes.get(name.replace(f".{shard_name}.", f".{peer_name}."))
+                        for peer_name in shard_names
+                    ]
+                    if expected_shape is None or any(shape is None for shape in peer_shapes):
+                        out[name] = {
+                            "found": False,
+                            "mode": "stacked",
+                            "internal_name": internal_name,
+                            "note": "missing expected shapes for stacked projection",
+                        }
+                        continue
+                    tensor = all_params[internal_name]
+                    offset = sum(shape[0] for shape in peer_shapes[:shard_index])
+                    length = expected_shape[0]
+                    if tensor.ndim < 1 or tensor.shape[0] < offset + length:
+                        out[name] = {
+                            "found": False,
+                            "mode": "stacked",
+                            "internal_name": internal_name,
+                            "actual_shape": list(tensor.shape),
+                            "note": f"cannot select rows [{offset}:{offset + length}]",
+                        }
+                        continue
+                    tensor = tensor.narrow(0, offset, length)
+                    entry = {
+                        "data_ptr": tensor.data_ptr(),
+                        "found": True,
+                        "parameter_id": id(all_params[internal_name]),
+                        "mode": "stacked",
+                        "internal_name": internal_name,
+                        "shard_index": shard_index,
+                        "dtype": torch_dtype_to_str(tensor.dtype),
+                        **_payload(tensor),
+                    }
+                    out[name] = entry
+                    continue
+
+                # 3. Routed expert -> FusedMoE fused weights.
                 m = expert_re.match(name)
                 if m is not None:
                     prefix, gj, proj = m.group(1), int(m.group(2)), m.group(3)
-                    # vLLM FusedMoE stores w13_weight [n_local_experts, 2*I, H] and
+                    # vLLM RoutedExperts stores w13_weight [n_local_experts, 2*I, H] and
                     # w2_weight [n_local_experts, H, I]. Local experts are a contiguous
                     # EP slice: global expert gj lives on ep_rank == gj // n_local.
-                    w13 = all_params.get(f"{prefix}.experts.w13_weight")
-                    w2 = all_params.get(f"{prefix}.experts.w2_weight")
+                    w13 = all_params.get(f"{prefix}.experts.routed_experts.w13_weight")
+                    w2 = all_params.get(f"{prefix}.experts.routed_experts.w2_weight")
                     if w13 is None or w2 is None:
                         # Fallback: scan for any experts.*weight tensor under this prefix.
                         cand = {
@@ -780,17 +911,1306 @@ class WorkerWrap:
                         "mode": "expert",
                         "owner_ep": owner_ep,
                         "local_e": local_e,
-                        "tensor": _cpu(t),
+                        "dtype": torch_dtype_to_str(t.dtype),
+                        **_payload(t),
                     }
                     out[name] = entry
                     continue
 
-                # 3. Unknown / unsupported name.
+                # 4. Unknown / unsupported name.
                 entry = {"found": False, "note": "no mapping"}
                 out[name] = entry
             except Exception as e:  # never crash the collective_rpc
                 out[name] = {"found": False, "error": repr(e)}
         return out
+
+    def fingerprint_named_weights(self, hf_names, expected_shapes):
+        """Return compact exact fingerprints for requested engine weights."""
+        fingerprints = {"__ranks__": None}
+        for name in hf_names:
+            # Read and hash one tensor at a time so the engine actor never holds
+            # a second full-model CPU copy. Only the compact digest leaves the
+            # actor.
+            weights = self.read_named_weights([name], expected_shapes=expected_shapes)
+            if fingerprints["__ranks__"] is None:
+                fingerprints["__ranks__"] = weights["__ranks__"]
+            entry = dict(weights[name])
+            tensor = entry.pop("tensor", None)
+            if tensor is None:
+                fingerprints[name] = entry
+                del weights
+                continue
+
+            actual_shape = list(tensor.shape)
+            expected_shape = expected_shapes.get(name)
+            compared_tensor = tensor
+            if expected_shape is not None and actual_shape != expected_shape:
+                expected_numel = 1
+                for dimension in expected_shape:
+                    expected_numel *= dimension
+                if tensor.numel() == expected_numel:
+                    compared_tensor = tensor.reshape(expected_shape)
+                    actual_shape = list(compared_tensor.shape)
+                can_trim_vocab_padding = (
+                    len(actual_shape) == len(expected_shape)
+                    and actual_shape[1:] == expected_shape[1:]
+                    and actual_shape[0] >= expected_shape[0]
+                )
+                if actual_shape == expected_shape:
+                    pass
+                elif not can_trim_vocab_padding:
+                    entry.update(
+                        {
+                            "actual_shape": actual_shape,
+                            "expected_shape": expected_shape,
+                            "shape_mismatch": True,
+                        }
+                    )
+                    fingerprints[name] = entry
+                    del tensor, weights
+                    continue
+                else:
+                    compared_tensor = tensor[: expected_shape[0]]
+            entry.update(
+                {
+                    "actual_shape": actual_shape,
+                    "shape_mismatch": False,
+                    "fingerprint": canonical_tensor_fingerprint(compared_tensor),
+                }
+            )
+            fingerprints[name] = entry
+            del tensor, weights
+        return fingerprints
+
+    def begin_head_input_capture(self, selected_token: int):
+        """Capture bounded inputs to the live model's next logits computation."""
+        if getattr(self, "_skyrl_head_input_capture_active", False):
+            raise RuntimeError("A vLLM head-input capture is already active")
+
+        model = self.model_runner.model
+        had_instance_compute_logits = "compute_logits" in model.__dict__
+        instance_compute_logits = model.__dict__.get("compute_logits")
+        original_compute_logits = model.compute_logits
+        captures = []
+        layer_captures = []
+        layer_hooks = []
+        forward_core_patches = []
+
+        def tensor_payload(tensor):
+            if tensor.ndim == 3:
+                if tensor.shape[0] != 1:
+                    raise RuntimeError(f"Expected vLLM diagnostic batch size 1, got {tensor.shape}")
+                tensor = tensor[0, -1]
+            elif tensor.ndim == 2:
+                tensor = tensor[-1]
+            else:
+                raise RuntimeError(f"Expected vLLM hidden states with rank 2 or 3, got {tensor.shape}")
+            return {
+                "values": tensor.detach().float().cpu().tolist(),
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+            }
+
+        def token_heads_payload(tensor, num_heads):
+            if tensor.ndim != 2 or tensor.shape[0] < num_heads:
+                raise RuntimeError(f"Expected flattened token heads [tokens * heads, head_dim], got {tensor.shape}")
+            token_heads = tensor.reshape(-1, num_heads, tensor.shape[-1])
+            last_token = token_heads[-1].reshape(-1)
+            return {
+                "values": last_token.detach().float().cpu().tolist(),
+                "dtype": str(tensor.dtype),
+                "shape": list(last_token.shape),
+                "token_fingerprints": [
+                    canonical_tensor_fingerprint(token_heads[index : index + 1])
+                    for index in range(token_heads.shape[0])
+                ],
+            }
+
+        def attention_payload(sequence_heads):
+            if sequence_heads.ndim != 3:
+                raise RuntimeError(f"Expected attention tensor [tokens, heads, head_dim], got {sequence_heads.shape}")
+            last_token = sequence_heads[-1].reshape(-1)
+            return {
+                "values": last_token.detach().float().cpu().tolist(),
+                "dtype": str(sequence_heads.dtype),
+                "shape": list(last_token.shape),
+                "sequence_shape": list(sequence_heads.shape),
+                "sequence_fingerprint": canonical_tensor_fingerprint(sequence_heads),
+                "token_fingerprints": [
+                    canonical_tensor_fingerprint(sequence_heads[index : index + 1])
+                    for index in range(sequence_heads.shape[0])
+                ],
+            }
+
+        def capture_input(_module, args, kwargs, *, destination, key, trace_tokens=False):
+            hidden_states = kwargs.get("hidden_states")
+            if hidden_states is None:
+                hidden_states = args[0]
+            payload = tensor_payload(hidden_states)
+            if trace_tokens:
+                payload["token_fingerprints"] = token_fingerprints(hidden_states)
+            destination.setdefault(key, []).append(payload)
+
+        def capture_output(_module, args, kwargs, output, *, destination, key, trace_tokens=False):
+            del args
+            hidden_states = kwargs.get("output")
+            if hidden_states is None:
+                hidden_states = output[0] if isinstance(output, tuple) else output
+            payload = tensor_payload(hidden_states)
+            if trace_tokens:
+                payload["token_fingerprints"] = token_fingerprints(hidden_states)
+            destination.setdefault(key, []).append(payload)
+
+        def capture_projection_output(_module, _args, output, *, destination, keys, sizes):
+            projected = output[0] if isinstance(output, tuple) else output
+            for key, tensor in zip(keys, projected.split(sizes, dim=-1), strict=True):
+                payload = tensor_payload(tensor)
+                payload["token_fingerprints"] = token_fingerprints(tensor)
+                destination.setdefault(key, []).append(payload)
+
+        def exact_error_summary(actual, expected):
+            difference = (actual.float() - expected.float()).abs().reshape(-1)
+            return {
+                "exact": bool(torch.equal(actual, expected)),
+                "max": float(difference.max().item()),
+                "mismatch_count": int(torch.count_nonzero(difference).item()),
+                "p95": float(torch.quantile(difference, 0.95).item()),
+                "shape": list(actual.shape),
+            }
+
+        def tensor_layout(tensor):
+            return {
+                "contiguous": tensor.is_contiguous(),
+                "device": str(tensor.device),
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+                "storage_nbytes": tensor.untyped_storage().nbytes(),
+                "storage_offset": tensor.storage_offset(),
+                "stride": list(tensor.stride()),
+            }
+
+        def token_fingerprints(tensor):
+            if tensor.ndim < 2:
+                raise ValueError(f"Expected a token dimension, got {tensor.shape}")
+            if tensor.ndim >= 3:
+                if tensor.shape[0] != 1:
+                    raise ValueError(f"Expected batch size one, got {tensor.shape}")
+                return [canonical_tensor_fingerprint(tensor[:, index]) for index in range(tensor.shape[1])]
+            return [canonical_tensor_fingerprint(tensor[index : index + 1]) for index in range(tensor.shape[0])]
+
+        def alias_summary(tensor, destination):
+            return {
+                "same_data_pointer": tensor.data_ptr() == destination.data_ptr(),
+                "same_storage": (tensor.untyped_storage().data_ptr() == destination.untyped_storage().data_ptr()),
+                "same_storage_offset": tensor.storage_offset() == destination.storage_offset(),
+            }
+
+        language_model = getattr(model, "language_model", None)
+        text_model = getattr(language_model, "model", None)
+        layers = getattr(text_model, "layers", ())
+        diagnostic_gdn_layer = 1
+        for layer_index, layer in enumerate(layers):
+            mixer_name = "linear_attn" if layer.layer_type == "linear_attention" else "self_attn"
+            mixer = getattr(layer, mixer_name)
+            entry = {"layer": layer_index, "mixer": mixer_name}
+            layer_captures.append(entry)
+            if layer_index == diagnostic_gdn_layer and mixer_name == "linear_attn":
+                qkv_size = (mixer.key_dim * 2 + mixer.value_dim) // mixer.tp_size
+                z_size = mixer.value_dim // mixer.tp_size
+                ba_size = mixer.in_proj_ba.weight.shape[0] // 2
+                projections = {"runtime": {}}
+                entry["projections"] = projections
+                stages = {}
+                entry["mixer_stages"] = stages
+                fla_inputs = []
+                fla_outputs = []
+                fla_values = []
+                fla_captures = []
+                entry["fla_core"] = fla_captures
+                causal_conv_captures = []
+                entry["causal_conv"] = causal_conv_captures
+                if hasattr(mixer, "in_proj_qkv"):
+                    layer_hooks.extend(
+                        (
+                            mixer.in_proj_qkv.register_forward_hook(
+                                lambda module, args, output, destination=projections["runtime"]: (
+                                    capture_projection_output(
+                                        module,
+                                        args,
+                                        output,
+                                        destination=destination,
+                                        keys=("qkv",),
+                                        sizes=(qkv_size,),
+                                    )
+                                )
+                            ),
+                            mixer.in_proj_z.register_forward_hook(
+                                lambda module, args, output, destination=projections["runtime"]: (
+                                    capture_projection_output(
+                                        module,
+                                        args,
+                                        output,
+                                        destination=destination,
+                                        keys=("z",),
+                                        sizes=(z_size,),
+                                    )
+                                )
+                            ),
+                        )
+                    )
+                else:
+                    layer_hooks.append(
+                        mixer.in_proj_qkvz.register_forward_hook(
+                            lambda module, args, output, destination=projections["runtime"]: capture_projection_output(
+                                module,
+                                args,
+                                output,
+                                destination=destination,
+                                keys=("qkv", "z"),
+                                sizes=(qkv_size, z_size),
+                            )
+                        )
+                    )
+                layer_hooks.append(
+                    mixer.in_proj_ba.register_forward_hook(
+                        lambda module, args, output, destination=projections["runtime"]: capture_projection_output(
+                            module,
+                            args,
+                            output,
+                            destination=destination,
+                            keys=("b", "a"),
+                            sizes=(ba_size, ba_size),
+                        )
+                    )
+                )
+
+                def capture_fla_input(_module, args, kwargs, *, destination=fla_inputs):
+                    argument_names = (
+                        "q",
+                        "k",
+                        "v",
+                        "g",
+                        "beta",
+                        "initial_state",
+                        "output_final_state",
+                        "cu_seqlens",
+                        "chunk_indices",
+                        "chunk_offsets",
+                        "use_qk_l2norm_in_kernel",
+                    )
+                    values = {
+                        name: kwargs[name] if name in kwargs else args[index]
+                        for index, name in enumerate(argument_names)
+                    }
+                    if values["use_qk_l2norm_in_kernel"]:
+                        raise RuntimeError("Expected pre-normalized Q/K in the Qwen3.5 prefill path")
+                    values["core_attn_out"] = kwargs.get(
+                        "core_attn_out",
+                        args[len(argument_names)] if len(args) > len(argument_names) else None,
+                    )
+                    captured_values = {
+                        name: value.detach().clone() if isinstance(value, torch.Tensor) else value
+                        for name, value in values.items()
+                        if name != "core_attn_out"
+                    }
+                    captured_values["core_attn_out"] = values["core_attn_out"]
+                    captured_values["input_layouts"] = {
+                        name: tensor_layout(value) for name, value in values.items() if isinstance(value, torch.Tensor)
+                    }
+                    destination.append(captured_values)
+
+                def capture_fla_output(
+                    _module,
+                    _args,
+                    _kwargs,
+                    output,
+                    *,
+                    source=fla_inputs,
+                    live_outputs=fla_outputs,
+                    live_values=fla_values,
+                    destination=fla_captures,
+                    backend=mixer.gdn_prefill_backend,
+                    backend_method=mixer.chunk_gated_delta_rule._forward_method,
+                ):
+                    if len(source) != 1:
+                        raise RuntimeError(f"Expected one pending FLA input capture, got {len(source)}")
+                    values = source.pop()
+                    live_output, live_final_state = output
+                    live_outputs.append(live_output.detach())
+                    live_values.append({name: values[name].detach().clone() for name in ("q", "k", "v")})
+
+                    from fla.ops.gated_delta_rule.chunk import (
+                        chunk_gated_delta_rule_fwd as released_chunk_gated_delta_rule_fwd,
+                    )
+                    from vllm.model_executor.layers.fla.ops.chunk import (
+                        chunk_gated_delta_rule_fwd as vllm_chunk_gated_delta_rule_fwd,
+                    )
+
+                    released_g, released_output, released_A, released_final_state, _ = (
+                        released_chunk_gated_delta_rule_fwd(
+                            q=values["q"].clone(),
+                            k=values["k"].clone(),
+                            v=values["v"].clone(),
+                            g=values["g"].clone(),
+                            beta=values["beta"].clone(),
+                            scale=values["k"].shape[-1] ** -0.5,
+                            initial_state=values["initial_state"].clone(),
+                            output_final_state=values["output_final_state"],
+                            cu_seqlens=values["cu_seqlens"],
+                            chunk_indices=values["chunk_indices"],
+                            transpose_state_layout=True,  # Match vLLM's [N, H, V, K] cache layout.
+                        )
+                    )
+                    vllm_arguments = {
+                        "q": values["q"].clone(),
+                        "k": values["k"].clone(),
+                        "v": values["v"].clone(),
+                        "g": values["g"].clone(),
+                        "beta": values["beta"].clone(),
+                        "scale": values["k"].shape[-1] ** -0.5,
+                        "initial_state": values["initial_state"].clone(),
+                        "output_final_state": values["output_final_state"],
+                        "cu_seqlens": values["cu_seqlens"],
+                        "chunk_indices": values["chunk_indices"],
+                        "chunk_offsets": values["chunk_offsets"],
+                    }
+                    (
+                        vllm_g,
+                        vllm_output,
+                        vllm_A,
+                        vllm_final_state,
+                        _,
+                        _,
+                        _,
+                    ) = vllm_chunk_gated_delta_rule_fwd(**vllm_arguments)
+
+                    live_chunk_destination = values["core_attn_out"]
+                    destination_template = live_chunk_destination
+                    if destination_template is None:
+                        destination_template = live_output.squeeze(0)
+                    replay_destination = torch.empty_strided(
+                        destination_template.shape,
+                        destination_template.stride(),
+                        dtype=destination_template.dtype,
+                        device=destination_template.device,
+                    )
+                    buffered_arguments = {
+                        **vllm_arguments,
+                        "q": values["q"].clone(),
+                        "k": values["k"].clone(),
+                        "v": values["v"].clone(),
+                        "g": values["g"].clone(),
+                        "beta": values["beta"].clone(),
+                        "initial_state": values["initial_state"].clone(),
+                        "core_attn_out": replay_destination,
+                    }
+                    (
+                        buffered_g,
+                        buffered_output,
+                        buffered_A,
+                        buffered_final_state,
+                        _,
+                        _,
+                        _,
+                    ) = vllm_chunk_gated_delta_rule_fwd(**buffered_arguments)
+                    replay_destination_view = replay_destination[: buffered_output.numel()].view_as(buffered_output)
+
+                    live_chunk_destination_view = None
+                    if live_chunk_destination is not None:
+                        live_chunk_destination_view = live_chunk_destination[: live_output.numel()].view_as(live_output)
+                    contract_output = buffered_output if live_chunk_destination is not None else vllm_output
+                    contract_final_state = (
+                        buffered_final_state if live_chunk_destination is not None else vllm_final_state
+                    )
+                    destination.append(
+                        {
+                            "backend": {
+                                "method": backend_method.__name__,
+                                "method_module": backend_method.__module__,
+                                "selected": backend,
+                            },
+                            "inputs": {
+                                name: {
+                                    "fingerprint": canonical_tensor_fingerprint(values[name]),
+                                    "layout": values["input_layouts"][name],
+                                    **(
+                                        {"token_fingerprints": token_fingerprints(values[name])}
+                                        if name != "initial_state"
+                                        else {}
+                                    ),
+                                }
+                                for name in ("q", "k", "v", "g", "beta", "initial_state")
+                            },
+                            "live": {
+                                "chunk_destination_fingerprint": (
+                                    canonical_tensor_fingerprint(live_chunk_destination_view)
+                                    if live_chunk_destination_view is not None
+                                    else None
+                                ),
+                                "chunk_destination_layout": (
+                                    tensor_layout(live_chunk_destination)
+                                    if live_chunk_destination is not None
+                                    else None
+                                ),
+                                "chunk_destination_supplied": live_chunk_destination is not None,
+                                "final_state_fingerprint": canonical_tensor_fingerprint(live_final_state),
+                                "final_state_layout": tensor_layout(live_final_state),
+                                "output_fingerprint": canonical_tensor_fingerprint(live_output),
+                                "output_layout": tensor_layout(live_output),
+                                "output_vs_chunk_destination": (
+                                    exact_error_summary(live_output, live_chunk_destination_view)
+                                    if live_chunk_destination_view is not None
+                                    else None
+                                ),
+                                "output_chunk_destination_aliasing": (
+                                    alias_summary(live_output, live_chunk_destination_view)
+                                    if live_chunk_destination_view is not None
+                                    else None
+                                ),
+                            },
+                            "metadata": {
+                                name: (values[name].detach().cpu().tolist() if values[name] is not None else None)
+                                for name in ("cu_seqlens", "chunk_indices", "chunk_offsets")
+                            },
+                            "metadata_layouts": {
+                                name: values["input_layouts"].get(name)
+                                for name in ("cu_seqlens", "chunk_indices", "chunk_offsets")
+                            },
+                            "options": {
+                                "output_final_state": values["output_final_state"],
+                                "state_layout": "N,H,V,K",
+                                "use_qk_l2norm_in_kernel": values["use_qk_l2norm_in_kernel"],
+                            },
+                            "live_vs_vllm_replay": {
+                                "output": exact_error_summary(live_output, contract_output),
+                                "final_state": exact_error_summary(live_final_state, contract_final_state),
+                            },
+                            "vllm_buffer_contract": {
+                                "buffered_destination_fingerprint": canonical_tensor_fingerprint(
+                                    replay_destination_view
+                                ),
+                                "buffered_destination_layout": tensor_layout(replay_destination),
+                                "buffered_destination_vs_returned": exact_error_summary(
+                                    replay_destination_view, buffered_output
+                                ),
+                                "buffered_return_aliasing": alias_summary(buffered_output, replay_destination_view),
+                                "buffered_vs_unbuffered": {
+                                    "A": exact_error_summary(buffered_A, vllm_A),
+                                    "final_state": exact_error_summary(buffered_final_state, vllm_final_state),
+                                    "g": exact_error_summary(buffered_g, vllm_g),
+                                    "output": exact_error_summary(buffered_output, vllm_output),
+                                },
+                            },
+                            "vllm_vs_released": {
+                                "g": exact_error_summary(vllm_g, released_g),
+                                "A": exact_error_summary(vllm_A, released_A),
+                                "output": exact_error_summary(contract_output, released_output),
+                                "final_state": exact_error_summary(contract_final_state, released_final_state),
+                                "released_final_state_fingerprint": canonical_tensor_fingerprint(released_final_state),
+                                "released_final_state_layout": tensor_layout(released_final_state),
+                                "vllm_final_state_fingerprint": canonical_tensor_fingerprint(contract_final_state),
+                                "vllm_final_state_layout": tensor_layout(contract_final_state),
+                            },
+                        }
+                    )
+
+                layer_hooks.append(
+                    mixer.chunk_gated_delta_rule.register_forward_pre_hook(capture_fla_input, with_kwargs=True)
+                )
+                layer_hooks.append(
+                    mixer.chunk_gated_delta_rule.register_forward_hook(capture_fla_output, with_kwargs=True)
+                )
+
+                had_instance_forward_core = "_forward_core" in mixer.__dict__
+                instance_forward_core = mixer.__dict__.get("_forward_core")
+                original_forward_core = mixer._forward_core
+
+                def capture_forward_core(*args, original=original_forward_core, layer_mixer=mixer, **kwargs):
+                    mixed_qkv = kwargs.get("mixed_qkv")
+                    if mixed_qkv is None:
+                        mixed_qkv = args[0]
+                    model_destination = kwargs.get("core_attn_out")
+                    if model_destination is None:
+                        model_destination = args[3]
+
+                    from causal_conv1d import causal_conv1d_fn as released_causal_conv1d_fn
+                    from vllm.forward_context import get_forward_context
+                    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+                    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+                        causal_conv1d_fn as vllm_causal_conv1d_fn,
+                    )
+                    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+                    forward_context = get_forward_context()
+                    attn_metadata_raw = forward_context.attn_metadata
+                    if not isinstance(attn_metadata_raw, dict):
+                        raise RuntimeError("Expected per-layer GDN attention metadata")
+                    attn_metadata = attn_metadata_raw[layer_mixer.prefix]
+                    if not isinstance(attn_metadata, GDNAttentionMetadata):
+                        raise RuntimeError(f"Expected GDN attention metadata for layer {diagnostic_gdn_layer}")
+                    num_actual_tokens = attn_metadata.num_actual_tokens
+                    query_start_loc = attn_metadata.non_spec_query_start_loc.detach().clone()
+                    has_initial_state = attn_metadata.has_initial_state.detach().clone()
+                    state_indices = attn_metadata.non_spec_state_indices_tensor.detach().clone()
+                    captured_x = mixed_qkv[:num_actual_tokens].detach().clone()
+                    if query_start_loc.cpu().tolist() != [0, captured_x.shape[0]]:
+                        raise RuntimeError(
+                            "Expected one complete prefill sequence in the causal-convolution diagnostic"
+                        )
+                    if torch.any(has_initial_state):
+                        raise RuntimeError("Expected a cold zero-state causal-convolution prefill")
+                    if (
+                        attn_metadata.num_prefills != 1
+                        or attn_metadata.num_decodes != 0
+                        or attn_metadata.spec_sequence_masks is not None
+                    ):
+                        raise RuntimeError("Expected one non-speculative prefill and no decodes")
+
+                    conv_weight = (
+                        layer_mixer.conv1d.weight.view(
+                            layer_mixer.conv1d.weight.shape[0], layer_mixer.conv1d.weight.shape[2]
+                        )
+                        .detach()
+                        .clone()
+                    )
+                    conv_bias = layer_mixer.conv1d.bias
+                    conv_bias = conv_bias.detach().clone() if conv_bias is not None else None
+                    live_conv_state = (
+                        layer_mixer.kv_cache[0]
+                        if is_conv_state_dim_first()
+                        else layer_mixer.kv_cache[0].transpose(-1, -2)
+                    )
+
+                    result = original(*args, **kwargs)
+                    if len(fla_outputs) != 1 or len(fla_values) != 1 or len(fla_captures) != 1:
+                        raise RuntimeError("Expected one live FLA output before the model destination capture")
+                    live_output = fla_outputs.pop()
+                    live_fla_values = fla_values.pop()
+
+                    def run_vllm_conv(token_major_x, *, activation, dirty_state=False):
+                        channel_last_x = token_major_x.contiguous().transpose(0, 1)
+                        scratch_state = torch.zeros(
+                            2,
+                            channel_last_x.shape[0],
+                            conv_weight.shape[1] - 1,
+                            dtype=live_conv_state.dtype,
+                            device=channel_last_x.device,
+                        )
+                        if dirty_state:
+                            scratch_state.fill_(1)
+                        scratch_query_start_loc = torch.tensor(
+                            [0, token_major_x.shape[0]], dtype=torch.int32, device=channel_last_x.device
+                        )
+                        scratch_output = vllm_causal_conv1d_fn(
+                            channel_last_x,
+                            conv_weight,
+                            conv_bias,
+                            conv_states=scratch_state,
+                            query_start_loc=scratch_query_start_loc,
+                            cache_indices=torch.ones(1, dtype=torch.int32, device=channel_last_x.device),
+                            has_initial_state=torch.zeros(1, dtype=torch.bool, device=channel_last_x.device),
+                            activation=activation,
+                            metadata=None,
+                            validate_data=True,
+                        )
+                        return scratch_output.transpose(0, 1).unsqueeze(0), scratch_state[1:2]
+
+                    def run_released_conv(token_major_x, *, activation):
+                        channel_first_x = token_major_x.transpose(0, 1).unsqueeze(0)
+                        return released_causal_conv1d_fn(
+                            channel_first_x,
+                            conv_weight,
+                            bias=conv_bias,
+                            seq_idx=None,
+                            activation=activation,
+                        ).transpose(1, 2)
+
+                    scratch_output, scratch_state = run_vllm_conv(captured_x, activation=layer_mixer.activation)
+                    scratch_raw_output, _ = run_vllm_conv(captured_x, activation=None)
+                    dirty_output, _ = run_vllm_conv(captured_x, activation=layer_mixer.activation, dirty_state=True)
+                    released_output = run_released_conv(captured_x, activation=layer_mixer.activation)
+                    released_raw_output = run_released_conv(captured_x, activation=None)
+                    scratch_q, scratch_k, scratch_v = layer_mixer.rearrange_mixed_qkv(scratch_output.squeeze(0))
+                    del scratch_q, scratch_k
+                    scratch_v = scratch_v.unsqueeze(0)
+                    expected_state = torch.nn.functional.pad(
+                        captured_x.to(live_conv_state.dtype).transpose(0, 1),
+                        (conv_weight.shape[1] - 1, 0),
+                    )[:, -(conv_weight.shape[1] - 1) :].unsqueeze(0)
+
+                    token0 = captured_x[:1]
+                    vllm_token0_raw, _ = run_vllm_conv(token0, activation=None)
+                    vllm_token0_silu, _ = run_vllm_conv(token0, activation="silu")
+                    released_token0_raw = run_released_conv(token0, activation=None)
+                    released_token0_silu = run_released_conv(token0, activation="silu")
+                    manual_token0_raw = token0.float() * conv_weight[:, -1].float()
+                    if conv_bias is not None:
+                        manual_token0_raw = manual_token0_raw + conv_bias.float()
+                    manual_token0_raw = manual_token0_raw.to(vllm_token0_raw.dtype).unsqueeze(0)
+                    manual_token0_silu = torch.nn.functional.silu(manual_token0_raw.float()).to(vllm_token0_silu.dtype)
+
+                    def tensor_payload(tensor):
+                        return {
+                            "fingerprint": canonical_tensor_fingerprint(tensor),
+                            "layout": tensor_layout(tensor),
+                            "token_fingerprints": token_fingerprints(tensor),
+                        }
+
+                    causal_conv_captures.append(
+                        {
+                            "backend": {
+                                "method": vllm_causal_conv1d_fn.__qualname__,
+                                "method_module": vllm_causal_conv1d_fn.__module__,
+                                "released_method": released_causal_conv1d_fn.__qualname__,
+                                "released_method_module": released_causal_conv1d_fn.__module__,
+                            },
+                            "inputs": {
+                                "x": tensor_payload(captured_x.unsqueeze(0)),
+                                "weight": {
+                                    "fingerprint": canonical_tensor_fingerprint(conv_weight),
+                                    "layout": tensor_layout(conv_weight),
+                                },
+                                "bias": (
+                                    {
+                                        "fingerprint": canonical_tensor_fingerprint(conv_bias),
+                                        "layout": tensor_layout(conv_bias),
+                                    }
+                                    if conv_bias is not None
+                                    else None
+                                ),
+                                "live_conv_state_layout": tensor_layout(live_conv_state),
+                            },
+                            "live_post_conv_v": tensor_payload(live_fla_values["v"]),
+                            "scratch_replay": tensor_payload(scratch_output),
+                            "released_replay": tensor_payload(released_output),
+                            "comparisons": {
+                                "dirty_vs_zero_state": exact_error_summary(dirty_output, scratch_output),
+                                "live_post_conv_v_vs_scratch": exact_error_summary(live_fla_values["v"], scratch_v),
+                                "scratch_state_vs_expected_tail": exact_error_summary(scratch_state, expected_state),
+                                "scratch_vs_released": exact_error_summary(scratch_output, released_output),
+                                "token0_raw": {
+                                    "full_vs_singleton": exact_error_summary(
+                                        scratch_raw_output[:, :1], vllm_token0_raw
+                                    ),
+                                    "released_full_vs_singleton": exact_error_summary(
+                                        released_raw_output[:, :1], released_token0_raw
+                                    ),
+                                    "scratch_vs_manual": exact_error_summary(vllm_token0_raw, manual_token0_raw),
+                                    "scratch_vs_released": exact_error_summary(vllm_token0_raw, released_token0_raw),
+                                },
+                                "token0_silu": {
+                                    "full_vs_singleton": exact_error_summary(scratch_output[:, :1], vllm_token0_silu),
+                                    "released_full_vs_singleton": exact_error_summary(
+                                        released_output[:, :1], released_token0_silu
+                                    ),
+                                    "scratch_vs_manual": exact_error_summary(vllm_token0_silu, manual_token0_silu),
+                                    "scratch_vs_released": exact_error_summary(vllm_token0_silu, released_token0_silu),
+                                },
+                            },
+                            "metadata": {
+                                "has_initial_state": has_initial_state.cpu().tolist(),
+                                "num_actual_tokens": num_actual_tokens,
+                                "num_decode_tokens": attn_metadata.num_decode_tokens,
+                                "num_decodes": attn_metadata.num_decodes,
+                                "num_prefills": attn_metadata.num_prefills,
+                                "query_start_loc": query_start_loc.cpu().tolist(),
+                                "spec_sequence_masks": None,
+                                "state_indices": state_indices.cpu().tolist(),
+                            },
+                            "options": {"activation": layer_mixer.activation, "state_layout": "N,C,K-1"},
+                        }
+                    )
+                    if (
+                        model_destination.ndim == live_output.ndim - 1
+                        and model_destination.shape[1:] == live_output.shape[2:]
+                    ):
+                        token_offset = model_destination.shape[0] - live_output.shape[1]
+                        if token_offset < 0:
+                            raise RuntimeError("Model destination is shorter than the live FLA output")
+                        model_destination_view = model_destination[token_offset:].unsqueeze(0)
+                    else:
+                        token_offset = None
+                        model_destination_view = model_destination.reshape(-1)[: live_output.numel()].view_as(
+                            live_output
+                        )
+                    fla_captures[0]["model_destination"] = {
+                        "fingerprint": canonical_tensor_fingerprint(model_destination_view),
+                        "layout": tensor_layout(model_destination),
+                        "output_aliasing": alias_summary(live_output, model_destination_view),
+                        "output_error": exact_error_summary(live_output, model_destination_view),
+                        "token_offset": token_offset,
+                    }
+                    return result
+
+                mixer._forward_core = capture_forward_core
+                forward_core_patches.append((mixer, had_instance_forward_core, instance_forward_core))
+
+                def capture_norm_input(
+                    _module,
+                    args,
+                    kwargs,
+                    *,
+                    destination=stages,
+                    heads=mixer.num_v_heads // mixer.tp_size,
+                ):
+                    core_attn_out = kwargs.get("x")
+                    if core_attn_out is None:
+                        core_attn_out = args[0]
+                    gate = kwargs.get("residual")
+                    if gate is None:
+                        gate = args[1]
+                    destination.setdefault("core_attn_out", []).append(token_heads_payload(core_attn_out, heads))
+                    destination.setdefault("z", []).append(token_heads_payload(gate, heads))
+
+                def capture_norm_output(
+                    _module,
+                    _args,
+                    _kwargs,
+                    output,
+                    *,
+                    destination=stages,
+                    heads=mixer.num_v_heads // mixer.tp_size,
+                ):
+                    destination.setdefault("norm_output", []).append(token_heads_payload(output, heads))
+
+                layer_hooks.append(mixer.norm.register_forward_pre_hook(capture_norm_input, with_kwargs=True))
+                layer_hooks.append(mixer.norm.register_forward_hook(capture_norm_output, with_kwargs=True))
+                layer_hooks.append(
+                    mixer.out_proj.register_forward_pre_hook(
+                        lambda module, args, kwargs, destination=stages: capture_input(
+                            module,
+                            args,
+                            kwargs,
+                            destination=destination,
+                            key="out_proj_input",
+                            trace_tokens=True,
+                        ),
+                        with_kwargs=True,
+                    )
+                )
+                layer_hooks.append(
+                    mixer.out_proj.register_forward_hook(
+                        lambda module, args, kwargs, output, destination=stages: capture_output(
+                            module,
+                            args,
+                            kwargs,
+                            output,
+                            destination=destination,
+                            key="out_proj_output",
+                            trace_tokens=True,
+                        ),
+                        with_kwargs=True,
+                    )
+                )
+            if layer_index == 3 and mixer_name == "self_attn":
+                attention_stages = {}
+                attention_replays = {}
+                attention_inputs = []
+                attention_core_tensors = []
+                attention_gate_tensors = []
+                entry["attention_stages"] = attention_stages
+                entry["attention_replays"] = attention_replays
+
+                def capture_attention_input(
+                    _module,
+                    args,
+                    kwargs,
+                    *,
+                    inputs=attention_inputs,
+                ):
+                    positions = kwargs.get("positions")
+                    if positions is None:
+                        positions = args[0]
+                    hidden_states = kwargs.get("hidden_states")
+                    if hidden_states is None:
+                        hidden_states = args[2]
+                    inputs.append((positions, hidden_states))
+
+                def attention_heads(tensor, heads, head_dim):
+                    if tensor.ndim != 2:
+                        raise RuntimeError(
+                            f"Expected packed vLLM attention tensor [tokens, hidden], got {tensor.shape}"
+                        )
+                    return tensor.view(tensor.shape[0], heads, head_dim)
+
+                def eager_project_qkv(layer_mixer, qkv, positions, *, destination, prefix):
+                    q_gate, key, value = qkv.split(
+                        [layer_mixer.q_size * 2, layer_mixer.kv_size, layer_mixer.kv_size], dim=-1
+                    )
+                    q_gate = q_gate.view(q_gate.shape[0], layer_mixer.num_heads, layer_mixer.head_dim * 2)
+                    query, gate = torch.chunk(q_gate, 2, dim=-1)
+                    query = layer_mixer.q_norm.forward(query)
+                    key = layer_mixer.k_norm.forward(
+                        key.view(key.shape[0], layer_mixer.num_kv_heads, layer_mixer.head_dim)
+                    )
+                    destination.setdefault(f"{prefix}_q_norm", []).append(attention_payload(query))
+                    destination.setdefault(f"{prefix}_k_norm", []).append(attention_payload(key))
+                    query = query.reshape(query.shape[0], -1)
+                    key = key.reshape(key.shape[0], -1)
+                    query, key = layer_mixer.rotary_emb.forward(positions, query, key)
+                    return query, key, value, gate.reshape(gate.shape[0], -1)
+
+                def store_processed_attention(
+                    destination,
+                    prefix,
+                    query,
+                    key,
+                    value,
+                    gate,
+                    *,
+                    layer_mixer,
+                ):
+                    destination.setdefault(f"{prefix}_q_rope", []).append(
+                        attention_payload(attention_heads(query, layer_mixer.num_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault(f"{prefix}_k_rope", []).append(
+                        attention_payload(attention_heads(key, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault(f"{prefix}_v", []).append(
+                        attention_payload(attention_heads(value, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault(f"{prefix}_gate", []).append(
+                        attention_payload(attention_heads(gate, layer_mixer.num_heads, layer_mixer.head_dim))
+                    )
+
+                def capture_qkv(
+                    _module,
+                    _args,
+                    output,
+                    *,
+                    inputs=attention_inputs,
+                    destination=attention_stages,
+                    replays=attention_replays,
+                    gates=attention_gate_tensors,
+                    layer_mixer=mixer,
+                ):
+                    if len(inputs) != 1:
+                        raise RuntimeError(f"Expected one vLLM attention input, got {len(inputs)}")
+                    positions, hidden_states = inputs[0]
+                    qkv = output[0] if isinstance(output, tuple) else output
+                    q_gate_size = layer_mixer.q_size * 2
+                    q_gate, key, value = qkv.split([q_gate_size, layer_mixer.kv_size, layer_mixer.kv_size], dim=-1)
+                    q_gate_heads = q_gate.view(q_gate.shape[0], layer_mixer.num_heads, layer_mixer.head_dim * 2)
+                    query, gate = torch.chunk(q_gate_heads, 2, dim=-1)
+                    gates.append(gate.reshape(gate.shape[0], -1))
+                    destination.setdefault("q_raw", []).append(attention_payload(query))
+                    destination.setdefault("gate", []).append(attention_payload(gate))
+                    destination.setdefault("k_raw", []).append(
+                        attention_payload(attention_heads(key, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault("v_raw", []).append(
+                        attention_payload(attention_heads(value, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+
+                    weight = layer_mixer.qkv_proj.weight
+                    bias = getattr(layer_mixer.qkv_proj, "bias", None)
+                    q_gate_bias = None if bias is None else bias[:q_gate_size]
+                    key_bias = None if bias is None else bias[q_gate_size : q_gate_size + layer_mixer.kv_size]
+                    value_bias = None if bias is None else bias[q_gate_size + layer_mixer.kv_size :]
+                    separate_q_gate = torch.nn.functional.linear(
+                        hidden_states,
+                        weight[:q_gate_size],
+                        q_gate_bias,
+                    )
+                    separate_key = torch.nn.functional.linear(
+                        hidden_states,
+                        weight[q_gate_size : q_gate_size + layer_mixer.kv_size],
+                        key_bias,
+                    )
+                    separate_value = torch.nn.functional.linear(
+                        hidden_states,
+                        weight[q_gate_size + layer_mixer.kv_size :],
+                        value_bias,
+                    )
+                    separate_q_gate_heads = separate_q_gate.view(
+                        separate_q_gate.shape[0], layer_mixer.num_heads, layer_mixer.head_dim * 2
+                    )
+                    separate_query, separate_gate = torch.chunk(separate_q_gate_heads, 2, dim=-1)
+                    replays.setdefault("separate_q_raw", []).append(attention_payload(separate_query))
+                    replays.setdefault("separate_gate", []).append(attention_payload(separate_gate))
+                    replays.setdefault("separate_k_raw", []).append(
+                        attention_payload(attention_heads(separate_key, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+                    replays.setdefault("separate_v_raw", []).append(
+                        attention_payload(
+                            attention_heads(separate_value, layer_mixer.num_kv_heads, layer_mixer.head_dim)
+                        )
+                    )
+                    separate_qkv = torch.cat((separate_q_gate, separate_key, separate_value), dim=-1)
+
+                    runtime_eager = eager_project_qkv(
+                        layer_mixer,
+                        qkv,
+                        positions,
+                        destination=replays,
+                        prefix="runtime_eager",
+                    )
+                    store_processed_attention(
+                        replays,
+                        "runtime_eager",
+                        *runtime_eager,
+                        layer_mixer=layer_mixer,
+                    )
+                    separate_eager = eager_project_qkv(
+                        layer_mixer,
+                        separate_qkv,
+                        positions,
+                        destination=replays,
+                        prefix="separate_eager",
+                    )
+                    store_processed_attention(
+                        replays,
+                        "separate_eager",
+                        *separate_eager,
+                        layer_mixer=layer_mixer,
+                    )
+                    separate_fused = layer_mixer._project_qkv_gate(separate_qkv, positions)
+                    store_processed_attention(
+                        replays,
+                        "separate_fused",
+                        *separate_fused,
+                        layer_mixer=layer_mixer,
+                    )
+
+                def capture_attention_backend_input(
+                    _module,
+                    args,
+                    *,
+                    destination=attention_stages,
+                    layer_mixer=mixer,
+                ):
+                    query, key, value = args[:3]
+                    destination.setdefault("q_rope", []).append(
+                        attention_payload(attention_heads(query, layer_mixer.num_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault("k_rope", []).append(
+                        attention_payload(attention_heads(key, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+                    destination.setdefault("v", []).append(
+                        attention_payload(attention_heads(value, layer_mixer.num_kv_heads, layer_mixer.head_dim))
+                    )
+
+                def capture_attention_backend_output(
+                    _module,
+                    _args,
+                    output,
+                    *,
+                    destination=attention_stages,
+                    tensors=attention_core_tensors,
+                    layer_mixer=mixer,
+                ):
+                    tensors.append(output)
+                    destination.setdefault("attention_core", []).append(
+                        attention_payload(attention_heads(output, layer_mixer.num_heads, layer_mixer.head_dim))
+                    )
+
+                def capture_post_gate(
+                    _module,
+                    args,
+                    *,
+                    destination=attention_stages,
+                    replays=attention_replays,
+                    cores=attention_core_tensors,
+                    gates=attention_gate_tensors,
+                    inputs=attention_inputs,
+                    layer_mixer=mixer,
+                ):
+                    post_gate = args[0]
+                    destination.setdefault("post_gate", []).append(tensor_payload(post_gate))
+                    if not gates and len(inputs) == 1:
+                        _, hidden_states = inputs[0]
+                        qkv = layer_mixer._project_qkv(hidden_states)
+                        capture_qkv(layer_mixer.qkv_proj, (hidden_states,), qkv)
+                    if len(cores) != 1 or len(gates) != 1:
+                        raise RuntimeError(f"Expected one attention core and gate, got {len(cores)} and {len(gates)}")
+                    replays.setdefault("post_gate", []).append(tensor_payload(cores[0] * torch.sigmoid(gates[0])))
+
+                layer_hooks.extend(
+                    (
+                        mixer.register_forward_pre_hook(capture_attention_input, with_kwargs=True),
+                        mixer.qkv_proj.register_forward_hook(capture_qkv),
+                        mixer.attn.register_forward_pre_hook(capture_attention_backend_input),
+                        mixer.attn.register_forward_hook(capture_attention_backend_output),
+                        mixer.o_proj.register_forward_pre_hook(capture_post_gate),
+                        mixer.o_proj.register_forward_hook(
+                            lambda module, args, output, destination=attention_stages: capture_output(
+                                module,
+                                args,
+                                {},
+                                output,
+                                destination=destination,
+                                key="out_proj",
+                            )
+                        ),
+                    )
+                )
+            if layer_index == 0:
+                mlp_stages = {}
+                mlp_replays = {}
+                mlp_inputs = []
+                entry["mlp_stages"] = mlp_stages
+                entry["mlp_replays"] = mlp_replays
+
+                def capture_mlp_input(module, args, *, inputs=mlp_inputs):
+                    inputs.append(args[0])
+
+                def capture_gate_up_input(
+                    module,
+                    args,
+                    *,
+                    inputs=mlp_inputs,
+                    destination=mlp_stages,
+                    replays=mlp_replays,
+                    activation=layer.mlp.act_fn,
+                    down_projection=layer.mlp.down_proj,
+                    projection=layer.mlp.gate_up_proj,
+                ):
+                    if len(inputs) != 1:
+                        raise RuntimeError(f"Expected one MLP input before activation, got {len(inputs)}")
+                    hidden_states = inputs[0]
+                    projected = args[0]
+                    gate, up = projected.chunk(2, dim=-1)
+                    destination.setdefault("gate", []).append(tensor_payload(gate))
+                    destination.setdefault("up", []).append(tensor_payload(up))
+
+                    split_size = gate.shape[-1]
+                    weight = projection.weight
+                    bias = getattr(projection, "bias", None)
+                    gate_bias = None if bias is None else bias[:split_size]
+                    up_bias = None if bias is None else bias[split_size:]
+                    separate_gate = torch.nn.functional.linear(
+                        hidden_states,
+                        weight[:split_size],
+                        gate_bias,
+                    )
+                    separate_up = torch.nn.functional.linear(
+                        hidden_states,
+                        weight[split_size:],
+                        up_bias,
+                    )
+                    separate_gate_up = torch.cat((separate_gate, separate_up), dim=-1)
+                    fused_separate_product = activation.forward_cuda(separate_gate_up)
+                    fused_separate_down = down_projection.forward(fused_separate_product)
+                    if isinstance(fused_separate_down, tuple):
+                        fused_separate_down = fused_separate_down[0]
+                    native_activation = torch.nn.functional.silu(gate)
+                    separate_native_activation = torch.nn.functional.silu(separate_gate)
+                    replays.setdefault("separate_gate", []).append(tensor_payload(separate_gate))
+                    replays.setdefault("separate_up", []).append(tensor_payload(separate_up))
+                    replays.setdefault("native_activation", []).append(tensor_payload(native_activation))
+                    replays.setdefault("separate_native_activation", []).append(
+                        tensor_payload(separate_native_activation)
+                    )
+                    replays.setdefault("native_product", []).append(tensor_payload(native_activation * up))
+                    replays.setdefault("separate_native_product", []).append(
+                        tensor_payload(separate_native_activation * separate_up)
+                    )
+                    replays.setdefault("fused_separate_product", []).append(tensor_payload(fused_separate_product))
+                    replays.setdefault("fused_separate_down", []).append(tensor_payload(fused_separate_down))
+
+                layer_hooks.append(layer.mlp.register_forward_pre_hook(capture_mlp_input))
+                layer_hooks.append(layer.mlp.act_fn.register_forward_pre_hook(capture_gate_up_input))
+                layer_hooks.append(
+                    layer.mlp.act_fn.register_forward_hook(
+                        lambda module, args, output, destination=mlp_stages: capture_output(
+                            module,
+                            args,
+                            {},
+                            output,
+                            destination=destination,
+                            key="product",
+                        )
+                    )
+                )
+                layer_hooks.append(
+                    layer.mlp.down_proj.register_forward_hook(
+                        lambda module, args, output, destination=mlp_stages: capture_output(
+                            module,
+                            args,
+                            {},
+                            output,
+                            destination=destination,
+                            key="down",
+                        )
+                    )
+                )
+            layer_hooks.append(
+                mixer.register_forward_pre_hook(
+                    lambda module, args, kwargs, destination=entry, trace_tokens=layer_index < 4: capture_input(
+                        module,
+                        args,
+                        kwargs,
+                        destination=destination,
+                        key="mixer_input",
+                        trace_tokens=trace_tokens,
+                    ),
+                    with_kwargs=True,
+                )
+            )
+            layer_hooks.append(
+                mixer.register_forward_hook(
+                    lambda module, args, kwargs, output, destination=entry, trace_tokens=layer_index < 4: (
+                        capture_output(
+                            module,
+                            args,
+                            kwargs,
+                            output,
+                            destination=destination,
+                            key="mixer_output",
+                            trace_tokens=trace_tokens,
+                        )
+                    ),
+                    with_kwargs=True,
+                )
+            )
+            layer_hooks.append(
+                layer.mlp.register_forward_pre_hook(
+                    lambda module, args, kwargs, destination=entry, trace_tokens=layer_index < 4: capture_input(
+                        module,
+                        args,
+                        kwargs,
+                        destination=destination,
+                        key="mlp_input",
+                        trace_tokens=trace_tokens,
+                    ),
+                    with_kwargs=True,
+                )
+            )
+            layer_hooks.append(
+                layer.mlp.register_forward_hook(
+                    lambda module, args, kwargs, output, destination=entry, trace_tokens=layer_index < 4: (
+                        capture_output(
+                            module,
+                            args,
+                            kwargs,
+                            output,
+                            destination=destination,
+                            key="mlp_output",
+                            trace_tokens=trace_tokens,
+                        )
+                    ),
+                    with_kwargs=True,
+                )
+            )
+
+        def capture_compute_logits(hidden_states, *args, **kwargs):
+            captured_hidden_state = None
+            if len(captures) < 8:
+                captured_hidden_state = hidden_states[0].detach().float().cpu().contiguous()
+            logits = original_compute_logits(hidden_states, *args, **kwargs)
+            if captured_hidden_state is not None:
+                selected_logit = logits[0, selected_token]
+                logsumexp = logits[0].logsumexp(dim=-1)
+                captures.append(
+                    {
+                        "head_input": captured_hidden_state.tolist(),
+                        "head_input_dtype": str(hidden_states.dtype),
+                        "head_input_shape": list(captured_hidden_state.shape),
+                        "compute_logits_input_shape": list(hidden_states.shape),
+                        "logits_dtype": str(logits.dtype),
+                        "logits_shape": list(logits.shape),
+                        "selected_logit": float(selected_logit.item()),
+                        "logsumexp": float(logsumexp.item()),
+                        "selected_logprob": float((selected_logit - logsumexp).item()),
+                    }
+                )
+            return logits
+
+        self._skyrl_original_compute_logits = original_compute_logits
+        self._skyrl_had_instance_compute_logits = had_instance_compute_logits
+        self._skyrl_instance_compute_logits = instance_compute_logits
+        self._skyrl_head_input_captures = captures
+        self._skyrl_layer_captures = layer_captures
+        self._skyrl_layer_capture_hooks = layer_hooks
+        self._skyrl_forward_core_patches = forward_core_patches
+        model.compute_logits = capture_compute_logits
+        self._skyrl_head_input_capture_active = True
+        return {"active": True}
+
+    def end_head_input_capture(self):
+        """Restore logits computation and return the bounded diagnostic capture."""
+        if not getattr(self, "_skyrl_head_input_capture_active", False):
+            raise RuntimeError("No vLLM head-input capture is active")
+
+        model = self.model_runner.model
+        if self._skyrl_had_instance_compute_logits:
+            model.compute_logits = self._skyrl_instance_compute_logits
+        else:
+            del model.compute_logits
+        for mixer, had_instance_forward_core, instance_forward_core in self._skyrl_forward_core_patches:
+            if had_instance_forward_core:
+                mixer._forward_core = instance_forward_core
+            else:
+                del mixer._forward_core
+        for hook in self._skyrl_layer_capture_hooks:
+            hook.remove()
+        captures = self._skyrl_head_input_captures
+        if len(captures) == 1:
+            for layer_entry in self._skyrl_layer_captures:
+                for key in ("mixer_input", "mixer_output", "mlp_input", "mlp_output"):
+                    values = layer_entry[key]
+                    if len(values) != 1:
+                        raise RuntimeError(
+                            f"Expected one vLLM {key} capture in layer {layer_entry['layer']}, got {len(values)}"
+                        )
+                    layer_entry[key] = values[0]
+                for mode, projection_captures in layer_entry.get("projections", {}).items():
+                    for key, values in projection_captures.items():
+                        if len(values) != 1:
+                            raise RuntimeError(
+                                f"Expected one vLLM {mode} {key} projection capture in layer "
+                                f"{layer_entry['layer']}, got {len(values)}"
+                            )
+                        projection_captures[key] = values[0]
+                for key, values in layer_entry.get("mixer_stages", {}).items():
+                    if len(values) != 1:
+                        raise RuntimeError(
+                            f"Expected one vLLM {key} stage capture in layer {layer_entry['layer']}, got {len(values)}"
+                        )
+                    layer_entry["mixer_stages"][key] = values[0]
+                for capture_name in ("mlp_stages", "mlp_replays"):
+                    for key, values in layer_entry.get(capture_name, {}).items():
+                        if len(values) != 1:
+                            raise RuntimeError(
+                                f"Expected one vLLM {key} {capture_name} capture in layer "
+                                f"{layer_entry['layer']}, got {len(values)}"
+                            )
+                        layer_entry[capture_name][key] = values[0]
+                for capture_name in ("attention_stages", "attention_replays"):
+                    for key, values in layer_entry.get(capture_name, {}).items():
+                        if len(values) != 1:
+                            raise RuntimeError(
+                                f"Expected one vLLM {key} {capture_name} capture in layer "
+                                f"{layer_entry['layer']}, got {len(values)}"
+                            )
+                        layer_entry[capture_name][key] = values[0]
+                fla_core = layer_entry.get("fla_core")
+                if fla_core is not None:
+                    if len(fla_core) != 1:
+                        raise RuntimeError(
+                            f"Expected one vLLM FLA core capture in layer {layer_entry['layer']}, got {len(fla_core)}"
+                        )
+                    if "model_destination" not in fla_core[0]:
+                        raise RuntimeError(f"Missing vLLM model destination capture in layer {layer_entry['layer']}")
+                    layer_entry["fla_core"] = fla_core[0]
+                causal_conv = layer_entry.get("causal_conv")
+                if causal_conv is not None:
+                    if len(causal_conv) != 1:
+                        raise RuntimeError(
+                            f"Expected one vLLM causal-convolution capture in layer "
+                            f"{layer_entry['layer']}, got {len(causal_conv)}"
+                        )
+                    layer_entry["causal_conv"] = causal_conv[0]
+            captures[0]["layer_trace"] = self._skyrl_layer_captures
+        del self._skyrl_original_compute_logits
+        del self._skyrl_had_instance_compute_logits
+        del self._skyrl_instance_compute_logits
+        del self._skyrl_head_input_captures
+        del self._skyrl_layer_captures
+        del self._skyrl_layer_capture_hooks
+        del self._skyrl_forward_core_patches
+        self._skyrl_head_input_capture_active = False
+        return captures
 
     def read_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 disaggregated-receive diag): return THIS engine worker's
@@ -835,8 +2255,8 @@ class WorkerWrap:
 
         out = {"__ranks__": {"tp_rank": tp_rank, "tp_size": tp_size, "ep_rank": ep_rank, "ep_size": ep_size}}
         prefix = f"model.layers.{layer_idx}.mlp"
-        w13 = all_params.get(f"{prefix}.experts.w13_weight")
-        w2 = all_params.get(f"{prefix}.experts.w2_weight")
+        w13 = all_params.get(f"{prefix}.experts.routed_experts.w13_weight")
+        w2 = all_params.get(f"{prefix}.experts.routed_experts.w2_weight")
         if w13 is None or w2 is None:
             cand = [k for k in all_params if k.startswith(f"{prefix}.experts.") and k.endswith("weight")]
             out["error"] = f"no w13/w2 under {prefix}; candidates={cand}"
@@ -848,7 +2268,8 @@ class WorkerWrap:
         global_num = None
         placement = None
         for mod_name, mod in model.named_modules():
-            if mod_name == f"{prefix}.experts" or mod_name.endswith(f"layers.{layer_idx}.mlp.experts"):
+            routed_experts_name = f"{prefix}.experts.routed_experts"
+            if mod_name == routed_experts_name or mod_name.endswith(routed_experts_name):
                 emap = getattr(mod, "_expert_map", None)
                 if emap is None:
                     emap = getattr(mod, "expert_map", None)
@@ -893,12 +2314,49 @@ class WorkerWrap:
 
         return socket.gethostname()
 
+    def report_runtime_installation(self, expected_vllm_engine_sha256: str):
+        """Return and verify the MarinSkyRL module loaded by this engine worker."""
+        import hashlib
+        from pathlib import Path
+
+        import skyrl_train
+
+        if len(expected_vllm_engine_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in expected_vllm_engine_sha256
+        ):
+            raise ValueError("expected_vllm_engine_sha256 must be a lowercase SHA256 digest")
+
+        module_path = Path(__file__).resolve()
+        actual_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
+        payload = {
+            "skyrl_train_file": str(Path(skyrl_train.__file__).resolve()),
+            "vllm_engine_file": str(module_path),
+            "vllm_engine_sha256": actual_sha256,
+            "expected_vllm_engine_sha256": expected_vllm_engine_sha256,
+            "matches_checkout": actual_sha256 == expected_vllm_engine_sha256,
+        }
+        print(f"SKYRL_ENGINECORE_RUNTIME {json.dumps(payload, sort_keys=True)}", flush=True)
+        if not payload["matches_checkout"]:
+            raise RuntimeError(f"EngineCore MarinSkyRL source mismatch: {payload}")
+        return payload
+
 
 class BaseVLLMInferenceEngine(InferenceEngineInterface):
     """Base class containing shared logic between sync and async VLLM engines."""
 
     def __init__(self, *args, bundle_indices: list = None, **kwargs):
         setup_envvars_for_vllm(kwargs, bundle_indices)
+        lm_head_compute_dtype = kwargs.pop("lm_head_compute_dtype", None)
+        # vLLM may construct the model in a separate EngineCore process, so the
+        # explicit constructor setting crosses that process boundary via env.
+        if lm_head_compute_dtype is None:
+            os.environ.pop(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV, None)
+        else:
+            os.environ[VLLM_LM_HEAD_COMPUTE_DTYPE_ENV] = lm_head_compute_dtype
+        configured_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(lm_head_compute_dtype)
+        if configured_model_classes:
+            action = "enabled" if lm_head_compute_dtype is not None else "restored"
+            logger.info(f"{action.capitalize()} lm_head compute for {', '.join(configured_model_classes)}")
         vllm_v1_disable_multiproc = kwargs.pop("vllm_v1_disable_multiproc", False)
         logger.info(
             f"BaseVLLMInferenceEngine: vllm_v1_disable_multiproc={vllm_v1_disable_multiproc}, "
@@ -919,7 +2377,13 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         if "rope_scaling" in kwargs:
             kwargs.pop("rope_scaling")
         # Let subclass create the appropriate engine
-        self.llm = self._create_engine(*args, **kwargs)
+        try:
+            self.llm = self._create_engine(*args, **kwargs)
+        finally:
+            if lm_head_compute_dtype is not None:
+                restored_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(None)
+                if restored_model_classes:
+                    logger.info(f"Restored lm_head compute for {', '.join(restored_model_classes)}")
 
         # Set NUMA affinity for TP>1 workers via collective_rpc
         if self._tp_size > 1 or self._pp_size > 1:
@@ -1035,8 +2499,11 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         """Reset the prefix cache. Subclasses override for async version."""
         return self.llm.llm_engine.reset_prefix_cache()
 
-    async def abort_generation(self) -> None:
-        raise NotImplementedError("Abort generation is only supported for AsyncVLLMInferenceEngine.")
+    async def pause_generation(self) -> None:
+        raise NotImplementedError("Pausing generation is only supported for AsyncVLLMInferenceEngine.")
+
+    async def resume_generation(self) -> None:
+        raise NotImplementedError("Resuming generation is only supported for AsyncVLLMInferenceEngine.")
 
 
 class VLLMInferenceEngine(BaseVLLMInferenceEngine):
@@ -1208,20 +2675,13 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
             current_running = 0
             current_waiting = 0
             current_cache_usage = 0.0
-            current_prefix_hit = 0.0
+            prefix_cache_stats = None
 
             if scheduler_stats is not None:
                 current_running = getattr(scheduler_stats, "num_running_reqs", 0)
                 current_waiting = getattr(scheduler_stats, "num_waiting_reqs", 0)
                 current_cache_usage = getattr(scheduler_stats, "kv_cache_usage", 0.0) * 100.0  # Convert to percentage
-
-                # Extract prefix cache hit rate from prefix_cache_stats
-                prefix_cache_stats = getattr(scheduler_stats, "prefix_cache_stats", None)
-                if prefix_cache_stats is not None:
-                    hits = getattr(prefix_cache_stats, "hits", 0)
-                    misses = getattr(prefix_cache_stats, "misses", 0)
-                    total = hits + misses
-                    current_prefix_hit = (hits / total * 100.0) if total > 0 else 0.0
+                prefix_cache_stats = scheduler_stats.prefix_cache_stats
 
             # Extract iteration_stats (second positional arg) for per-request latency data
             iteration_stats = None
@@ -1271,14 +2731,14 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
 
                 if existing is None:
                     # Initialize with sample lists for median calculation
-                    V1LoggingStatLoggerFixed._stats_registry[self._engine_id] = {
+                    existing = {
                         # Sample lists for computing median (only active samples)
                         "_samples_prompt_tp": [current_prompt_tp] if is_active else [],
                         "_samples_gen_tp": [current_gen_tp] if is_active else [],
                         "_samples_running": [current_running] if is_active else [],
                         "_samples_waiting": [current_waiting] if is_active else [],
                         "_samples_cache": [current_cache_usage] if is_active else [],
-                        "_samples_prefix_hit": [current_prefix_hit] if is_active else [],
+                        "_prefix_hit": PrefixCacheHitRateAccumulator(),
                         # Per-request latency samples (accumulated from finished requests)
                         "_samples_prefill_time": list(finished_prefill_times),
                         "_samples_decode_time": list(finished_decode_times),
@@ -1292,12 +2752,12 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
                         "_peak_running": current_running,
                         "_peak_waiting": current_waiting,
                         "_peak_cache": current_cache_usage,
-                        "_peak_prefix_hit": current_prefix_hit,
                         # Counters
                         "_num_samples": 1,
                         "_num_active_samples": 1 if is_active else 0,
                         "timestamp": time.time(),
                     }
+                    V1LoggingStatLoggerFixed._stats_registry[self._engine_id] = existing
                 else:
                     # Update peak values
                     existing["_peak_prompt_tp"] = max(existing["_peak_prompt_tp"], current_prompt_tp)
@@ -1305,7 +2765,6 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
                     existing["_peak_running"] = max(existing["_peak_running"], current_running)
                     existing["_peak_waiting"] = max(existing["_peak_waiting"], current_waiting)
                     existing["_peak_cache"] = max(existing["_peak_cache"], current_cache_usage)
-                    existing["_peak_prefix_hit"] = max(existing["_peak_prefix_hit"], current_prefix_hit)
 
                     # Accumulate per-request latency samples
                     existing["_samples_prefill_time"].extend(finished_prefill_times)
@@ -1322,11 +2781,12 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
                         existing["_samples_running"].append(current_running)
                         existing["_samples_waiting"].append(current_waiting)
                         existing["_samples_cache"].append(current_cache_usage)
-                        existing["_samples_prefix_hit"].append(current_prefix_hit)
                         existing["_num_active_samples"] += 1
 
                     existing["_num_samples"] += 1
                     existing["timestamp"] = time.time()
+
+                existing["_prefix_hit"].observe(prefix_cache_stats, is_active=is_active)
 
         now = time.monotonic()
         if now - self.last_log_time > self.log_interval:
@@ -1369,7 +2829,7 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
             median_running = cls._compute_median(stats["_samples_running"])
             median_waiting = cls._compute_median(stats["_samples_waiting"])
             median_cache = cls._compute_median(stats["_samples_cache"])
-            median_prefix_hit = cls._compute_median(stats["_samples_prefix_hit"])
+            median_prefix_hit = cls._compute_median(stats["_prefix_hit"].samples)
 
             # Compute means from sample lists
             num_active = stats["_num_active_samples"]
@@ -1404,7 +2864,7 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
                 "peak_running_reqs": stats["_peak_running"],
                 "peak_waiting_reqs": stats["_peak_waiting"],
                 "peak_gpu_cache_usage_perc": stats["_peak_cache"],
-                "peak_prefix_cache_hit_rate": stats["_peak_prefix_hit"],
+                "peak_prefix_cache_hit_rate": stats["_prefix_hit"].peak,
                 # Median values
                 "median_prompt_throughput": median_prompt_tp,
                 "median_generation_throughput": median_gen_tp,
@@ -1439,7 +2899,7 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
                 "num_running_reqs": stats["_peak_running"],
                 "num_waiting_reqs": stats["_peak_waiting"],
                 "gpu_cache_usage_perc": stats["_peak_cache"],
-                "prefix_cache_hit_rate": stats["_peak_prefix_hit"],
+                "prefix_cache_hit_rate": stats["_prefix_hit"].peak,
                 # Metadata
                 "timestamp": stats["timestamp"],
                 "num_samples": stats["_num_samples"],
@@ -1459,6 +2919,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
     def __init__(self, *args, **kwargs):
         # Generate unique engine ID before calling super().__init__() which calls _create_engine
         self._stats_engine_id = id(self)
+        self._batch_admission_lock = asyncio.Lock()
         super().__init__(*args, **kwargs)
         self._weight_loader = VLLMWeightLoader(self.llm, is_async=True)
 
@@ -1795,6 +3256,50 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
 
         return final_output
 
+    async def _collect_admitted_output(self, queue):
+        """Collect one request that was admitted before scheduler resume."""
+        final_output = None
+        finished = False
+        while not finished:
+            request_output = queue.get_nowait() or await queue.get()
+            if request_output is STREAM_FINISHED:
+                break
+            final_output = request_output
+            finished = request_output.finished
+        return final_output
+
+    async def _admit_batch(self, prompt_token_ids, sampling_params: SamplingParams, request_ids: list[str]):
+        """Admit one logical batch before vLLM can execute its first step."""
+        lora_request = None
+        if self._is_lora:
+            lora_int_ids = list(await self.llm.list_loras())
+            if lora_int_ids:
+                lora_int_id = lora_int_ids[0]
+                lora_request = LoRARequest(
+                    lora_name=f"{lora_int_id}",
+                    lora_int_id=lora_int_id,
+                    lora_path="/dummy_lora_path",
+                )
+        queues = []
+        pause_scheduler = len(prompt_token_ids) > 1
+        async with self._batch_admission_lock:
+            if pause_scheduler:
+                await self.llm.pause_generation(mode="keep", clear_cache=False)
+            try:
+                for prompt, request_id in zip(prompt_token_ids, request_ids, strict=True):
+                    queues.append(
+                        await self.llm.add_request(
+                            request_id=request_id,
+                            prompt=TokensPrompt(prompt_token_ids=prompt),
+                            params=sampling_params,
+                            lora_request=lora_request,
+                        )
+                    )
+            finally:
+                if pause_scheduler:
+                    await self.llm.resume_generation()
+        return queues
+
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
         """Generate responses using vLLM's async engine.
 
@@ -1813,16 +3318,11 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         """
         prompt_token_ids, sampling_params = self._preprocess_prompts(input_batch)
 
+        request_ids = [str(uuid4().hex) for _ in prompt_token_ids]
         tasks = []
-        request_ids: list[str] = []
-        for prompt in prompt_token_ids:
-            # Schedule the collection of outputs for each prompt.
-            # Avoid duplicate request_ids
-            request_id = str(uuid4().hex)
-            request_ids.append(request_id)
-            task = asyncio.create_task(self._collect_outputs(prompt, request_id, sampling_params))
-            tasks.append(task)
         try:
+            queues = await self._admit_batch(prompt_token_ids, sampling_params, request_ids)
+            tasks = [asyncio.create_task(self._collect_admitted_output(queue)) for queue in queues]
             outputs = await asyncio.gather(*tasks)
         except BaseException as e:
             # Cancel any sibling asyncio tasks still in flight.
@@ -1905,17 +3405,37 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         engine = self._get_engine()
         return await engine.collective_rpc("end_weight_update")
 
-    async def read_engine_weights(self, hf_names, dump_inventory: bool = False):
-        """TEST-ONLY (Stage 6 weight-equality gate): read engine-side weights back
+    async def read_engine_weights(
+        self,
+        hf_names,
+        dump_inventory: bool = False,
+    ):
+        """Read engine-side weights back
         under the trainer's HF parameter names, gathered across all TP/EP workers.
 
         Returns ``List[Dict]`` (one dict per worker rank), each as produced by
-        ``WorkerWrap.read_named_weights``. The caller assembles the per-rank
-        contributions (TP/EP shards) into the full HF tensors to compare against
-        the trainer's post-step weights.
+        ``WorkerWrap.read_named_weights``.
         """
         engine = self._get_engine()
         return await engine.collective_rpc("read_named_weights", args=(list(hf_names), dump_inventory))
+
+    async def fingerprint_engine_weights(self, hf_names, expected_shapes):
+        """Return compact in-actor fingerprints for engine weights."""
+        engine = self._get_engine()
+        return await engine.collective_rpc(
+            "fingerprint_named_weights",
+            args=(list(hf_names), dict(expected_shapes)),
+        )
+
+    async def begin_head_input_capture(self, selected_token: int):
+        """Start a bounded, test-only capture in each live engine worker."""
+        engine = self._get_engine()
+        return await engine.collective_rpc("begin_head_input_capture", args=(int(selected_token),))
+
+    async def end_head_input_capture(self):
+        """Stop a bounded, test-only capture and return its compact payload."""
+        engine = self._get_engine()
+        return await engine.collective_rpc("end_head_input_capture")
 
     async def read_engine_expert_slots_raw(self, layer_idx: int):
         """TEST-ONLY (D1/D2 diag): per-engine-worker RAW FusedMoE local-slot weights +
@@ -1928,6 +3448,14 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         """TEST-ONLY (disaggregation proof): hostname of every engine TP/EP worker."""
         engine = self._get_engine()
         return await engine.collective_rpc("report_host")
+
+    async def report_runtime_installation(self, expected_vllm_engine_sha256: str):
+        """Return and verify MarinSkyRL provenance inside each engine worker."""
+        engine = self._get_engine()
+        return await engine.collective_rpc(
+            "report_runtime_installation",
+            args=(expected_vllm_engine_sha256,),
+        )
 
     async def begin_weight_reload(self):
         """#1685 fix: open the layerwise-reload bracket on every engine worker so the
@@ -2181,40 +3709,22 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         stats["engine_id"] = self._stats_engine_id
         return stats
 
-    async def abort_generation(self) -> None:
-        """
-        Abort all running and waiting requests, which make the ongoing requests return the
-        already-generated tokens with a stop_reason of "abort".
-        """
+    async def pause_generation(self) -> None:
+        """Abort outstanding requests and hold the EngineCore scheduler idle for weight reload."""
         engine = self._get_engine()
-        # Collect all request IDs currently tracked by the scheduler/output processor
-        unfinished_request_ids = list(engine.output_processor.request_states.keys())
-        if unfinished_request_ids:
-            # DRAIN the engine to idle before returning. The caller (weight sync) then moves model
-            # params onto the `meta` device (vLLM layerwise reload); a decode that steps after this
-            # returns would hit `_C::rms_norm` on a meta tensor -> EngineCore crash (enforce_eager)
-            # or a freed-buffer read (cudagraph). engine.abort() -> output_processor.abort_requests()
-            # DIRECTLY pops request_states, so we LOOP (re-snapshot -> re-abort) until idle: a one-shot
-            # abort stalled because stragglers / late arrivals landed after the first snapshot and were
-            # never aborted (the 60s-timeout teardown hit at the 35B weight sync). Re-aborting each
-            # iteration converges. NON-FATAL on the (now-unlikely) 600s deadline: log loudly + proceed
-            # rather than tear down a multi-hour job -- a residual straggler is masked by cudagraph, and
-            # a genuine 600s wedge is already a lost engine that teardown would not recover.
-            drain_deadline = time.monotonic() + 600.0
-            while engine.output_processor.has_unfinished_requests():
-                straggler_ids = list(engine.output_processor.request_states.keys())
-                if straggler_ids:
-                    await engine.abort(straggler_ids)
-                if time.monotonic() > drain_deadline:
-                    logger.warning(
-                        "abort_generation: %d requests still unfinished after 600s of draining; "
-                        "proceeding with the weight reload anyway (wedged engine, not a normal drain).",
-                        len(engine.output_processor.request_states),
-                    )
-                    break
-                await asyncio.sleep(0.02)
-        await engine.reset_prefix_cache()  # avoid KV-cache pollution
-        logger.info(f"abort_generation() finished, aborted {len(unfinished_request_ids)} requests")
+        outstanding_requests = len(engine.output_processor.request_states)
+        # vLLM's scheduler-level pause is a utility RPC into EngineCore. In abort
+        # mode it aborts running/waiting requests, waits for the scheduler to reach
+        # its paused state, and clears the KV/prefix cache before returning. Unlike
+        # AsyncLLM.abort(), it cannot report success merely because the frontend
+        # output_processor already removed the request IDs.
+        await engine.pause_generation(mode="abort", clear_cache=True)
+        logger.info(f"pause_generation() finished, aborted {outstanding_requests} requests and paused EngineCore")
+
+    async def resume_generation(self) -> None:
+        """Release the EngineCore scheduler after the weight reload completes."""
+        await self._get_engine().resume_generation()
+        logger.info("resume_generation() finished, EngineCore scheduler released")
 
 
 class _MinimalRequest:
@@ -2252,6 +3762,12 @@ class VLLMWeightTransferReceiver:
         self.model_config = model_config
         self.device = device
 
+    def _is_fp32_grug_router_bias(self, name: str, dtype: torch.dtype) -> bool:
+        hf_config = getattr(self.model_config, "hf_text_config", None)
+        if hf_config is None:
+            hf_config = getattr(self.model_config, "hf_config", None)
+        return is_grug_router_bias(getattr(hf_config, "model_type", None), name) and dtype == torch.float32
+
     def receive_weights(self, request: NamedWeightsUpdateRequest) -> Iterator[Tuple[str, torch.Tensor]]:
         """Receive weights and yield (name, tensor) tuples.
 
@@ -2268,12 +3784,10 @@ class VLLMWeightTransferReceiver:
 
     def _receive_broadcast(self, request: NamedWeightsUpdateRequest) -> Iterator[Tuple[str, torch.Tensor]]:
         """Receive weights via torch.distributed.broadcast."""
-        import os
-
-        _fuse = os.environ.get("SKYRL_FUSE_WEIGHTS", "0") == "1"
+        _fuse = bool(request.get("packed", False))
         for name, dtype_str, shape in zip(request["names"], request["dtypes"], request["shapes"]):
             dtype = str_to_torch_dtype(dtype_str)
-            if not _fuse:
+            if not _fuse and not self._is_fp32_grug_router_bias(name, dtype):
                 assert dtype == self.model_config.dtype, f"mismatch dtype: src {dtype}, dst {self.model_config.dtype}"
             # Always receive in sender's dtype, load_weights handles conversion
             weight = torch.empty(shape, dtype=dtype, device="cuda")
@@ -2319,7 +3833,10 @@ class VLLMWeightTransferReceiver:
             physical_gpu_id = str(props.uuid)
             for name, dtype_str, shape, ipc_handle in zip(names, dtypes, shapes, ipc_handles):
                 dtype = str_to_torch_dtype(dtype_str)
-                assert dtype == self.model_config.dtype, f"mismatch dtype: src {dtype}, dst {self.model_config.dtype}"
+                if not self._is_fp32_grug_router_bias(name, dtype):
+                    assert dtype == self.model_config.dtype, (
+                        f"mismatch dtype: src {dtype}, dst {self.model_config.dtype}"
+                    )
 
                 handle = ipc_handle[physical_gpu_id]
                 device_id = self.device.index

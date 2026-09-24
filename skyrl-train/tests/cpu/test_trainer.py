@@ -1,24 +1,55 @@
 """
-uv  run --isolated --extra dev pytest tests/cpu/test_trainer.py
+uv  run --isolated --group dev --extra cpu pytest tests/cpu/test_trainer.py
 """
+
+import contextlib
+import asyncio
+import gc
+import weakref
+from types import SimpleNamespace
 
 import torch
 import pytest
 from jaxtyping import Float, Integer
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from pytest import approx
 from unittest.mock import MagicMock, patch
 
 
 from skyrl_train.distributed.dispatch import MeshRank
+from skyrl_train.group_admission import GroupAdvantageInvariant
+import skyrl_train.trainer as trainer_module
 from skyrl_train.trainer import RayPPOTrainer
-from skyrl_train.training_batch import TrainingInputBatch
+from skyrl_train.utils.trainer_utils import ResumeMode
+from skyrl_train.utils.policy_losses import ppo_policy_loss
+from skyrl_train.training_batch import TrainingBatchIterator, TrainingInputBatch, TrainingOutputBatch
+from skyrl_train.models.grug_moe import GrugMoeForCausalLM
+from skyrl_train.model_wrapper import HFModelWrapper
+from skyrl_train.models.grug_query_bias import (
+    GrugLossFreeBiasAccumulator,
+    GrugLossFreeBiasUpdater,
+    GrugQuantileBiasUpdater,
+    GrugQueryBiasCapturePlan,
+    GrugQueryBiasShardLayout,
+    GrugQueryBiasWindow,
+    next_loss_free_query_bias,
+    next_query_bias,
+)
 import numpy as np
-from skyrl_train.workers.worker import PolicyWorkerBase, CriticWorkerBase
-from skyrl_train.workers.worker_utils import BatchIterator
+from skyrl_train.workers.worker import CriticWorkerBase, PolicyWorkerBase
 from skyrl_train.utils.utils import validate_batch_sizes
 from skyrl_train.config.utils import get_default_config
 from tests.cpu.util import example_dummy_config
+from tests.grug_training_parity import ORACLE_FIXTURE_DIR
+
+
+_TEST_PROGRESS_CONFIG = {
+    "mode": "tqdm",
+    "min_interval_seconds": 0.5,
+    "heartbeat_seconds": 15,
+    "percent_step": 5,
+    "count_step": 1000,
+}
 
 
 @pytest.fixture
@@ -35,6 +66,165 @@ class DummyDataset:
 
     def collate_fn(self, batch):
         return batch
+
+
+class _CapturingPolicyGroup:
+    def __init__(self):
+        self.actor_infos = [SimpleNamespace(rank=SimpleNamespace(dp_size=2)) for _ in range(4)]
+        self.training_batch = None
+
+    def async_run_ray_method(self, dispatch_type, method_name, *args):
+        del dispatch_type
+        if method_name == "ppo_train":
+            self.training_batch = args[0]
+            return [object()]
+        if method_name == "empty_cache":
+            return []
+        raise AssertionError(f"Unexpected policy method: {method_name}")
+
+
+class _ResidencyPolicyGroup:
+    def __init__(self):
+        self.model_on_gpu = False
+        self.optimizer_on_gpu = False
+
+    def backload_to_gpu(self, backload_optimizer=True, backload_model=True):
+        self.optimizer_on_gpu |= backload_optimizer
+        self.model_on_gpu |= backload_model
+
+    def offload_to_cpu(self, offload_optimizer=True, offload_model=True):
+        if offload_optimizer:
+            self.optimizer_on_gpu = False
+        if offload_model:
+            self.model_on_gpu = False
+
+
+class _ResidencyInferenceClient:
+    def __init__(self):
+        self.awake = True
+        self.wake_tags = []
+
+    async def sleep(self):
+        self.awake = False
+
+    async def wake_up(self, tags):
+        self.wake_tags.append(tags)
+        self.awake = True
+
+
+@pytest.mark.parametrize("save_error", [None, RuntimeError("storage of size 0")])
+def test_colocated_checkpoint_temporarily_backloads_policy_and_restores_rollout_residency(save_error, monkeypatch):
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.colocate_all = True
+    trainer.policy_model = _ResidencyPolicyGroup()
+    trainer.inference_engine_client = _ResidencyInferenceClient()
+    trainer.sync_policy_weights_to_inference_engines = lambda: []
+    trainer.all_timings = {}
+    monkeypatch.setattr(trainer_module.ray, "get", lambda refs: refs)
+    save_observations = []
+
+    def save_checkpoints():
+        save_observations.append(
+            (
+                trainer.policy_model.model_on_gpu,
+                trainer.policy_model.optimizer_on_gpu,
+                trainer.inference_engine_client.awake,
+            )
+        )
+        if save_error is not None:
+            raise save_error
+
+    trainer.save_checkpoints = save_checkpoints
+
+    if save_error is None:
+        asyncio.run(trainer._save_checkpoints_with_residency())
+    else:
+        with pytest.raises(RuntimeError, match="storage of size 0"):
+            asyncio.run(trainer._save_checkpoints_with_residency())
+
+    assert save_observations == [(True, True, False)]
+    assert not trainer.policy_model.model_on_gpu
+    assert not trainer.policy_model.optimizer_on_gpu
+    assert trainer.inference_engine_client.awake
+    assert trainer.inference_engine_client.wake_tags == [["weights"], ["kv_cache"]]
+
+
+def test_intermediate_checkpoint_failure_is_recorded_and_later_save_can_succeed():
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.all_metrics = {}
+    trainer.all_timings = {}
+    trainer._checkpoint_save_failures = 0.0
+    attempts = 0
+    saved_steps = []
+
+    async def save_with_residency():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("AccessDenied")
+
+    async def call_event_async(event, state, control, **_kwargs):
+        assert event == "on_save"
+        saved_steps.append(state.global_step)
+        return control
+
+    trainer._save_checkpoints_with_residency = save_with_residency
+    trainer.callback_handler = SimpleNamespace(call_event_async=call_event_async)
+    trainer._control = SimpleNamespace()
+    state = SimpleNamespace(global_step=6)
+
+    asyncio.run(trainer._save_intermediate_checkpoint(state))
+    assert trainer.all_metrics["trainer/checkpoint_save_failures"] == 1.0
+    asyncio.run(trainer._save_intermediate_checkpoint(state))
+    assert saved_steps == [6]
+
+
+def test_intermediate_checkpoint_does_not_suppress_non_storage_failure():
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.all_metrics = {}
+    trainer.all_timings = {}
+    trainer._checkpoint_save_failures = 0.0
+
+    async def fail_save():
+        raise ValueError("invalid checkpoint state")
+
+    trainer._save_checkpoints_with_residency = fail_save
+    state = SimpleNamespace(global_step=6)
+
+    with pytest.raises(ValueError, match="invalid checkpoint state"):
+        asyncio.run(trainer._save_intermediate_checkpoint(state))
+
+    assert trainer.all_metrics == {}
+
+
+def test_sync_trainer_attaches_global_loss_denominator_before_dispatch(monkeypatch):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = OmegaConf.create(
+        {
+            "trainer": {
+                "algorithm": {"loss_reduction": "seq_mean_token_sum_norm_global", "max_seq_len": 8},
+                "token_stats": {"enabled": False},
+            }
+        }
+    )
+    trainer.global_step = 3
+    trainer.all_metrics = {}
+    trainer.all_timings = {}
+    trainer.colocate_all = False
+    trainer.critic_model = None
+    trainer.policy_model = _CapturingPolicyGroup()
+
+    status = TrainingOutputBatch()
+    status.metadata = {"train_status": {}}
+    monkeypatch.setattr(trainer_module, "collect_actor_results", lambda *args, **kwargs: [status])
+    monkeypatch.setattr(trainer_module.ray, "get", lambda refs: refs)
+
+    batch = TrainingInputBatch({"advantages": torch.tensor([[1.0, 0.0], [0.0, 2.0]])})
+    batch.metadata = {}
+
+    trainer.train_critic_and_policy(batch)
+
+    assert trainer.policy_model.training_batch.metadata["global_loss_denom"] == 32.0
 
 
 @pytest.fixture
@@ -60,8 +250,243 @@ def dummy_tokenizer():
 
 
 @pytest.fixture
-def dummy_generator():
+def dummy_trajectory_runner():
     return MagicMock()
+
+
+class _ObservableGrugCausalLM(GrugMoeForCausalLM):
+    def __init__(self):
+        self.config = SimpleNamespace(
+            num_experts_per_tok=2,
+            num_local_experts=4,
+            num_hidden_layers=1,
+        )
+        self.query_bias = torch.tensor([[3.0, -3.0]])
+
+    def set_query_bias(self, query_bias):
+        self.query_bias = query_bias.clone()
+
+    def get_query_bias(self):
+        return self.query_bias.clone()
+
+
+class _FixedQueryBiasAccumulator:
+    def __init__(self, betas):
+        self.betas = betas
+
+    def finalize_betas(self):
+        return self.betas
+
+
+class _FixedExpertLoadAccumulator:
+    def __init__(self, loads):
+        self.loads = loads
+
+    def finalize_loads(self):
+        return self.loads
+
+
+def _window_with_grug_query_bias_accumulator(accumulator, *, target_weight=1.0):
+    causal_lm = _ObservableGrugCausalLM()
+    shard_layout = GrugQueryBiasShardLayout(micro_batch_size=1, accumulation_steps=1, ep_size=1, ep_rank=0)
+    capture_plan = GrugQueryBiasCapturePlan.build(torch.ones((1, 1)), shard_layout)
+    updater = GrugQuantileBiasUpdater(causal_lm, valid_tokens=1, target_weight=target_weight)
+    updater.accumulator = accumulator
+    window = GrugQueryBiasWindow(causal_lm, capture_plan, updater)
+    return window, causal_lm
+
+
+def _window_with_grug_loss_free_accumulator(accumulator, *, update_rate=0.001):
+    causal_lm = _ObservableGrugCausalLM()
+    shard_layout = GrugQueryBiasShardLayout(micro_batch_size=1, accumulation_steps=1, ep_size=1, ep_rank=0)
+    capture_plan = GrugQueryBiasCapturePlan.build(torch.ones((1, 1)), shard_layout)
+    updater = GrugLossFreeBiasUpdater(causal_lm, update_rate=update_rate)
+    updater.accumulator = accumulator
+    window = GrugQueryBiasWindow(causal_lm, capture_plan, updater)
+    return window, causal_lm
+
+
+def _grug_ppo_worker_and_batch(
+    cfg: DictConfig,
+    causal_lm: GrugMoeForCausalLM,
+    sequences: torch.Tensor,
+) -> tuple[PolicyWorkerBase, TrainingInputBatch]:
+    batch_size = sequences.shape[0]
+    batch = TrainingInputBatch(
+        {
+            "sequences": sequences,
+            "attention_mask": torch.ones_like(sequences),
+            "action_log_probs": torch.zeros(batch_size, 2),
+            "base_action_log_probs": torch.zeros(batch_size, 2),
+            "values": torch.zeros(batch_size, 2),
+            "returns": torch.zeros(batch_size, 2),
+            "advantages": torch.ones(batch_size, 2),
+            "loss_mask": torch.ones(batch_size, 2),
+            "response_mask": torch.ones(batch_size, 2),
+            "rollout_logprobs": None,
+        }
+    )
+    batch.metadata = {"global_step": 0, "response_length": 2}
+
+    worker = PolicyWorkerBase(
+        cfg=cfg,
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        master_addr="localhost",
+        master_port=12345,
+        sequence_parallel_size=1,
+    )
+    worker.strategy = MagicMock(fsdp_strategy="fsdp2")
+    worker.strategy.is_rank_0.return_value = False
+    worker.strategy.all_reduce.side_effect = lambda status: status
+    worker.model = SimpleNamespace(model=causal_lm)
+    return worker, batch
+
+
+def _run_grug_ppo_train(worker: PolicyWorkerBase, batch: TrainingInputBatch) -> None:
+    with (
+        patch("torch.cuda.empty_cache"),
+        patch("torch.cuda.current_device", return_value="cpu"),
+        patch("torch.autocast", side_effect=lambda *args, **kwargs: contextlib.nullcontext()),
+        patch("torch.distributed.barrier"),
+        patch("tqdm.tqdm", side_effect=lambda iterator, **kwargs: iterator),
+    ):
+        worker.ppo_train(batch)
+
+
+class _CpuPolicyStrategy:
+    """Exercise the policy worker while replacing only its distributed/CUDA adapter."""
+
+    device_mesh = None
+    ep_size = 1
+    last_optimizer_step_succeeded = True
+
+    def is_rank_0(self):
+        return False
+
+    def all_reduce(self, value, op="mean"):
+        return value
+
+    def backward(self, loss, model, optimizer):
+        loss.backward()
+
+    def optimizer_step(self, optimizer, model, scheduler, **kwargs):
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        return torch.tensor(0.0)
+
+
+def _enable_cpu_policy_training(worker: PolicyWorkerBase, causal_lm: GrugMoeForCausalLM) -> None:
+    worker.model = HFModelWrapper(causal_lm, bf16=False, training_strategy="fsdp2")
+    worker.strategy = _CpuPolicyStrategy()
+    worker.optimizer = torch.optim.AdamW(worker.model.parameters(), lr=1e-4)
+    worker.scheduler = torch.optim.lr_scheduler.LambdaLR(worker.optimizer, lambda _: 1.0)
+
+
+def test_failed_optimizer_step_discards_grug_query_bias_window():
+    accumulator = _FixedQueryBiasAccumulator(torch.tensor([[1.0, -2.0]]))
+    window, causal_lm = _window_with_grug_query_bias_accumulator(accumulator)
+    previous_bias = causal_lm.query_bias.clone()
+
+    window.finish(optimizer_step_succeeded=False)
+    window.finish(optimizer_step_succeeded=True)
+
+    torch.testing.assert_close(causal_lm.query_bias, previous_bias)
+
+
+def test_successful_step_applies_grug_query_bias_once():
+    betas = torch.tensor([[1.0, -2.0]])
+    accumulator = _FixedQueryBiasAccumulator(betas)
+    window, causal_lm = _window_with_grug_query_bias_accumulator(accumulator)
+
+    window.finish(optimizer_step_succeeded=True)
+
+    torch.testing.assert_close(causal_lm.query_bias, next_query_bias(betas))
+    causal_lm.query_bias.fill_(17)
+    window.finish(optimizer_step_succeeded=True)
+    torch.testing.assert_close(causal_lm.query_bias, torch.full_like(causal_lm.query_bias, 17))
+
+
+def test_successful_step_interpolates_toward_grug_query_bias_target():
+    betas = torch.tensor([[1.0, -2.0]])
+    accumulator = _FixedQueryBiasAccumulator(betas)
+    window, causal_lm = _window_with_grug_query_bias_accumulator(accumulator, target_weight=0.25)
+    previous_bias = causal_lm.query_bias.clone()
+
+    window.finish(optimizer_step_succeeded=True)
+
+    expected = torch.lerp(previous_bias, next_query_bias(betas), 0.25)
+    torch.testing.assert_close(causal_lm.query_bias, expected)
+
+
+def test_successful_step_moves_grug_query_bias_target_to_buffer_device():
+    accumulator = _FixedQueryBiasAccumulator(torch.tensor([[1.0, -2.0]]))
+    window, causal_lm = _window_with_grug_query_bias_accumulator(accumulator, target_weight=0.25)
+    causal_lm.query_bias = causal_lm.query_bias.to("meta")
+
+    window.finish(optimizer_step_succeeded=True)
+
+    assert causal_lm.query_bias.device.type == "meta"
+
+
+@pytest.mark.parametrize("optimizer_step_succeeded", [False, True])
+def test_loss_free_bias_updates_only_after_successful_optimizer_step(optimizer_step_succeeded):
+    loads = torch.tensor([[3.0, 1.0]])
+    accumulator = _FixedExpertLoadAccumulator(loads)
+    window, causal_lm = _window_with_grug_loss_free_accumulator(accumulator)
+    previous_bias = causal_lm.query_bias.clone()
+
+    window.finish(optimizer_step_succeeded=optimizer_step_succeeded)
+
+    expected = (
+        next_loss_free_query_bias(previous_bias, loads, update_rate=0.001)
+        if optimizer_step_succeeded
+        else previous_bias
+    )
+    torch.testing.assert_close(causal_lm.query_bias, expected)
+
+
+def test_grug_query_bias_virtual_shards_partition_optimizer_window():
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 0],
+            [1, 0, 0],
+            [1, 1, 1],
+            [0, 1, 1],
+        ]
+    )
+    microbatches = attention_mask.split(2)
+
+    rank_masks = []
+    for ep_rank in range(2):
+        shard_layout = GrugQueryBiasShardLayout(
+            micro_batch_size=2,
+            accumulation_steps=2,
+            ep_size=2,
+            ep_rank=ep_rank,
+        )
+        capture_plan = GrugQueryBiasCapturePlan.build(attention_mask, shard_layout)
+        assert capture_plan.valid_token_counts == ((3, 0), (0, 5))[ep_rank]
+        rank_masks.append(
+            torch.cat([shard_layout.mask_for(mask, local_step) for local_step, mask in enumerate(microbatches)])
+        )
+
+    torch.testing.assert_close(rank_masks[0].logical_xor(rank_masks[1]), attention_mask.bool())
+    assert not torch.logical_and(rank_masks[0], rank_masks[1]).any()
+    assert rank_masks[0].sum().item() == 3
+    assert rank_masks[1].sum().item() == 5
+    single_rank_layout = GrugQueryBiasShardLayout(
+        micro_batch_size=4,
+        accumulation_steps=1,
+        ep_size=1,
+        ep_rank=0,
+    )
+    torch.testing.assert_close(
+        single_rank_layout.mask_for(attention_mask, local_step=0),
+        attention_mask.bool(),
+    )
 
 
 def _get_test_data(trainer: RayPPOTrainer):
@@ -116,7 +541,37 @@ def _get_test_data(trainer: RayPPOTrainer):
     return data
 
 
-def test_calculate_kl_create_experience_batched(dummy_config):
+def test_load_checkpoints_preserves_cloud_resume_uri(dummy_config):
+    resume_path = "s3://marin-us-east-02a/iris/test/checkpoints/global_step_12"
+    dummy_config.trainer.resume_path = resume_path
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = dummy_config
+    trainer.resume_mode = ResumeMode.FROM_PATH
+
+    with patch("skyrl_train.trainer.io.exists", return_value=False) as exists:
+        with pytest.raises(FileNotFoundError, match="Checkpoint path not found"):
+            trainer.load_checkpoints()
+
+    exists.assert_called_once_with(resume_path)
+
+
+def test_load_checkpoints_accepts_trailing_slash_resume_path(dummy_config):
+    resume_path = "s3://marin-us-east-02a/iris/test/checkpoints/global_step_12/"
+    dummy_config.trainer.resume_path = resume_path
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = dummy_config
+    trainer.resume_mode = ResumeMode.FROM_PATH
+
+    with patch("skyrl_train.trainer.io.exists", return_value=False) as exists:
+        with pytest.raises(FileNotFoundError, match="Checkpoint path not found"):
+            trainer.load_checkpoints()
+
+    exists.assert_called_once_with(resume_path.rstrip("/"))
+
+
+def test_calculate_kl_create_experience_batched(dummy_config, dummy_trajectory_runner):
     trainer = RayPPOTrainer(
         cfg=dummy_config,
         tracker=None,
@@ -124,7 +579,7 @@ def test_calculate_kl_create_experience_batched(dummy_config):
         train_dataset=DummyDataset(),
         eval_dataset=DummyDataset(),
         inference_engine_client=None,
-        generator=dummy_generator,
+        trajectory_runner=dummy_trajectory_runner,
     )
     data = _get_test_data(trainer)
     # Assertions
@@ -134,8 +589,8 @@ def test_calculate_kl_create_experience_batched(dummy_config):
     assert metrics["avg_kl"] == approx(0.1249, abs=1e-4)
 
 
-@patch("skyrl_train.utils.ppo_utils.compute_advantages_and_returns", new_callable=MagicMock)
-def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config):
+@patch("skyrl_train.trainer.compute_advantages_and_returns", new_callable=MagicMock)
+def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config, dummy_trajectory_runner):
     trainer = RayPPOTrainer(
         cfg=dummy_config,
         tracker=None,
@@ -143,7 +598,7 @@ def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config):
         train_dataset=DummyDataset(),
         eval_dataset=DummyDataset(),
         inference_engine_client=None,
-        generator=dummy_generator,
+        trajectory_runner=dummy_trajectory_runner,
     )
     data = _get_test_data(trainer)
 
@@ -167,6 +622,94 @@ def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config):
     assert "avg_advantages_abs" in metrics
     assert metrics["avg_advantages"] == approx(
         torch.masked_select(mock_advantages, data["response_mask"].bool()).mean().item(), rel=1e-5
+    )
+
+
+@pytest.mark.parametrize(
+    ("loss_reduction", "expected_policy_loss"),
+    [("token_mean", 0.05), ("sequence_mean", 0.04375)],
+)
+def test_grpo_loop_credit_is_token_local_when_every_group_member_has_the_same_outcome(
+    loss_reduction, expected_policy_loss
+):
+    response_length = 48
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = OmegaConf.create(
+        {
+            "trainer": {
+                "step_wise_training": False,
+                "algorithm": {
+                    "advantage_estimator": "grpo",
+                    "gamma": 1.0,
+                    "lambd": 1.0,
+                    "grpo_norm_by_std": True,
+                    "policy_loss_type": "regular",
+                    "loss_reduction": loss_reduction,
+                    "eps_clip_low": 0.2,
+                    "eps_clip_high": 0.2,
+                    "use_tis": False,
+                    "max_seq_len": response_length,
+                },
+            }
+        }
+    )
+    trainer.group_advantage_invariant = GroupAdvantageInvariant.exact_physical(physical_group_size=4)
+    trainer.all_metrics = {}
+    loop_start = 18
+    response_mask = torch.ones(4, response_length)
+    response_mask[2:, 24:] = 0
+    loop_advantages = torch.zeros(4, response_length)
+    loop_advantages[:, loop_start:] = -0.1
+    loop_advantages *= response_mask
+    data = TrainingInputBatch(
+        {
+            "rewards": torch.zeros(4, response_length),
+            "response_mask": response_mask,
+            "values": None,
+            "loop_advantages": loop_advantages,
+        }
+    )
+    data.metadata = {
+        "uids": ["same-group"] * 4,
+        "avg_response_length": float(response_length),
+    }
+
+    result = trainer.compute_advantages_and_returns(data)
+    result = trainer_module.normalize_advantages_dict(result)
+    result = trainer.apply_loop_advantages(result)
+
+    assert torch.equal(result["advantages"], loop_advantages)
+    assert torch.equal(result["returns"], torch.zeros(4, response_length))
+    policy_loss, _ = ppo_policy_loss(
+        torch.zeros_like(loop_advantages),
+        torch.zeros_like(loop_advantages),
+        result["advantages"],
+        config=trainer.cfg.trainer.algorithm,
+        loss_mask=response_mask,
+    )
+    assert policy_loss.item() == pytest.approx(expected_policy_loss)
+
+
+def test_loop_advantages_are_collated_with_response_tokens(dummy_config, dummy_tokenizer):
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = dummy_config
+    trainer.group_advantage_invariant = GroupAdvantageInvariant.no_group_advantage(physical_group_size=1)
+    trainer.tokenizer = dummy_tokenizer
+    trainer.pad_batch = lambda batch: batch
+    trajectory_batch = {
+        "prompt_token_ids": [[1, 2], [3]],
+        "response_ids": [[4, 5, 6], [7]],
+        "rewards": [[0.0, 0.0, 0.0], [0.0]],
+        "loss_masks": [[1, 1, 1], [1]],
+        "rollout_logprobs": None,
+        "loop_advantages": [[0.0, -0.1, -0.1], [-0.2]],
+    }
+
+    batch = trainer.convert_to_training_input(trajectory_batch, ["a", "b"])
+
+    torch.testing.assert_close(
+        batch["loop_advantages"],
+        torch.tensor([[0.0, -0.1, -0.1], [-0.2, 0.0, 0.0]]),
     )
 
 
@@ -207,10 +750,12 @@ def test_normalize_mini_batch_size():
         cfg = OmegaConf.create(
             {
                 "trainer": {
+                    "progress": _TEST_PROGRESS_CONFIG,
                     "train_batch_size": train_batch_size,
                     "policy_mini_batch_size": policy_mini_batch_size,
                     "micro_train_batch_size_per_gpu": micro_train_batch_size_per_gpu,
                     "algorithm": {
+                        "batch_invariant": False,
                         "policy_loss_type": "regular",
                     },
                 },
@@ -242,9 +787,11 @@ def test_normalize_mini_batch_size():
         cfg = OmegaConf.create(
             {
                 "trainer": {
+                    "progress": _TEST_PROGRESS_CONFIG,
                     "train_batch_size": train_batch_size,
                     "critic_mini_batch_size": critic_mini_batch_size,
                     "micro_train_batch_size_per_gpu": micro_train_batch_size_per_gpu,
+                    "algorithm": {"batch_invariant": False},
                 },
                 "generator": {
                     "n_samples_per_prompt": n_samples_per_prompt,
@@ -510,13 +1057,22 @@ def test_ppo_train_batch_calculations():
     cfg = OmegaConf.create(
         {
             "trainer": {
+                "progress": _TEST_PROGRESS_CONFIG,
                 "micro_train_batch_size_per_gpu": 2,
                 "update_epochs_per_batch": 1,
+                "token_stats": {"enabled": False},
+                "policy": {
+                    "grug_query_bias_update_mode": "frozen",
+                    "optimizer_config": {"max_grad_norm": 1.0},
+                },
                 "algorithm": {
+                    "batch_invariant": False,
                     "policy_loss_type": "regular",
+                    "loss_reduction": "token_mean",
                 },
             },
             "generator": {
+                "r3_transport": "decentral",
                 "sampling_params": {
                     "temperature": 1.0,
                 },
@@ -563,7 +1119,7 @@ def test_ppo_train_batch_calculations():
         # Mock dependencies
         worker.strategy = MagicMock()
         worker.strategy.is_rank_0.return_value = False  # Disable progress bars
-        worker.strategy.all_reduce.return_value = {"loss": 0.5, "lr": 1e-4}
+        worker.strategy.all_reduce.side_effect = lambda status, *args, **kwargs: status
 
         # Always set model for all worker types (policy/critic need this for ppo_train)
         worker.model = MagicMock()
@@ -578,14 +1134,17 @@ def test_ppo_train_batch_calculations():
 
     def mock_policy_training_step(experience, global_step, local_step, accumulation_steps):
         policy_training_calls.append({"local_step": local_step, "accumulation_steps": accumulation_steps})
-        return {"policy_loss": 0.5, "policy_lr": 1e-4, "entropy": 2.0}
+        return {
+            "policy_loss": 0.5,
+            "policy_lr": 1e-4,
+            "policy_entropy": 2.0,
+            "response_length": response_length,
+        }
 
     policy_worker.training_step = mock_policy_training_step
 
     # Calculate expected values based on new accumulation logic
-    dataloader = BatchIterator(
-        dummy_databatch, sample_batch_size=cfg.trainer.micro_train_batch_size_per_gpu, drop_last=False
-    )
+    dataloader = TrainingBatchIterator(dummy_databatch, cfg.trainer.micro_train_batch_size_per_gpu)
     total_micro_batches = len(dataloader)  # Should be 6
     micro_batches_per_mini_batch = (
         policy_worker.policy_mini_batch_size_per_gpu // cfg.trainer.micro_train_batch_size_per_gpu
@@ -668,6 +1227,162 @@ def test_ppo_train_batch_calculations():
     train_status = result.metadata["train_status"]
     assert "critic_update_steps" in train_status
     assert train_status["critic_update_steps"] == len(critic_training_calls) / expected_accumulation_steps
+
+
+def test_grug_ppo_train_does_not_retain_consumed_microbatches():
+    """The policy releases each consumed Experience before loading the next one."""
+
+    cfg = OmegaConf.create(
+        {
+            "trainer": {
+                "progress": _TEST_PROGRESS_CONFIG,
+                "micro_train_batch_size_per_gpu": 1,
+                "update_epochs_per_batch": 1,
+                "token_stats": {"enabled": False},
+                "policy": {
+                    "grug_query_bias_update_mode": "frozen",
+                    "optimizer_config": {"max_grad_norm": 1.0},
+                },
+                "algorithm": {
+                    "batch_invariant": False,
+                    "policy_loss_type": "regular",
+                    "loss_reduction": "token_mean",
+                },
+            },
+            "generator": {"r3_transport": "decentral", "sampling_params": {"temperature": 1.0}},
+        }
+    )
+    worker, batch = _grug_ppo_worker_and_batch(
+        cfg,
+        _ObservableGrugCausalLM(),
+        torch.ones(4, 4, dtype=torch.long),
+    )
+    worker.policy_mini_batch_size_per_gpu = 2
+    worker.strategy.ep_size = 1
+    previous_experience = None
+    prior_microbatch_was_released = []
+
+    def training_step(experience, _global_step, _local_step, _accumulation_steps):
+        nonlocal previous_experience
+        if previous_experience is not None:
+            gc.collect()
+            prior_microbatch_was_released.append(previous_experience() is None)
+        previous_experience = weakref.ref(experience)
+        return {"policy_loss": 0.5, "policy_lr": 1e-4, "policy_entropy": 0.1, "response_length": 2}
+
+    worker.training_step = training_step
+    _run_grug_ppo_train(worker, batch)
+
+    assert prior_microbatch_was_released == [True, True, True]
+
+
+def test_default_grug_ppo_train_keeps_query_bias_exact_across_optimizer_steps():
+    causal_lm = GrugMoeForCausalLM.from_pretrained(
+        ORACLE_FIXTURE_DIR,
+        local_files_only=True,
+        attn_implementation="eager",
+        dtype=torch.float32,
+    )
+    causal_lm.train()
+    frozen_bias = torch.linspace(
+        -0.3,
+        0.3,
+        steps=causal_lm.config.num_hidden_layers * causal_lm.config.num_local_experts,
+    ).reshape(causal_lm.config.num_hidden_layers, causal_lm.config.num_local_experts)
+    frozen_bias -= frozen_bias.mean(dim=-1, keepdim=True)
+    causal_lm.set_query_bias(frozen_bias)
+
+    cfg = get_default_config()
+    cfg.trainer.micro_train_batch_size_per_gpu = 1
+    cfg.trainer.update_epochs_per_batch = 1
+    cfg.trainer.algorithm.loss_reduction = "token_mean"
+    OmegaConf.update(cfg, "trainer.algorithm.max_seq_len", 6, force_add=True)
+    batch_size = 5
+    sequences = torch.arange(batch_size * 6).reshape(batch_size, 6) % causal_lm.config.vocab_size
+    worker, batch = _grug_ppo_worker_and_batch(
+        cfg,
+        causal_lm,
+        sequences,
+    )
+    worker.policy_mini_batch_size_per_gpu = 1
+    _enable_cpu_policy_training(worker, causal_lm)
+    initial_bias = torch.stack([layer.mlp.router.bias for layer in causal_lm.model.layers]).clone()
+    initial_lm_head = causal_lm.lm_head.weight.detach().clone()
+    _run_grug_ppo_train(worker, batch)
+
+    actual_bias = torch.stack([layer.mlp.router.bias for layer in causal_lm.model.layers])
+    torch.testing.assert_close(actual_bias, initial_bias, rtol=0, atol=0)
+    assert not torch.equal(causal_lm.lm_head.weight, initial_lm_head)
+
+
+def _grug_query_bias_after_policy_training(mode, interpolation_weight=None, update_rate=None):
+    torch.manual_seed(1234)
+    causal_lm = GrugMoeForCausalLM.from_pretrained(
+        ORACLE_FIXTURE_DIR,
+        local_files_only=True,
+        attn_implementation="eager",
+        dtype=torch.float32,
+    )
+    causal_lm.train()
+    initial_bias = torch.stack([layer.mlp.router.bias for layer in causal_lm.model.layers]).clone()
+
+    cfg = get_default_config()
+    cfg.trainer.policy.grug_query_bias_update_mode = mode
+    cfg.trainer.policy.grug_query_bias_interpolation_weight = interpolation_weight
+    cfg.trainer.policy.grug_query_bias_update_rate = update_rate
+    cfg.trainer.micro_train_batch_size_per_gpu = 1
+    cfg.trainer.update_epochs_per_batch = 1
+    cfg.trainer.algorithm.loss_reduction = "token_mean"
+    OmegaConf.update(cfg, "trainer.algorithm.max_seq_len", 6, force_add=True)
+    sequences = torch.arange(6).reshape(1, 6) % causal_lm.config.vocab_size
+    expected_loss_free_bias = None
+    if mode == "loss_free":
+        attention_mask = torch.ones_like(sequences)
+        causal_lm.begin_loss_free_bias_capture(attention_mask)
+        with torch.no_grad():
+            causal_lm(sequences, attention_mask=attention_mask)
+        observation = causal_lm.take_loss_free_bias_observation()
+        accumulator = GrugLossFreeBiasAccumulator(
+            num_layers=causal_lm.config.num_hidden_layers,
+            num_experts=causal_lm.config.num_local_experts,
+        )
+        accumulator.observe(observation)
+        assert update_rate is not None
+        expected_loss_free_bias = next_loss_free_query_bias(
+            initial_bias,
+            accumulator.finalize_loads(),
+            update_rate=update_rate,
+        )
+    worker, batch = _grug_ppo_worker_and_batch(cfg, causal_lm, sequences)
+    worker.policy_mini_batch_size_per_gpu = 1
+    _enable_cpu_policy_training(worker, causal_lm)
+
+    _run_grug_ppo_train(worker, batch)
+
+    actual_bias = torch.stack([layer.mlp.router.bias for layer in causal_lm.model.layers])
+    return initial_bias, actual_bias, expected_loss_free_bias
+
+
+def test_replace_mode_updates_grug_query_bias_through_policy_training():
+    initial_bias, actual_bias, _ = _grug_query_bias_after_policy_training("replace")
+
+    assert not torch.equal(actual_bias, initial_bias)
+
+
+def test_interpolate_mode_applies_configured_fraction_through_policy_training():
+    replace_initial, replace_bias, _ = _grug_query_bias_after_policy_training("replace")
+    interpolate_initial, interpolate_bias, _ = _grug_query_bias_after_policy_training("interpolate", 0.25)
+
+    torch.testing.assert_close(interpolate_initial, replace_initial, rtol=0, atol=0)
+    torch.testing.assert_close(interpolate_bias, torch.lerp(replace_initial, replace_bias, 0.25), rtol=1e-6, atol=1e-7)
+
+
+def test_loss_free_mode_updates_grug_query_bias_through_policy_training():
+    initial_bias, actual_bias, expected_bias = _grug_query_bias_after_policy_training("loss_free", update_rate=0.001)
+
+    assert not torch.equal(actual_bias, initial_bias)
+    assert expected_bias is not None
+    torch.testing.assert_close(actual_bias, expected_bias, rtol=0, atol=0)
 
 
 def test_validate_batch_sizes_lcm_dp_requirement():

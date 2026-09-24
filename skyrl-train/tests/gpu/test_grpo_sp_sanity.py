@@ -1,5 +1,5 @@
 """
-uv run --isolated --extra vllm --extra dev -- pytest -s -vvv tests/gpu/test_grpo_sp_sanity.py
+uv run --isolated --extra vllm --group dev -- pytest -s -vvv tests/gpu/test_grpo_sp_sanity.py
 
 This is the Ulysses sequence-parallel (SP) sanity check: a full GRPO step at sp=2
 matches sp=1 within tol. The Context-Parallel (CP) counterpart — a full seeded
@@ -21,7 +21,7 @@ from skyrl_train.trainer import RayPPOTrainer
 import ray
 from tqdm import tqdm
 from skyrl_train.utils import Timer
-from skyrl_train.utils.ppo_utils import normalize_advantages_dict
+from skyrl_train.utils.policy_math import normalize_advantages_dict
 
 
 import asyncio
@@ -36,7 +36,7 @@ class TestExp(BasePPOExp):
         train_dataset,
         eval_dataset,
         inference_engine_client,
-        generator,
+        trajectory_runner,
         colocate_pg,
     ):
         return RayPPOTestTrainer(
@@ -46,7 +46,7 @@ class TestExp(BasePPOExp):
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             inference_engine_client=inference_engine_client,
-            generator=generator,
+            trajectory_runner=trajectory_runner,
             colocate_pg=colocate_pg,
         )
 

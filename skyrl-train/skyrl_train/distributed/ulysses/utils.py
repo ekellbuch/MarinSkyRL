@@ -164,7 +164,7 @@ def all_gather_tensor(local_tensor: Tensor, group: Optional[dist.ProcessGroup] =
     output_shape = list(local_tensor.shape)
     output_shape[0] = output_shape[0] * sp_world_size
     output = torch.empty(output_shape, dtype=local_tensor.dtype, device=local_tensor.device)
-    dist.all_gather_into_tensor(output, local_tensor, group=group, async_op=async_op)
+    dist.all_gather_into_tensor(output, local_tensor.contiguous(), group=group, async_op=async_op)
     return output
 
 

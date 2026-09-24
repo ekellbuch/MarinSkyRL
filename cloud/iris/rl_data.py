@@ -1,7 +1,7 @@
 """RL job data-staging + topology helpers for the Iris launcher.
 
 - ``resolve_rl_train_data``: extract HF task datasets to local task directories.
-- ``compute_num_inference_engines`` / ``derive_skyrl_export_path``: placement math.
+- ``compute_num_inference_engines``: placement math.
 - ``check_rl_environment``: locate an optional standalone RL venv.
 """
 
@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from cloud.iris.hf_datasets import is_hf_dataset_path
+from marinskyrl.resource_locator import is_hugging_face_repo_id
 
 
 def resolve_rl_train_data(
@@ -86,7 +86,7 @@ def resolve_rl_train_data(
     resolved_paths = []
 
     for data_path in train_data:
-        if is_hf_dataset_path(data_path):
+        if is_hugging_face_repo_id(data_path):
             repo_name = data_path.split("/")[-1]
             output_dir = tasks_base / repo_name
 
@@ -207,21 +207,12 @@ def compute_num_inference_engines(
     return total_gpus // tensor_parallel_size
 
 
-def derive_skyrl_export_path(
-    experiments_dir: str,
-    run_name: str,
-    exports_subdir: str = "exports",
-) -> str:
-    """Derive the SkyRL export path (``<experiments_dir>/<run_name>/<exports_subdir>``)."""
-    return str(Path(experiments_dir) / run_name / exports_subdir)
-
-
 def check_rl_environment() -> Optional[Path]:
     """Locate an optional standalone RL venv, or None.
 
     Checks ``$DCFT_RL_ENV``, ``$DCFT/envs/rl``, then ``<repo>/envs/rl``. Returns
     None when no such venv exists (the caller then uses ``sys.executable``, which
-    on Iris is already the gpu-rl image's RL venv python).
+    on Iris is already the frozen task venv's Python).
     """
     candidates = []
     if os.environ.get("DCFT_RL_ENV"):

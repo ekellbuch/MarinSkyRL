@@ -20,12 +20,9 @@ from skyrl_train.entrypoints.main_base import create_teacher_inference_engines_f
 from skyrl_train.distillation_trainer import DistillationTrainer
 from skyrl_train.training_batch import TrainingInputBatch
 from skyrl_train.utils import initialize_ray
-from skyrl_train.utils.ppo_utils import (
-    register_advantage_estimator,
-    register_policy_loss,
-    reduce_loss,
-    masked_mean,
-)
+from skyrl_train.utils.algorithm_registry import NoGroupAdvantage, register_advantage_estimator, register_policy_loss
+from skyrl_train.utils.loss_reduction import reduce_loss
+from skyrl_train.utils.policy_math import masked_mean
 import hydra
 
 
@@ -68,7 +65,7 @@ class OnPolicyDistillationLogitsTrainer(DistillationTrainer):
 
 
 # Reuse the no-op advantage estimator from the original example
-@register_advantage_estimator("no_op")
+@register_advantage_estimator("no_op", group_contract=NoGroupAdvantage())
 def compute_no_op_advantage(token_level_rewards: torch.Tensor, **kwargs):
     return token_level_rewards, token_level_rewards
 
@@ -79,7 +76,7 @@ def compute_importance_sampling_policy_loss(
 ):
     loss = -torch.exp(log_probs - old_log_probs) * advantages
     loss = reduce_loss(loss, loss_mask, "seq_mean_token_sum_norm", config.max_seq_len)
-    return loss, 0.0
+    return loss, {}
 
 
 class OnPolicyDistillationLogitsExp(BasePPOExp):

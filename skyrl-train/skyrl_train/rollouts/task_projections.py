@@ -26,7 +26,7 @@ from skyrl_train.trajectory_runners.projections import (
 )
 
 from skyrl_train.trajectory_runners.selected_topk import align_student_topk
-from skyrl_train.trajectory_runners.trajectory_processing import get_batch_failure_metrics
+from skyrl_train.trajectory_runners.trajectory_processing import classify_reward_groups, get_batch_failure_metrics
 from skyrl_train.trajectory_runners.types import AgentLoopOutput, TrajectoryBatch, TrajectoryRequestBatch
 from skyrl_train.utils.harbor_errors import (
     DEFAULT_ERROR_HANDLING_CONFIG,
@@ -285,6 +285,7 @@ class WholeTaskProjection:
                 outputs[index] = replace(outputs[index], env_metrics={})
         batch = self.projection.project(outputs, request)
         _merge_task_metrics(batch, rollouts, request)
+        _merge_reward_group_metrics(batch, outputs, request)
         return batch
 
 
@@ -306,6 +307,7 @@ class StepTaskProjection:
                 outputs[index] = [replace(output, env_metrics={}) for output in outputs[index]]
         batch = self.projection.project(outputs, request)
         _merge_task_metrics(batch, rollouts, request)
+        _merge_reward_group_metrics(batch, [steps[-1] for steps in outputs], request)
         return batch
 
 
@@ -358,6 +360,18 @@ def _merge_task_metrics(
             continue
         for key, value in rollout.metrics.items():
             metrics[key] = metrics.get(key, 0.0) + value
+
+
+def _merge_reward_group_metrics(
+    batch: TrajectoryBatch, outputs: Sequence[AgentLoopOutput], request: TrajectoryRequestBatch
+) -> None:
+    """Report reward-group composition from each trajectory's final output."""
+    trajectory_ids = request.get("trajectory_ids")
+    if trajectory_ids is None:
+        return
+    batch["rollout_metrics"].update(
+        classify_reward_groups(outputs, [trajectory_id.instance_id for trajectory_id in trajectory_ids])
+    )
 
 
 def _step_training_outputs(

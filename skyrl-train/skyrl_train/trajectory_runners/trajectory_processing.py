@@ -43,6 +43,19 @@ _NUM_TRIALS_METRIC = "generate/num_trials"
 _NUM_FAILED_INSTANCES_METRIC = "generate/num_failed_instances"
 _NUM_FAILED_TRAJECTORIES_METRIC = "generate/num_failed_trajectories"
 _NUM_MASKED_TRAJECTORIES_METRIC = "generate/num_masked_trajectories"
+REWARD_GROUP_METRIC_PREFIX = "generate/reward_groups/"
+_REWARD_GROUP_COUNTS = (
+    "groups",
+    "samples",
+    "graded_samples",
+    "ungraded_samples",
+    "agent_timeouts",
+    "truncated_samples",
+    "all_zero_groups",
+    "all_one_groups",
+    "nonconstant_groups",
+    "incomplete_groups",
+)
 
 
 class TitoFullDeclineReason(StrEnum):
@@ -479,6 +492,7 @@ def concatenate_trajectory_batches(
             )
 
     rollout_metrics.update(_merge_batch_failure_metrics(trajectory_batches))
+    rollout_metrics.update(_merge_reward_group_metrics(trajectory_batches))
 
     # Retention counts per group, and this rebuilds rollout_metrics from responses and rewards, so
     # the per-group counters have to be carried across or the archives are written unobserved.
@@ -680,6 +694,72 @@ def _merge_batch_failure_metrics(trajectory_batches: List[TrajectoryBatch]) -> d
     error_keys = {key for metrics in group_metrics for key in metrics if key.startswith(BATCH_ERROR_METRIC_PREFIX)}
     merged.update({key: sum(metrics.get(key, 0) for metrics in group_metrics) for key in error_keys})
     return merged
+
+
+def classify_reward_groups(outputs: Sequence[Any], instance_ids: Sequence[str]) -> Dict[str, float]:
+    """Describe the reward composition of every requested rollout group.
+
+    ``outputs`` holds one final trainer output per requested rollout, aligned with
+    ``instance_ids``. A member whose disposition excludes it from the baseline
+    (infrastructure or verifier failure) is ungraded, and a group with any ungraded
+    member is ``incomplete`` rather than unanimous, so a dead sandbox never reads as
+    an all-zero group. Under a group-baseline estimator only ``nonconstant`` groups
+    carry a learning signal.
+    """
+    groups: Dict[str, List[Any]] = defaultdict(list)
+    for instance_id, output in zip(instance_ids, outputs, strict=True):
+        groups[instance_id].append(output)
+
+    counts = dict.fromkeys(_REWARD_GROUP_COUNTS, 0)
+    counts["groups"] = len(groups)
+    counts["samples"] = len(outputs)
+    for members in groups.values():
+        rewards: List[float] = []
+        for output in members:
+            if output.disposition.exception_type == "AgentTimeoutError":
+                counts["agent_timeouts"] += 1
+            if output.evidence.stop_reason == "length":
+                counts["truncated_samples"] += 1
+            if output.disposition.baseline_eligible:
+                rewards.append(float(output.reward.optimization_reward))
+        counts["graded_samples"] += len(rewards)
+        counts["ungraded_samples"] += len(members) - len(rewards)
+        if len(rewards) < len(members):
+            counts["incomplete_groups"] += 1
+        elif all(reward > 0 for reward in rewards):
+            counts["all_one_groups"] += 1
+        elif all(reward <= 0 for reward in rewards):
+            counts["all_zero_groups"] += 1
+        else:
+            counts["nonconstant_groups"] += 1
+    return reward_group_metrics(counts)
+
+
+def reward_group_metrics(counts: Dict[str, float]) -> Dict[str, float]:
+    """Publish reward-group counts with their fractions of all groups."""
+    metrics = {f"{REWARD_GROUP_METRIC_PREFIX}num_{name}": float(counts[name]) for name in _REWARD_GROUP_COUNTS}
+    groups = counts["groups"]
+    for name in ("all_zero_groups", "all_one_groups", "nonconstant_groups", "incomplete_groups"):
+        metrics[f"{REWARD_GROUP_METRIC_PREFIX}frac_{name}"] = counts[name] / groups if groups else float("nan")
+    return metrics
+
+
+def _merge_reward_group_metrics(trajectory_batches: List[TrajectoryBatch]) -> Dict[str, float]:
+    """Sum reward-group counts across rollout groups and recompute their fractions."""
+    first = f"{REWARD_GROUP_METRIC_PREFIX}num_groups"
+    group_metrics = [
+        metrics
+        for metrics in (output.get("rollout_metrics") or {} for output in trajectory_batches)
+        if first in metrics
+    ]
+    if not group_metrics:
+        return {}
+    return reward_group_metrics(
+        {
+            name: sum(metrics[f"{REWARD_GROUP_METRIC_PREFIX}num_{name}"] for metrics in group_metrics)
+            for name in _REWARD_GROUP_COUNTS
+        }
+    )
 
 
 def get_batch_failure_metrics(

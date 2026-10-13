@@ -217,6 +217,7 @@ async def test_task_grade_and_exact_tokens_reach_the_leased_buffer(task_inputs, 
         "generate/task_rollout/generated_tokens": 2.0,
         "generate/task_rollout/missing_logprob_tokens": 0.0 if with_logprobs else 2.0,
     }
+    assert batch["rollout_metrics"]["generate/reward_groups/num_all_one_groups"] == 1.0
 
 
 @pytest.mark.asyncio

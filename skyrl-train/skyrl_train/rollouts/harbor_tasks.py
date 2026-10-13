@@ -9,6 +9,7 @@ from harbor_config.models.job.config import RetryConfig
 from harbor_config.models.environment_type import EnvironmentType
 from harbor_config.models.trial.config import EnvironmentConfig, VerifierConfig
 from omegaconf import DictConfig
+from pydantic import BaseModel, ConfigDict, Field
 from shellbox.backends.daytona.machine import DaytonaMachineFactory, DaytonaNetworkMode, DaytonaNetworkPolicy
 from shellbox.machine import Backend, MachineFactory
 from taskcompendium.models import NoGrader
@@ -16,7 +17,12 @@ from rolloutengine.spec import LoweredTaskSpec, MachineRuntimeSpec
 from taskcompendium.grading_result import GradingFailure, Outcome
 from rolloutengine.contracts import RolloutData, RolloutFailure
 
-from skyrl_train.trajectory_runners.harbor.configuration import HarborConfigBuilder
+from skyrl_train.rollouts.opensandbox_machine import (
+    DEFAULT_SANDBOX_TTL_MINUTES,
+    OpenSandboxMachineFactory,
+    OpenSandboxNetworkPolicy,
+)
+from skyrl_train.trajectory_runners.harbor.configuration import OPENSANDBOX_ENVIRONMENT, HarborConfigBuilder
 from skyrl_train.trajectory_runners.harbor.identity_aware_reward import (
     IDENTITY_AWARE_SHAPER,
     identity_aware_pass_ratios,
@@ -39,6 +45,43 @@ HARBOR_MACHINE_BACKEND = "harbor"
 HARBOR_EVAL_MACHINE_BACKEND = "harbor_eval"
 
 
+def _credential(name: str, provider: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise ValueError(f"Missing {provider} credential environment variable: {name}")
+    return value
+
+
+class OpenSandboxSettings(BaseModel):
+    """Connection settings for ``environment_type: opensandbox``; credentials are named, never inlined."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    domain: str = Field(min_length=1)
+    api_key_env: str = Field(min_length=1)
+    use_server_proxy: bool = False
+    request_timeout_sec: float | None = Field(default=None, gt=0)
+    # Anonymous Docker Hub pulls are rate limited per source IP; both must be set to authenticate.
+    registry_username_env: str | None = "DOCKERHUB_USERNAME"
+    registry_token_env: str | None = "DOCKERHUB_TOKEN"
+
+    def machine_factory(self, kwargs: dict) -> OpenSandboxMachineFactory:
+        policy = kwargs.get("network_policy")
+        username = os.environ.get(self.registry_username_env) if self.registry_username_env else None
+        token = os.environ.get(self.registry_token_env) if self.registry_token_env else None
+        return OpenSandboxMachineFactory(
+            domain=self.domain,
+            api_key=_credential(self.api_key_env, "OpenSandbox"),
+            use_server_proxy=self.use_server_proxy,
+            request_timeout_sec=self.request_timeout_sec,
+            ttl_minutes=kwargs.get("ttl_minutes", DEFAULT_SANDBOX_TTL_MINUTES),
+            network_policy=None
+            if policy is None
+            else OpenSandboxNetworkPolicy(mode=policy["mode"], value=policy.get("value")),
+            image_auth=(username, token) if username and token else None,
+        )
+
+
 @dataclass(frozen=True)
 class HarborTaskSettings:
     environment: EnvironmentConfig
@@ -53,14 +96,23 @@ class HarborTaskSettings:
     reward_shaping: dict
     retry: RetryConfig
     attempt_timeout: float | None
+    opensandbox: OpenSandboxSettings | None = None
 
     @classmethod
     def from_config(cls, config: DictConfig):
         builder = HarborConfigBuilder(config)
         agent, options = builder.agent_fields()
         trial = builder.trial_fields()
+        environment = builder.environment_config()
+        opensandbox = environment.kwargs.get("opensandbox")
+        if builder.environment_backend() == OPENSANDBOX_ENVIRONMENT:
+            if opensandbox is None:
+                raise ValueError("environment_type opensandbox requires harbor.opensandbox settings")
+            opensandbox = OpenSandboxSettings.model_validate(opensandbox)
+        elif opensandbox is not None:
+            raise ValueError("harbor.opensandbox settings require environment_type opensandbox")
         return cls(
-            builder.environment_config(),
+            environment,
             builder.verifier_config(),
             agent.get("override_timeout_sec"),
             agent.get("max_timeout_sec"),
@@ -72,6 +124,7 @@ class HarborTaskSettings:
             builder.get_reward_shaping_config(),
             builder.build_retry_config(),
             trial.get("trial_attempt_timeout_sec"),
+            opensandbox,
         )
 
     def retry_delay(self, failure: RolloutFailure | None, retries: int) -> float | None:
@@ -91,16 +144,15 @@ class HarborTaskSettings:
         return NoGrader(reason="Harbor verification is disabled") if self.verifier.disable else None
 
     def machine_factory(self, *, phase: str = "train") -> MachineFactory:
+        if self.opensandbox is not None:
+            return self.opensandbox.machine_factory(self.environment.kwargs)
         match self.environment.type:
             case EnvironmentType.DAYTONA:
                 policy = self.environment.kwargs.get("network_policy")
                 key_env = self.environment.kwargs.get("eval_api_key_env" if phase == "eval" else "api_key_env")
                 client_factory = AsyncDaytona
                 if key_env is not None:
-                    api_key = os.environ.get(key_env)
-                    if not api_key:
-                        raise ValueError(f"Missing Daytona credential environment variable: {key_env}")
-                    client_factory = partial(AsyncDaytona, DaytonaConfig(api_key=api_key))
+                    client_factory = partial(AsyncDaytona, DaytonaConfig(api_key=_credential(key_env, "Daytona")))
                 return DaytonaMachineFactory(
                     client_factory=client_factory,
                     ttl_minutes=self.environment.kwargs.get("ttl_minutes", 360),

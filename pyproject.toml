@@ -126,6 +126,9 @@ telemetry = [
     "memray ; sys_platform == 'linux'",
     "ray[default]",
 ]
+opensandbox = [
+    "opensandbox==0.1.16",
+]
 
 [project.scripts]
 marinskyrl = "cloud.iris.launch:main"

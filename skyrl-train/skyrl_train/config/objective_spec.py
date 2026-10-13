@@ -59,11 +59,17 @@ BUILTIN_LOSS_SPECS: Mapping[str, LossSpec] = MappingProxyType(
         PolicyLossType.KL_COV: LossSpec(RatioAnchor.OLD, row_local=False, advantage_linear=False),
         PolicyLossType.IMPORTANCE_SAMPLING: LossSpec(RatioAnchor.OLD),
         PolicyLossType.BEHAVIOR_CLIP: LossSpec(RatioAnchor.ROLLOUT),
+        PolicyLossType.DPPO: LossSpec(RatioAnchor.ROLLOUT),
         PolicyLossType.SFT: LossSpec(RatioAnchor.NONE, advantage_linear=False),
         PolicyLossType.FTPO: LossSpec(RatioAnchor.NONE, advantage_linear=False),
         PolicyLossType.DPO: LossSpec(RatioAnchor.NONE, advantage_linear=False),
     }
 )
+
+
+class DPPODivergenceType(StrEnum):
+    TV = "tv"
+    KL = "kl"
 
 
 class LossReduction(StrEnum):
@@ -280,11 +286,24 @@ def validate_dpo(cfg: DictConfig) -> None:
         )
 
 
+def validate_dppo(algorithm: DictConfig) -> None:
+    """Reject DPPO settings that depart from the pinned TMax trust region."""
+    if algorithm.dppo.divergence_type not in set(DPPODivergenceType):
+        raise ValueError(f"trainer.algorithm.dppo.divergence_type must be one of {list(DPPODivergenceType)}")
+    threshold = float(algorithm.dppo.divergence_threshold)
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise ValueError("trainer.algorithm.dppo.divergence_threshold must be a positive finite number")
+    if algorithm.use_kl_loss:
+        raise ValueError("trainer.algorithm.policy_loss_type=dppo requires use_kl_loss=false for TMax parity")
+
+
 def validate_objective(cfg: DictConfig, *, loss_spec: LossSpec | None = None) -> None:
     """Reject objective settings that cannot affect the selected training rows correctly."""
     validate_ftpo(cfg)
     if cfg.trainer.algorithm.policy_loss_type == PolicyLossType.DPO:
         validate_dpo(cfg)
+    if cfg.trainer.algorithm.policy_loss_type == PolicyLossType.DPPO:
+        validate_dppo(cfg.trainer.algorithm)
     limit = cfg.trainer.policy.max_consecutive_nonfinite_steps
     if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
         raise ValueError("trainer.policy.max_consecutive_nonfinite_steps must be null or an integer >= 1")

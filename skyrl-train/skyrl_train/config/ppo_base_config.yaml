@@ -227,6 +227,11 @@ trainer:
     sapo:
       tau_pos: 1.0
       tau_neg: 1.05
+    # Directional trust-region mask against the rollout policy (TMax DPPO); set policy_loss_type=dppo
+    # to activate. divergence_type is tv or kl over the sampled token's Bernoulli approximation.
+    dppo:
+      divergence_type: "tv"
+      divergence_threshold: 0.1
     
     value_clip: 0.2
     dynamic_sampling:

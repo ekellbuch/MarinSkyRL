@@ -13,6 +13,7 @@ from omegaconf import DictConfig
 from marinskyrl.runtime_options import PolicyLossType
 from skyrl_train.ftpo import FTPOInputs, ftpo_loss
 from skyrl_train.config.ftpo import ftpo_config
+from skyrl_train.config.objective_spec import DPPODivergenceType
 from skyrl_train.objective.dpo import DPOInputs, dpo_pair_values
 from skyrl_train.tensor_math import masked_mean, safe_exp_delta
 from skyrl_train.utils.algorithm_registry import register_policy_loss
@@ -152,6 +153,78 @@ def behavior_clipped_policy_loss(inputs: PolicyLossInputs, config: DictConfig) -
             eps_clip_low=config.eps_clip_low,
             eps_clip_high=config.eps_clip_high,
         ),
+    )
+
+
+def _dppo_binary_divergence(
+    behavior_log_probs: torch.Tensor, policy_log_probs: torch.Tensor, divergence_type: str
+) -> torch.Tensor:
+    """Compute TMax's sampled-token Bernoulli approximation to policy divergence."""
+    epsilon = 1e-9
+    behavior = torch.exp(behavior_log_probs.float().clamp(min=-30.0, max=0.0))
+    policy = torch.exp(policy_log_probs.float().clamp(min=-30.0, max=0.0))
+    if divergence_type == DPPODivergenceType.TV:
+        return (behavior - policy).abs()
+    if divergence_type == DPPODivergenceType.KL:
+        behavior = behavior.clamp(epsilon, 1.0 - epsilon)
+        policy = policy.clamp(epsilon, 1.0 - epsilon)
+        return behavior * (behavior.log() - policy.log()) + (1.0 - behavior) * (
+            (1.0 - behavior).log() - (1.0 - policy).log()
+        )
+    raise ValueError(f"Unknown DPPO divergence type: {divergence_type}")
+
+
+def compute_dppo_mask(
+    policy_log_probs: torch.Tensor,
+    behavior_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    ratio: torch.Tensor,
+    loss_mask: torch.Tensor,
+    divergence_type: str,
+    divergence_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the directional DPPO keep mask and per-token divergence (pinned TMax oracle)."""
+    valid = loss_mask.bool()
+    with torch.no_grad():
+        divergence = _dppo_binary_divergence(behavior_log_probs, policy_log_probs, divergence_type)
+        divergence = torch.where(valid, divergence, torch.zeros_like(divergence))
+        outside = divergence > divergence_threshold
+        bad_high = (advantages > 0) & (ratio > 1.0) & outside
+        bad_low = (advantages < 0) & (ratio < 1.0) & outside
+        keep = (~(bad_high | bad_low) & valid).to(policy_log_probs.dtype)
+    return keep, divergence
+
+
+@register_policy_loss(PolicyLossType.DPPO)
+def dppo_policy_loss(inputs: PolicyLossInputs, config: DictConfig) -> TokenLoss:
+    """Mask updates that push the policy further outside a divergence region around the rollout policy.
+
+    Matches TMax's DPPO: the full (unclipped) rollout importance ratio multiplies the advantage,
+    and a token is dropped when its sampled-token divergence exceeds the threshold and the update
+    would move the ratio further away from one. The ratio uses the shared bounded exponent so a
+    pathological log-probability delta stays finite.
+    """
+    if inputs.rollout_log_probs is None:
+        raise ValueError("rollout_logprobs are required for dppo policy loss")
+    ratio = safe_exp_delta(inputs.log_probs - inputs.rollout_log_probs)
+    keep, divergence = compute_dppo_mask(
+        inputs.log_probs,
+        inputs.rollout_log_probs,
+        inputs.advantages,
+        ratio,
+        inputs.loss_mask,
+        config.dppo.divergence_type,
+        config.dppo.divergence_threshold,
+    )
+    masked_divergence = torch.where(inputs.loss_mask > 0, divergence, 0)
+    return _token_loss(
+        -inputs.advantages * ratio * keep,
+        inputs,
+        {
+            "dppo/masked_fraction": 1.0 - _masked_fraction(keep, inputs.loss_mask),
+            "dppo/divergence_mean": masked_mean(divergence, inputs.loss_mask).detach().item(),
+            "dppo/divergence_max": masked_divergence.max().detach().item(),
+        },
     )
 
 

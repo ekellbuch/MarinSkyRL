@@ -45,6 +45,7 @@ class PolicyLossType(StrEnum):
     REGULAR = "regular"
     DUAL_CLIP = "dual_clip"
     BEHAVIOR_CLIP = "behavior_clip"
+    DPPO = "dppo"
     GSPO = "gspo"
     CISPO = "cispo"
     CLIP_COV = "clip_cov"

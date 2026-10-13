@@ -386,6 +386,17 @@ def _warn_missing_logprobs(
         len(rollouts),
         ", ".join(sorted(set(missing))),
     )
+    # Locate the drop: which engine turns came back without logprobs, and how the rollout ended.
+    for rollout in rollouts:
+        if rollout.logprobs is None:
+            logger.warning(
+                "Task {}: {}/{} turns without behavior logprobs (stop_reason={}, exception={})",
+                rollout.task_id,
+                sum(step.turn.logprobs is None for step in rollout.steps),
+                len(rollout.steps),
+                rollout.stop_reason,
+                None if rollout.failure is None else rollout.failure.exception_type,
+            )
 
 
 def _merge_reward_group_metrics(

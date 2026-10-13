@@ -532,6 +532,60 @@ def test_validate_cfg_configures_behavior_logprob_probability_convention(tempera
     assert cfg.generator.sampling_params.min_tokens == 0
 
 
+def _dppo_config():
+    cfg = _validatable_dummy_config()
+    cfg.trainer.algorithm.policy_loss_type = "dppo"
+    cfg.trainer.algorithm.off_policy_correction = "none"
+    cfg.trainer.algorithm.use_kl_loss = False
+    cfg.generator.num_inference_engines = 1
+    cfg.generator.inference_engine_tensor_parallel_size = 1
+    cfg.generator.inference_engine_expert_parallel_size = 1
+    return cfg
+
+
+def test_validate_cfg_dppo_requests_rollout_logprobs():
+    cfg = _dppo_config()
+    validate_cfg(cfg)
+
+    assert cfg.generator.sampling_params.logprobs == 0
+
+
+def test_validate_cfg_rejects_dppo_with_off_policy_correction():
+    cfg = _dppo_config()
+    cfg.trainer.algorithm.off_policy_correction = "tis"
+
+    with pytest.raises(ValueError, match="requires an OLD-anchored policy loss"):
+        validate_cfg(cfg)
+
+
+def test_validate_cfg_rejects_dppo_with_kl_penalty():
+    cfg = _dppo_config()
+    cfg.trainer.algorithm.use_kl_loss = True
+
+    with pytest.raises(ValueError, match="requires use_kl_loss=false"):
+        validate_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [("divergence_type", "js", "divergence_type"), ("divergence_threshold", 0.0, "divergence_threshold")],
+)
+def test_validate_cfg_rejects_invalid_dppo_region(key, value, message):
+    cfg = _dppo_config()
+    cfg.trainer.algorithm.dppo[key] = value
+
+    with pytest.raises(ValueError, match=message):
+        validate_cfg(cfg)
+
+
+def test_validate_cfg_rejects_unsupported_lm_head_compute_dtype():
+    cfg = _validatable_dummy_config()
+    cfg.trainer.policy.model.lm_head_compute_dtype = "bfloat16"
+
+    with pytest.raises(ValueError, match="lm_head_compute_dtype"):
+        validate_cfg(cfg)
+
+
 def test_validate_cfg_best_of_n_uses_selected_batch_geometry():
     cfg = _validatable_dummy_config()
     OmegaConf.update(cfg, "trainer.trajectory_selector.type", "best_of_n", force_add=True)

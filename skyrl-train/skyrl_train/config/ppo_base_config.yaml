@@ -117,6 +117,9 @@ trainer:
       tokenizer_revision: ${trainer.policy.model.revision}
       source_uri: null
       source_identity: null
+      # null or "float32". float32 runs the vLLM rollout engine's output projection in FP32 (Qwen3.5
+      # model classes only). The Megatron learner's output layer still computes in the model dtype.
+      lm_head_compute_dtype: null
       lora:
           rank: 0
           alpha: 16

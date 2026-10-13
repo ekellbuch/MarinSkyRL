@@ -283,6 +283,7 @@ def _run_create(
     dcp: int,
     attention_backend: str | None = None,
     *,
+    lm_head_compute_dtype: str | None = None,
     startup_failure: BaseException | None = None,
     removed_placement_groups: list | None = None,
 ):
@@ -344,6 +345,7 @@ def _run_create(
         tensor_parallel_size=1,
         model_dtype="bfloat16",
         pretrain="dummy/model",
+        lm_head_compute_dtype=lm_head_compute_dtype,
         seed=0,
         vllm_v1_disable_multiproc=True,
         enable_prefix_caching=False,
@@ -359,6 +361,11 @@ def _run_create(
         engine_init_timeout_seconds=60,
     )
     return capture
+
+
+def test_lm_head_compute_dtype_forwarded_to_vllm_actor(monkeypatch):
+    capture = _run_create(monkeypatch, dcp=1, lm_head_compute_dtype="float32")
+    assert capture.remote_calls[0]["lm_head_compute_dtype"] == "float32"
 
 
 def test_failed_engine_startup_releases_owned_placement_group(monkeypatch):

@@ -70,6 +70,11 @@ from skyrl_train.inference_engines.placement import inference_worker_placement
 from skyrl_train.inference_engines.vllm.numa import set_async_worker_numa_affinity
 from skyrl_train.weight_sync.expert_block.receiver import ExpertBlockReceiver
 from skyrl_train.weight_sync.weight_loader import WeightLoader
+from skyrl_train.models.lm_head_precision import (
+    VLLM_LM_HEAD_COMPUTE_DTYPE_ENV,
+    configure_vllm_model_instance_lm_head_compute_dtype,
+    configure_vllm_qwen3_5_lm_head_compute_dtype,
+)
 from skyrl_train.weight_sync.vllm_weight_conversion import load_weights_into_vllm
 from skyrl_train.weight_sync.weight_extractor import is_weight_sync_dtype_compatible
 from skyrl_train.inference_engines.vllm.utils import (
@@ -323,6 +328,13 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
                         set_numa_affinity_for_gpu(gpu_ids[0])
         except Exception as e:
             logger.warning(f"setup_envvars_for_vllm: NUMA affinity setup failed: {e}")
+
+
+def _refresh_vllm_lm_head_compute_dtype(model) -> None:
+    """Re-apply the FP32 output projection a weight load may have overwritten or recreated."""
+    dtype_name = os.environ.get(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV)
+    if dtype_name is not None:
+        configure_vllm_model_instance_lm_head_compute_dtype(model, dtype_name)
 
 
 class WorkerWrap:
@@ -588,6 +600,7 @@ class WorkerWrap:
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             finalize_layerwise_reload(model, self.model_config)
         self._skyrl_weight_update_active = False
+        _refresh_vllm_lm_head_compute_dtype(model)
         speculative_config = self.vllm_config.speculative_config
         if speculative_config is not None and speculative_config.method == "eagle3":
             self.model_runner.refresh_online_eagle_target_owned_weights()
@@ -769,6 +782,9 @@ class WorkerWrap:
                 torch.cuda.empty_cache()
             else:
                 load_weights_into_vllm(model, self._accumulated_weights)
+            # Inside the layerwise-reload bracket, finalize refreshes the projection once.
+            if not getattr(self, "_skyrl_weight_update_active", False):
+                _refresh_vllm_lm_head_compute_dtype(model)
             self._accumulated_weights.clear()
             del self._accumulated_weights
             gc.collect()
@@ -799,6 +815,10 @@ class WorkerWrap:
         else:
             # Immediate mode (default): load right away
             load_weights_into_vllm(self.model_runner.model, weight_list)
+            if not getattr(self, "_skyrl_weight_update_active", False) and any(
+                name == "lm_head.weight" or name.endswith("embed_tokens.weight") for name, _ in weight_list
+            ):
+                _refresh_vllm_lm_head_compute_dtype(self.model_runner.model)
             for weight in weight_list:
                 del weight
 
@@ -1380,6 +1400,17 @@ class AsyncVLLMInferenceEngine(InferenceEngineInterface):
         self._rendezvous_port_reservation = kwargs.pop("rendezvous_port_reservation", None)
         self._weight_sync_pause_policy: WeightSyncPausePolicy = kwargs.pop("weight_sync_pause_policy")
         setup_envvars_for_vllm(kwargs, bundle_indices)
+        lm_head_compute_dtype = kwargs.pop("lm_head_compute_dtype", None)
+        # vLLM may construct the model in a separate EngineCore process, so the
+        # constructor setting crosses that process boundary via the environment.
+        if lm_head_compute_dtype is None:
+            os.environ.pop(VLLM_LM_HEAD_COMPUTE_DTYPE_ENV, None)
+        else:
+            os.environ[VLLM_LM_HEAD_COMPUTE_DTYPE_ENV] = lm_head_compute_dtype
+        configured_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(lm_head_compute_dtype)
+        if configured_model_classes:
+            action = "enabled" if lm_head_compute_dtype is not None else "restored"
+            logger.info(f"{action.capitalize()} lm_head compute for {', '.join(configured_model_classes)}")
         vllm_v1_disable_multiproc = kwargs.pop("vllm_v1_disable_multiproc", False)
         logger.info(
             f"AsyncVLLMInferenceEngine: vllm_v1_disable_multiproc={vllm_v1_disable_multiproc}, "
@@ -1398,7 +1429,13 @@ class AsyncVLLMInferenceEngine(InferenceEngineInterface):
 
         if "rope_scaling" in kwargs:
             kwargs.pop("rope_scaling")
-        self.llm = self._create_engine(*args, **kwargs)
+        try:
+            self.llm = self._create_engine(*args, **kwargs)
+        finally:
+            if lm_head_compute_dtype is not None:
+                restored_model_classes = configure_vllm_qwen3_5_lm_head_compute_dtype(None)
+                if restored_model_classes:
+                    logger.info(f"Restored lm_head compute for {', '.join(restored_model_classes)}")
         self._weight_loader = VLLMWeightLoader(self.llm)
 
     def tp_size(self):

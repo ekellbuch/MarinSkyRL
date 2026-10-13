@@ -618,6 +618,15 @@ def validate_cfg(cfg: DictConfig):
             raise NotImplementedError("Behavior-logprob objectives require the vLLM generator backend")
         configure_behavior_logprob_sampling(cfg.generator)
 
+    lm_head_compute_dtype = cfg.trainer.policy.model.get("lm_head_compute_dtype")
+    if lm_head_compute_dtype not in (None, "float32"):
+        raise ValueError("trainer.policy.model.lm_head_compute_dtype must be null or 'float32'")
+    if lm_head_compute_dtype is not None:
+        logger.warning(
+            "trainer.policy.model.lm_head_compute_dtype=float32 applies to the vLLM rollout projection only; "
+            "the Megatron learner's output layer still computes in the model dtype."
+        )
+
     if cfg.trainer.policy.model.lora.rank > 0:
         raise ValueError("Megatron training does not support LoRA")
 

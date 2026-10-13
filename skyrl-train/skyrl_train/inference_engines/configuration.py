@@ -26,6 +26,7 @@ class InferenceEngineRoleConfig:
     shared_pg: Any
     inference_engine_enable_sleep: bool
     max_logprobs: int = 1
+    lm_head_compute_dtype: str | None = None
 
 
 def inference_engine_kwargs_from_config(
@@ -60,6 +61,7 @@ def inference_engine_kwargs_from_config(
         "vllm_attention_backend": cfg.generator.get("vllm_attention_backend", None),
         "engine_init_kwargs": engine_init_kwargs,
         "max_logprobs": role.max_logprobs,
+        "lm_head_compute_dtype": role.lm_head_compute_dtype,
         "mp_backend": cfg.generator.get("inference_engine_mp_backend", False),
         "placement_group_timeout_seconds": int(cfg.trainer.distributed.placement_group_timeout_seconds),
         "weight_sync_pause_policy": resolve_weight_sync_pause_policy(cfg.generator),

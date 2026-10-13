@@ -52,6 +52,9 @@ EVAL_SCHEMA = SectionSchema(
     fields={"eval_timeout_override_sec": FieldMapping("eval_timeout_override_sec", default=900)}
 )
 
+OPENSANDBOX_ENVIRONMENT = "opensandbox"
+OPENSANDBOX_IMPORT_PATH = "skyrl_train.rollouts.opensandbox_machine:OpenSandboxMachineFactory"
+
 ENVIRONMENT_SCHEMA = SectionSchema(
     fields={
         "override_cpus": FieldMapping("override_cpus"),
@@ -63,6 +66,8 @@ ENVIRONMENT_SCHEMA = SectionSchema(
         "ttl_minutes": FieldMapping("ttl_minutes", field_type="kwargs"),
         "daytona_api_key_env": FieldMapping("api_key_env", field_type="kwargs"),
         "eval_daytona_api_key_env": FieldMapping("eval_api_key_env", field_type="kwargs"),
+        # Connection settings for environment_type: opensandbox (see OpenSandboxSettings).
+        "opensandbox": FieldMapping("opensandbox", field_type="kwargs"),
     }
 )
 
@@ -284,6 +289,10 @@ class HarborConfigBuilder:
 
         return direct_fields, kwargs_fields
 
+    def environment_backend(self) -> str:
+        """Return the selected sandbox backend, including ones Harbor's EnvironmentType lacks."""
+        return str(self._get_field_value("environment_type", ENVIRONMENT_SCHEMA.fields["environment_type"]))
+
     def environment_config(self) -> EnvironmentConfig:
         """Build EnvironmentConfig from config."""
         env_fields = {}
@@ -296,7 +305,11 @@ class HarborConfigBuilder:
                     # Pass through to environment kwargs
                     env_kwargs[mapping.harbor_field] = value
                 elif mapping.harbor_field == "type":
-                    # Special handling for environment type
+                    # Harbor's enum has no OpenSandbox member. Naming the Shellbox factory keeps
+                    # EnvironmentConfig from defaulting the type to docker.
+                    if value == OPENSANDBOX_ENVIRONMENT:
+                        env_fields["import_path"] = OPENSANDBOX_IMPORT_PATH
+                        continue
                     if isinstance(value, str):
                         value = EnvironmentType(value)
                     env_fields[mapping.harbor_field] = value

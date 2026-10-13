@@ -578,6 +578,12 @@ def test_validate_cfg_rejects_invalid_dppo_region(key, value, message):
         validate_cfg(cfg)
 
 
+def test_validate_cfg_accepts_fp32_lm_head():
+    cfg = _dppo_config()
+    cfg.trainer.policy.model.lm_head_compute_dtype = "float32"
+    validate_cfg(cfg)
+
+
 def test_validate_cfg_rejects_unsupported_lm_head_compute_dtype():
     cfg = _validatable_dummy_config()
     cfg.trainer.policy.model.lm_head_compute_dtype = "bfloat16"

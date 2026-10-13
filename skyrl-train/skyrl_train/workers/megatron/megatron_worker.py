@@ -60,6 +60,7 @@ from skyrl_train.workers.megatron.megatron_model_wrapper import (
     MegatronPolicyMicroBatch,
 )
 from skyrl_train.workers.megatron.bridge_provider_config import configure_bridge_provider
+from skyrl_train.workers.megatron.fp32_output_projection import uses_fp32_output_projection
 from skyrl_train.workers.megatron.router_replay_install import install_megatron_router_replay
 from skyrl_train.workers.megatron.output_projection_layout import install_dpo_batch_major_output_projection
 from skyrl_train.workers.megatron.weight_extractor import BucketedMegatronWeightExtractor, mapping_hf_names
@@ -514,6 +515,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             logprob_chunk_size=OmegaConf.select(
                 self.cfg, "trainer.policy.megatron_config.logprob_chunk_size", default=None
             ),
+            fp32_output_projection=uses_fp32_output_projection(
+                self.cfg.trainer.policy.model.get("lm_head_compute_dtype")
+            ),
         )
         self._maybe_install_router_replay("policy")
 
@@ -545,6 +549,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             actor_module=self.actor_module,
             logprob_chunk_size=OmegaConf.select(
                 self.cfg, "trainer.policy.megatron_config.logprob_chunk_size", default=None
+            ),
+            fp32_output_projection=uses_fp32_output_projection(
+                self.cfg.trainer.policy.model.get("lm_head_compute_dtype")
             ),
         )
 

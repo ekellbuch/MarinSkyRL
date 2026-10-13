@@ -472,3 +472,16 @@ async def test_ftpo_empty_rollout_batch_skips_training(config):
     )
     assert status["policy_update_steps"] == 0
     assert trainer.all_metrics["ftpo/empty_batch"] == 1
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        ("trainer.policy.model.lm_head_compute_dtype", "float32", "does not support FTPO"),
+    ],
+)
+def test_ftpo_recipe_rejects_settings_that_replace_boundary_logits(config, path, value, message):
+    changed = deepcopy(config)
+    OmegaConf.update(changed, path, value)
+    with pytest.raises(ValueError, match=message):
+        validate_cfg(changed)

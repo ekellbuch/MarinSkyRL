@@ -53,7 +53,7 @@ from marinskyrl.distillation import (
     validate_generation_logprobs,
 )
 from marinskyrl.inference_placement import validate_expert_block_transport
-from marinskyrl.runtime_options import GDNBackend, R3Transport
+from marinskyrl.runtime_options import GDNBackend, PolicyLossType, R3Transport
 
 from .constants import DEFAULT_RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS
 from .algorithm_registry import (
@@ -621,11 +621,10 @@ def validate_cfg(cfg: DictConfig):
     lm_head_compute_dtype = cfg.trainer.policy.model.get("lm_head_compute_dtype")
     if lm_head_compute_dtype not in (None, "float32"):
         raise ValueError("trainer.policy.model.lm_head_compute_dtype must be null or 'float32'")
-    if lm_head_compute_dtype is not None:
-        logger.warning(
-            "trainer.policy.model.lm_head_compute_dtype=float32 applies to the vLLM rollout projection only; "
-            "the Megatron learner's output layer still computes in the model dtype."
-        )
+    is_ftpo = cfg.trainer.algorithm.policy_loss_type == PolicyLossType.FTPO
+    if lm_head_compute_dtype is not None and (is_ftpo or distillation_plan is not None):
+        # The FP32 learner projection returns per-token statistics; FTPO and distillation consume logits.
+        raise ValueError("trainer.policy.model.lm_head_compute_dtype=float32 does not support FTPO or distillation")
 
     if cfg.trainer.policy.model.lora.rank > 0:
         raise ValueError("Megatron training does not support LoRA")

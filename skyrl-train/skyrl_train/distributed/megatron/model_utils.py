@@ -16,11 +16,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
+from functools import partial
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
 import megatron.core.parallel_state as mpu
+from torch.utils.checkpoint import checkpoint
 
 
 @torch.no_grad()
@@ -322,29 +325,49 @@ def from_parallel_logits_to_logprobs(
 
     Taken from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L354
     """
+    target, pad_len = next_token_targets(target, vocab_parallel_logits.shape[1], cp_group)
+    logprobs = _parallel_logprobs(
+        vocab_parallel_logits, target, vocab_start_index, vocab_end_index, tp_group, inference_only, chunk_size
+    )
+    return next_token_values_to_sequence(logprobs, pad_len, cp_group)
+
+
+def next_token_targets(
+    target: torch.Tensor,
+    local_seq_len: int,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[torch.Tensor, int]:
+    """Shift ``[batch, seq_len]`` tokens to next-token targets in this context-parallel rank's layout.
+
+    Returns the ``[batch, local_seq_len]`` targets and the right padding added to fill ``local_seq_len * CP``.
+    """
     target = target.roll(shifts=-1, dims=-1)
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
     # Pad the targets to local size * cp_size
-    pad_len = vocab_parallel_logits.shape[1] * cp_size - target.shape[1]
+    pad_len = local_seq_len * cp_size - target.shape[1]
     if pad_len > 0:
         target = torch.nn.functional.pad(target, (0, pad_len), value=0)
 
     # Shard the targets by context parallelism
     cp_rank = torch.distributed.get_rank(cp_group)
-    target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
+    return _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1), pad_len
 
-    logprobs = _parallel_logprobs(
-        vocab_parallel_logits, target, vocab_start_index, vocab_end_index, tp_group, inference_only, chunk_size
-    )
 
+def next_token_values_to_sequence(
+    values: torch.Tensor,
+    pad_len: int,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Gather per-target values from ``next_token_targets`` back to ``[batch, seq_len - 1]``."""
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
     if cp_size > 1:
         # we need to gather the logits by context parallelism
-        logprobs = allgather_cp_sharded_tensor(logprobs, cp_group, seq_dim=1)  # , unpadded_seqlen=target.shape[1])
+        values = allgather_cp_sharded_tensor(values, cp_group, seq_dim=1)
 
     if pad_len > 0:
-        logprobs = logprobs[:, :-pad_len]
+        values = values[:, :-pad_len]
 
-    return logprobs[:, :-1]
+    return values[:, :-1]
 
 
 def from_parallel_logits_to_logprobs_packed_sequences(
@@ -381,8 +404,21 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         torch.Tensor: Log probabilities in original padded positions with shape
             [batch_size, sequence_length - 1].
     """
-    # Remove batch dimension to work with [T, vocab_size] and [T]
-    vocab_parallel_logits = vocab_parallel_logits.squeeze(0)
+    rolled_targets = packed_next_token_targets(target, cu_seqlens_padded, cp_group)
+    # Logprob kernels consume [batch, sequence, vocabulary] tensors.
+    vocab_parallel_logits = vocab_parallel_logits.squeeze(0).unsqueeze(0)
+    probs = _parallel_logprobs(
+        vocab_parallel_logits, rolled_targets, vocab_start_index, vocab_end_index, group, inference_only, chunk_size
+    )
+    return packed_next_token_values_to_padded(probs, cu_seqlens_padded, attention_mask, cp_group)
+
+
+def packed_next_token_targets(
+    target: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Shift each packed ``[1, T]`` sequence to next-token targets in this context-parallel rank's layout."""
     target = target.squeeze(0)
 
     batch_size = cu_seqlens_padded.shape[0] - 1
@@ -402,14 +438,18 @@ def from_parallel_logits_to_logprobs_packed_sequences(
             rolled_seq_targets, cp_rank, cp_size, seq_dim=0
         )
 
-    # Logprob kernels consume [batch, sequence, vocabulary] tensors.
-    rolled_targets = rolled_targets.unsqueeze(0)
-    vocab_parallel_logits = vocab_parallel_logits.unsqueeze(0)
+    return rolled_targets.unsqueeze(0)
 
-    # Apply distributed log probability computation
-    probs = _parallel_logprobs(
-        vocab_parallel_logits, rolled_targets, vocab_start_index, vocab_end_index, group, inference_only, chunk_size
-    )
+
+def packed_next_token_values_to_padded(
+    probs: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    attention_mask: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Scatter per-target values from ``packed_next_token_targets`` to ``[batch, seq_len - 1]``."""
+    batch_size = cu_seqlens_padded.shape[0] - 1
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
     # Remove batch dimension for filtering
     probs = probs.squeeze(0)
@@ -604,3 +644,171 @@ def vocab_parallel_entropy(vocab_parallel_logits: torch.Tensor, chunk_size: Opti
         _VocabParallelEntropy.apply(logits_chunk) for logits_chunk in vocab_parallel_logits.split(chunk_size, dim=-2)
     ]
     return torch.cat(entropy_chunks, dim=-1)
+
+
+# Columns of ``fp32_projection_token_stats``'s output, in order.
+PROJECTION_STAT_FIELDS = ("logprob", "entropy", "top1_margin", "top1_token")
+
+
+class _SumAcrossVocabShards(torch.autograd.Function):
+    """All-reduce one vocabulary shard's partial sum and pass the gradient back unchanged.
+
+    Correct only when the loss downstream of the sum is replicated across the tensor-parallel ranks, so every
+    rank's incoming gradient is already the full gradient of the total.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:  # pyrefly: ignore[bad-override]
+        tensor = tensor.clone()
+        dist.all_reduce(tensor, group=group)
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return grad_output, None
+
+
+def _vocab_shard_count(group: Optional[dist.ProcessGroup]) -> int:
+    return 1 if group is None else dist.get_world_size(group)
+
+
+def _sum_across_vocab_shards(tensor: torch.Tensor, group: Optional[dist.ProcessGroup]) -> torch.Tensor:
+    if _vocab_shard_count(group) == 1:
+        return tensor
+    return _SumAcrossVocabShards.apply(tensor, group)
+
+
+@torch.no_grad()
+def vocab_parallel_top2_margin(
+    logits: torch.Tensor,
+    vocab_start_index: int,
+    vocabulary_size: int,
+    group: Optional[dist.ProcessGroup],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the FP32 top-1 minus runner-up logit and the top-1 token id over the unpadded vocabulary."""
+    valid = max(0, min(logits.shape[-1], vocabulary_size - vocab_start_index))
+    values = torch.full((*logits.shape[:-1], 2), float("-inf"), dtype=torch.float32, device=logits.device)
+    tokens = torch.zeros(values.shape, dtype=torch.int64, device=logits.device)
+    if valid:
+        top_values, top_indices = logits[..., :valid].topk(min(2, valid), dim=-1)
+        values[..., : top_values.shape[-1]] = top_values.float()
+        tokens[..., : top_indices.shape[-1]] = top_indices + vocab_start_index
+    shards = _vocab_shard_count(group)
+    if shards > 1:
+        gathered_values = [torch.empty_like(values) for _ in range(shards)]
+        gathered_tokens = [torch.empty_like(tokens) for _ in range(shards)]
+        dist.all_gather(gathered_values, values, group=group)
+        dist.all_gather(gathered_tokens, tokens, group=group)
+        values = torch.cat(gathered_values, dim=-1)
+        tokens = torch.cat(gathered_tokens, dim=-1)
+    top_values, top_positions = values.topk(2, dim=-1)
+    return top_values[..., 0] - top_values[..., 1], tokens.gather(-1, top_positions[..., :1]).squeeze(-1)
+
+
+def _projection_chunk_stats(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    vocabulary_size: int,
+    temperature: float,
+    group: Optional[dist.ProcessGroup],
+    entropy_requires_grad: bool,
+    compute_top1: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    logits = torch.matmul(hidden.float(), weight.t())
+    if compute_top1:
+        margin, top1 = vocab_parallel_top2_margin(logits, vocab_start_index, vocabulary_size, group)
+    else:
+        margin = logits.new_zeros(logits.shape[:-1])
+        top1 = torch.zeros(logits.shape[:-1], dtype=torch.int64, device=logits.device)
+    if temperature != 1.0:
+        logits = logits / temperature
+
+    local_vocab = logits.shape[-1]
+    with torch.no_grad():
+        logits_max = logits.amax(dim=-1, keepdim=True)
+        if _vocab_shard_count(group) > 1:
+            dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=group)
+    shifted = logits - logits_max
+    exp_shifted = shifted.exp()
+    normalizer = _sum_across_vocab_shards(exp_shifted.sum(dim=-1), group)
+    log_normalizer = normalizer.log()
+
+    in_shard = (targets >= vocab_start_index) & (targets < vocab_start_index + local_vocab)
+    local_targets = (targets - vocab_start_index).clamp(0, local_vocab - 1)
+    target_shifted = shifted.gather(-1, local_targets.unsqueeze(-1)).squeeze(-1)
+    target_shifted = _sum_across_vocab_shards(torch.where(in_shard, target_shifted, 0.0), group)
+    logprob = target_shifted - log_normalizer
+
+    # Entropy is log Z - sum_v exp(s_v) s_v / Z with s = logits - max. Each vocabulary shard's partial sums
+    # reach the loss only through these all-reduced totals, so every rank's backward sees the same gradient.
+    with torch.set_grad_enabled(entropy_requires_grad and torch.is_grad_enabled()):
+        weighted = _sum_across_vocab_shards((exp_shifted * shifted).sum(dim=-1), group)
+        entropy = log_normalizer - weighted / normalizer
+    return logprob, entropy, margin, top1
+
+
+def fp32_projection_token_stats(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    vocabulary_size: int,
+    temperature: float,
+    chunk_size: Optional[int],
+    group: Optional[dist.ProcessGroup],
+    entropy_requires_grad: bool,
+    inference_only: bool,
+    compute_top1: bool,
+) -> torch.Tensor:
+    """Project hidden states in FP32 and reduce each sequence chunk to per-token statistics.
+
+    Only one chunk's ``[chunk, batch, vocab_size // TP]`` FP32 logits are alive at a time: each chunk is
+    checkpointed, so backward recomputes its logits instead of keeping them. The weight is cast to FP32 once
+    per call; its gradient accumulates across chunks in FP32 and reaches the parameter in the parameter's dtype.
+
+    Args:
+        hidden: ``[seq, batch, hidden]`` final hidden states, identical on every tensor-parallel rank.
+        weight: ``[vocab_size // TP, hidden]`` vocabulary shard of the output projection.
+        targets: ``[seq, batch]`` next-token ids in the full-vocabulary index space.
+        vocab_start_index: First vocabulary id of this rank's shard.
+        vocabulary_size: Unpadded vocabulary size; padded ids never become the top-1 token.
+        temperature: Divides the logits before the softmax, as the rollout sampler does.
+        chunk_size: Sequence positions per chunk; ``None`` projects the whole sequence at once.
+        group: Tensor-parallel group the vocabulary is split across; ``None`` for an unsplit vocabulary.
+        entropy_requires_grad: Whether the entropy column participates in backward.
+        inference_only: Skip autograd entirely.
+        compute_top1: Fill the top-1 margin and token columns; zeros otherwise.
+
+    Returns:
+        ``[seq, batch, 4]`` FP32 columns in ``PROJECTION_STAT_FIELDS`` order. The log-probability and entropy
+        columns carry gradients; the top-1 margin (unscaled logits) and token id do not.
+    """
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    chunk_fn = partial(
+        _projection_chunk_stats,
+        vocab_start_index=vocab_start_index,
+        vocabulary_size=vocabulary_size,
+        temperature=temperature,
+        group=group,
+        entropy_requires_grad=entropy_requires_grad,
+        compute_top1=compute_top1,
+    )
+    split = hidden.shape[0] if chunk_size is None else chunk_size
+    chunks = []
+    with torch.no_grad() if inference_only else nullcontext():
+        weight = weight.float()
+        for hidden_chunk, target_chunk in zip(hidden.split(split), targets.split(split), strict=True):
+            if torch.is_grad_enabled():
+                # The chunk draws no random numbers, so recomputation needs no saved RNG state.
+                logprob, entropy, margin, top1 = checkpoint(
+                    chunk_fn, hidden_chunk, weight, target_chunk, use_reentrant=False, preserve_rng_state=False
+                )
+            else:
+                logprob, entropy, margin, top1 = chunk_fn(hidden_chunk, weight, target_chunk)
+            chunks.append(torch.stack([logprob, entropy, margin, top1.to(torch.float32)], dim=-1))
+    return torch.cat(chunks, dim=0)

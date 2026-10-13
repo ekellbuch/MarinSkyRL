@@ -131,6 +131,11 @@ def stub_megatron_modules() -> None:
             "DistributedDataParallel": type("DistributedDataParallel", (), {}),
             "finalize_model_grads": lambda *args, **kwargs: None,
         },
+        "megatron.core.tensor_parallel": {},
+        "megatron.core.tensor_parallel.mappings": {
+            "copy_to_tensor_model_parallel_region": lambda *args, **kwargs: None,
+            "gather_from_sequence_parallel_region": lambda *args, **kwargs: None,
+        },
         "megatron.core.transformer": {},
         "megatron.core.transformer.module": {"Float16Module": type("Float16Module", (), {})},
         "megatron.core.optimizer": {

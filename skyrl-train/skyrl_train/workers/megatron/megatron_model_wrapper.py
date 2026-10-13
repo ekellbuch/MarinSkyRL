@@ -16,6 +16,10 @@ from megatron.core.transformer.module import Float16Module
 from skyrl_train.distributed.megatron.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    next_token_targets,
+    next_token_values_to_sequence,
+    packed_next_token_targets,
+    packed_next_token_values_to_padded,
     vocab_parallel_entropy,
 )
 from skyrl_train.distributed.megatron.megatron_utils import get_model_config
@@ -33,6 +37,10 @@ from skyrl_train.objective.reduction import policy_data_weights, step_counts
 from skyrl_train.utils.profiler import Profiler
 from skyrl_train.timing_observability import PhaseBreakdown
 from skyrl_train.utils.importance_ratio_diagnostics import LogRatioMonitor, gather_ratio_tensor
+from skyrl_train.workers.megatron.fp32_output_projection import (
+    FP32ProjectionRequest,
+    fp32_projection_output_processor,
+)
 
 from skyrl_train.distributed.megatron.megatron_utils import (
     compact_left_padded_tokens,
@@ -101,10 +109,35 @@ class MegatronPolicyMicroBatch:
     pair_roles: Optional[torch.Tensor] = None
 
 
+@dataclass(frozen=True)
+class _ProjectionOptions:
+    """Per-forward settings of the FP32 output projection; targets are added per micro-batch."""
+
+    temperature: float
+    entropy_requires_grad: bool
+    compute_top1: bool
+
+
+@dataclass(frozen=True)
+class _TokenValues:
+    """Scalar per-token outputs restored to the padded ``[batch, seq]`` layout.
+
+    ``logprobs`` is next-token aligned (``[batch, seq - 1]``); the others are position aligned.
+    ``top1_margin`` and ``top1_token`` are ``None`` unless requested.
+    """
+
+    logprobs: torch.Tensor
+    entropy: torch.Tensor
+    top1_margin: Optional[torch.Tensor] = None
+    top1_token: Optional[torch.Tensor] = None
+
+
 class MegatronModelWrapper:
     # MoE router replay (R3); set as an instance attribute by the worker after
     # install. Class-level None keeps flag-off behavior for every wrapper.
     router_replay: Optional[MegatronRouterReplay] = None
+    # Replace the output layer with an FP32 projection that returns per-token statistics.
+    fp32_output_projection: bool = False
 
     def __init__(
         self,
@@ -114,9 +147,13 @@ class MegatronModelWrapper:
         policy_loss_fn: Optional[Callable] = None,
         logprob_chunk_size: Any = _UNSET,
         vocabulary_size: int | None = None,
+        fp32_output_projection: bool = False,
     ):
         self.cfg = config
         self.vocabulary_size = vocabulary_size
+        if fp32_output_projection and vocabulary_size is None:
+            raise ValueError("The FP32 output projection needs the unpadded vocabulary size")
+        self.fp32_output_projection = fp32_output_projection
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
         self.policy_loss_fn = policy_loss_fn
@@ -194,6 +231,63 @@ class MegatronModelWrapper:
                 raise ValueError("Packed sequence parameters are required when sample packing is enabled.")
             return unpack_packed_token_values(token_entropies, packed_seq_params, attention_mask)
         return scatter_token_values(token_entropies, attention_mask, drop_last=False)
+
+    def _position_values(self, values: torch.Tensor, attention_mask: torch.Tensor, packed_seq_params) -> torch.Tensor:
+        """Restore position-aligned scalars from the model's token layout to ``[batch, seq]``."""
+        if self.use_sample_packing:
+            return unpack_packed_token_values(values, packed_seq_params, attention_mask)
+        return scatter_token_values(values, attention_mask, drop_last=False)
+
+    def _projection_request(
+        self,
+        options: _ProjectionOptions,
+        sequences: torch.Tensor,
+        attention_mask: torch.Tensor,
+        packed_seq_params,
+    ) -> FP32ProjectionRequest:
+        """Build next-token targets in the token layout the output processor sees."""
+        if self.use_sample_packing:
+            packed_sequences = pack_padded_tokens(sequences, attention_mask, packed_seq_params)
+            targets = packed_next_token_targets(
+                packed_sequences, packed_seq_params.cu_seqlens_q_padded, mpu.get_context_parallel_group()
+            )
+        else:
+            compact_sequences = compact_left_padded_tokens(sequences, attention_mask)
+            targets, _ = next_token_targets(compact_sequences, compact_sequences.shape[1])
+        return FP32ProjectionRequest(
+            targets=targets,
+            vocabulary_size=self.vocabulary_size,
+            temperature=options.temperature,
+            chunk_size=self._logprob_chunk_size,
+            entropy_requires_grad=options.entropy_requires_grad,
+            inference_only=not self.actor_module[0].training,
+            compute_top1=options.compute_top1,
+        )
+
+    def _projected_token_values(
+        self,
+        stats: torch.Tensor,
+        attention_mask: torch.Tensor,
+        packed_seq_params,
+        *,
+        compute_top1: bool,
+    ) -> _TokenValues:
+        """Restore the FP32 output processor's ``[batch, local_seq, 4]`` statistics to padded positions."""
+        if self.use_sample_packing:
+            token_logprobs = packed_next_token_values_to_padded(
+                stats[..., 0], packed_seq_params.cu_seqlens_q_padded, attention_mask, mpu.get_context_parallel_group()
+            )
+        else:
+            token_logprobs = scatter_token_values(
+                next_token_values_to_sequence(stats[..., 0], pad_len=0), attention_mask, drop_last=True
+            )
+        token_entropies = self._position_values(stats[..., 1], attention_mask, packed_seq_params)
+        if not compute_top1:
+            return _TokenValues(token_logprobs, token_entropies)
+        with torch.no_grad():
+            top1_margin = self._position_values(stats[..., 2], attention_mask, packed_seq_params)
+            top1_token = self._position_values(stats[..., 3], attention_mask, packed_seq_params).long()
+        return _TokenValues(token_logprobs, token_entropies, top1_margin, top1_token)
 
     def _build_router_replay_targets(
         self,
@@ -298,13 +392,15 @@ class MegatronModelWrapper:
         probe_row_indices: Optional[torch.Tensor] = None,
         num_actions: Optional[int] = None,
         record_recompute: bool = False,
+        projection: Optional[_ProjectionOptions] = None,
     ):
         """Run the shared packed or left-unpadded Megatron model boundary.
 
         When router replay is installed and routes are present, brackets the
         model call with ``begin_forward`` / ``end_forward`` (never falling back
         to native routing); with replay installed but no routes, fails fast
-        before the model runs.
+        before the model runs. With ``projection`` the last stage returns the
+        FP32 output processor's per-token statistics instead of logits.
         """
         attention_mask = attention_mask.to(bool)
         armed = False
@@ -349,12 +445,21 @@ class MegatronModelWrapper:
             # module (equivalence experiments) already returns module-precision outputs.
             inner = model.module if isinstance(model, MegatronDDP) else model
             precision_kwargs = {"fp32_output": False} if isinstance(inner, Float16Module) else {}
+            projection_kwargs = {}
+            if projection is not None:
+                projection_kwargs = {
+                    "output_processor": fp32_projection_output_processor,
+                    "output_processor_context": self._projection_request(
+                        projection, sequences, attention_mask, packed_seq_params
+                    ),
+                }
             outputs = model(
                 model_sequences,
                 model_position_ids,
                 model_attention_mask,
                 packed_seq_params=packed_seq_params,
                 **precision_kwargs,
+                **projection_kwargs,
             )
             if armed:
                 self.router_replay.end_forward()
@@ -391,8 +496,19 @@ class MegatronModelWrapper:
         """
         forward_backward_func = get_forward_backward_func()
 
+        projection = (
+            _ProjectionOptions(temperature=temperature, entropy_requires_grad=False, compute_top1=False)
+            if self.fp32_output_projection
+            else None
+        )
+
         def collection_func(logits, data, packed_seq_params):
             sequences = data.sequences
+            if projection is not None:
+                values = self._projected_token_values(
+                    logits, data.attention_mask.to(bool), packed_seq_params, compute_top1=False
+                )
+                return torch.tensor(0.0, device=values.logprobs.device), {"scores": values.logprobs}
             if data.ftpo_chosen_mask is not None:
                 boundary_logits = compact_boundary_logits(
                     logits[..., : self.vocabulary_size], data.attention_mask, data.ftpo_chosen_mask
@@ -407,6 +523,8 @@ class MegatronModelWrapper:
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
+            if projection is not None and batch.ftpo_chosen_mask is not None:
+                raise ValueError("FTPO boundary logits are unavailable with lm_head_compute_dtype=float32")
             outputs, packed_seq_params = self._forward_micro_batch(
                 model,
                 batch.sequences,
@@ -415,6 +533,7 @@ class MegatronModelWrapper:
                 rollout_routed_experts=batch.rollout_routed_experts,
                 probe_row_indices=batch.probe_row_indices,
                 num_actions=batch.num_actions,
+                projection=projection,
             )
 
             return outputs, partial(collection_func, data=batch, packed_seq_params=packed_seq_params)
@@ -519,6 +638,15 @@ class MegatronModelWrapper:
             self.cfg.trainer.algorithm.max_seq_len,
             sum_data_parallel,
         )
+        projection = (
+            _ProjectionOptions(
+                temperature=temperature,
+                entropy_requires_grad=bool(self.cfg.trainer.algorithm.use_entropy_loss),
+                compute_top1=False,
+            )
+            if self.fp32_output_projection
+            else None
+        )
         ftpo_normalization = None
         if micro_batches[0].ftpo is not None:
             ftpo_normalization = ftpo_counts(
@@ -541,6 +669,8 @@ class MegatronModelWrapper:
             response_span_tags = data.response_span_tags
 
             ftpo_inputs = None
+            if projection is not None and (data.ftpo is not None or data.distillation is not None):
+                raise ValueError("FTPO and distillation need logits, which lm_head_compute_dtype=float32 never forms")
             if data.ftpo is not None:
                 assert ftpo_normalization is not None
                 ftpo_inputs = FTPOInputs(
@@ -551,20 +681,27 @@ class MegatronModelWrapper:
                     boundary_values(sequences[:, -num_actions:], data.ftpo.chosen_mask),
                     ftpo_normalization,
                 )
-            # FTPO's logit margin and reference tether use unscaled model logits.
-            if data.ftpo is None and temperature != 1.0:
-                logits.div_(temperature)
+            attention_mask = data.attention_mask.to(bool)
+            sparse_student_logprobs = None
+            if projection is not None:
+                values = self._projected_token_values(logits, attention_mask, packed_seq_params, compute_top1=False)
+            else:
+                # FTPO's logit margin and reference tether use unscaled model logits.
+                if data.ftpo is None and temperature != 1.0:
+                    logits.div_(temperature)
 
-            token_logprobs = self._token_logprobs(logits, sequences, data.attention_mask.to(bool), packed_seq_params)
+                token_logprobs = self._token_logprobs(logits, sequences, attention_mask, packed_seq_params)
+                sparse_student_logprobs = self._distillation_student_logprobs(logits, data)
+
+                # Without an entropy loss the entropy is a metric only. Computing it under no_grad
+                # avoids saving two vocab-sized copies of the logits for backward on the last stage.
+                with torch.set_grad_enabled(self.cfg.trainer.algorithm.use_entropy_loss):
+                    token_entropies = self._token_entropies(logits, attention_mask, packed_seq_params)
+                values = _TokenValues(token_logprobs, token_entropies)
+            token_logprobs = values.logprobs
+            token_entropies = values.entropy
 
             action_log_probs = token_logprobs[:, -num_actions:]
-
-            sparse_student_logprobs = self._distillation_student_logprobs(logits, data)
-
-            # Without an entropy loss the entropy is a metric only. Computing it under no_grad
-            # avoids saving two vocab-sized copies of the logits for backward on the last stage.
-            with torch.set_grad_enabled(self.cfg.trainer.algorithm.use_entropy_loss):
-                token_entropies = self._token_entropies(logits, data.attention_mask.to(bool), packed_seq_params)
             teacher = None
             if data.distillation is not None:
                 assert sparse_student_logprobs is not None
@@ -631,6 +768,7 @@ class MegatronModelWrapper:
                     rollout_routed_experts=batch.rollout_routed_experts,
                     num_actions=batch.num_actions,
                     record_recompute=True,
+                    projection=projection,
                 )
 
             return outputs, partial(loss_func, data=batch, packed_seq_params=packed_seq_params)

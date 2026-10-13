@@ -217,6 +217,45 @@ async def test_task_grade_and_exact_tokens_reach_the_leased_buffer(task_inputs, 
         "generate/task_rollout/generated_tokens": 2.0,
         "generate/task_rollout/missing_logprob_tokens": 0.0 if with_logprobs else 2.0,
     }
+    assert batch["rollout_metrics"]["generate/reward_groups/num_all_one_groups"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_required_logprobs_missing_from_one_rollout_mask_only_that_rollout(task_inputs):
+    """A completed rollout without behavior logprobs leaves the loss; the rest of its group still trains."""
+    config, request = task_inputs
+    request.update(
+        prompts=request["prompts"] * 2,
+        env_classes=request["env_classes"] * 2,
+        env_extras=request["env_extras"] * 2,
+        trajectory_ids=[TrajectoryID("arithmetic", index) for index in range(2)],
+    )
+
+    class Client(InferenceClient):
+        async def generate(self, request):
+            output = await super().generate(request)
+            if request["session_ids"] == ["arithmetic_1"]:
+                output["response_logprobs"] = None
+            return output
+
+    worker = TaskRolloutWorker(
+        config,
+        WholeTaskProjection(WholeTrajectoryProjection(config, Tokenizer())),
+        Client(),
+        {},
+        shutdown_timeout=30,
+    )
+    writer = Writer()
+    try:
+        await worker.run_task(RolloutTask(RolloutLease("lease", 0, 1), {"uid": "arithmetic"}, request), writer)
+    finally:
+        await worker.shutdown()
+    batch = writer.groups[0][1].trajectory_batch
+
+    assert batch["loss_masks"] == [[1, 1], [0, 0]]
+    np.testing.assert_allclose(batch["rollout_logprobs"], [[-0.1, -0.2], [0.0, 0.0]])
+    # The masked rollout was graded, so its reward still counts toward the group baseline.
+    assert batch["exclude_from_baseline"] == [False, False]
 
 
 @pytest.mark.asyncio

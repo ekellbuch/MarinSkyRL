@@ -3,15 +3,17 @@ uv run --group dev --extra cpu --isolated pytest tests/cpu/trajectory_runners/te
 """
 
 import copy
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from skyrl_gym.verification import VerificationResult
+from skyrl_gym.verification import TrainingDisposition, VerificationResult
 
 from skyrl_train.batch_sampling import filter_trajectory_batch
 from skyrl_train.trajectory_runners.base import TrajectoryBatch, TrajectoryID
 from skyrl_train.trajectory_runners.trajectory_processing import (
     apply_overlong_filtering,
+    classify_reward_groups,
     concatenate_trajectory_batches,
     get_batch_failure_metrics,
     get_metrics_from_trajectory_batch,
@@ -145,6 +147,68 @@ def test_failure_metrics_survive_concatenation():
     assert merged["rollout_metrics"]["generate/failed_trajectory_fraction"] == pytest.approx(4 / 6)
     assert merged["rollout_metrics"]["generate/errors/SandboxError"] == 3
     assert merged["rollout_metrics"]["generate/errors/ContextLengthExceededError"] == 1
+
+
+def _final_output(reward, *, graded=True, stop_reason="stop", exception_type=None):
+    disposition = (
+        TrainingDisposition(True, True, "verified", exception_type=exception_type)
+        if graded
+        else TrainingDisposition.mask("Rollout execution failed", exception_type=exception_type)
+    )
+    return SimpleNamespace(
+        disposition=disposition,
+        evidence=SimpleNamespace(stop_reason=stop_reason),
+        reward=SimpleNamespace(optimization_reward=reward),
+    )
+
+
+def test_ungraded_member_makes_its_group_incomplete_not_unanimous():
+    """A group with a baseline-excluded member is incomplete, so a dead sandbox never reads as all-zero."""
+    outputs = [
+        _final_output(1.0),
+        _final_output(0.0),
+        _final_output(0.0),
+        _final_output(0.0, graded=False, exception_type="SandboxError"),
+        _final_output(0.0, exception_type="AgentTimeoutError"),
+        _final_output(0.0, stop_reason="length"),
+        _final_output(1.0),
+        _final_output(0.5),
+    ]
+    metrics = classify_reward_groups(outputs, ["mixed", "mixed", "dead", "dead", "zero", "zero", "one", "one"])
+
+    assert {name.removeprefix("generate/reward_groups/"): value for name, value in metrics.items()} == {
+        "num_groups": 4.0,
+        "num_samples": 8.0,
+        "num_graded_samples": 7.0,
+        "num_ungraded_samples": 1.0,
+        "num_agent_timeouts": 1.0,
+        "num_truncated_samples": 1.0,
+        "num_all_zero_groups": 1.0,
+        "num_all_one_groups": 1.0,
+        "num_nonconstant_groups": 1.0,
+        "num_incomplete_groups": 1.0,
+        "frac_all_zero_groups": 0.25,
+        "frac_all_one_groups": 0.25,
+        "frac_nonconstant_groups": 0.25,
+        "frac_incomplete_groups": 0.25,
+    }
+
+
+def test_reward_group_fractions_survive_concatenation():
+    """The asynchronous trainer reads one merged batch, so fractions come from summed counts."""
+    first, second = _generated_group(2, 0), _generated_group(4, 0)
+    first["rollout_metrics"].update(classify_reward_groups([_final_output(1.0), _final_output(0.0)], ["a", "a"]))
+    second["rollout_metrics"].update(
+        classify_reward_groups([_final_output(0.0)] * 4, ["b", "b", "c", "c"]),
+    )
+
+    merged = concatenate_trajectory_batches([first, second], tis_lcs_alert_threshold=0.005)
+
+    assert merged["rollout_metrics"]["generate/reward_groups/num_groups"] == 3
+    assert merged["rollout_metrics"]["generate/reward_groups/num_samples"] == 6
+    # One nonconstant group of three, not the 0.5 of averaging the per-request fractions 1.0 and 0.0.
+    assert merged["rollout_metrics"]["generate/reward_groups/frac_nonconstant_groups"] == pytest.approx(1 / 3)
+    assert merged["rollout_metrics"]["generate/reward_groups/frac_all_zero_groups"] == pytest.approx(2 / 3)
 
 
 def test_data_sources_survive_async_batch_concatenation():

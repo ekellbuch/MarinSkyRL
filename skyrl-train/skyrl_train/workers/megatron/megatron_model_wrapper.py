@@ -21,6 +21,7 @@ from skyrl_train.distributed.megatron.model_utils import (
     packed_next_token_targets,
     packed_next_token_values_to_padded,
     vocab_parallel_entropy,
+    vocab_parallel_top2_margin,
 )
 from skyrl_train.distributed.megatron.megatron_utils import get_model_config
 from skyrl_train.ftpo import FTPOTargets, FTPOInputs, boundary_values, compact_boundary_logits, ftpo_counts
@@ -37,6 +38,7 @@ from skyrl_train.objective.reduction import policy_data_weights, step_counts
 from skyrl_train.utils.profiler import Profiler
 from skyrl_train.timing_observability import PhaseBreakdown
 from skyrl_train.utils.importance_ratio_diagnostics import LogRatioMonitor, gather_ratio_tensor
+from skyrl_train.utils.token_stats import TokenStatsBatch, select_micro_batch_tokens
 from skyrl_train.workers.megatron.fp32_output_projection import (
     FP32ProjectionRequest,
     fp32_projection_output_processor,
@@ -107,6 +109,8 @@ class MegatronPolicyMicroBatch:
     correction_weights: Optional[torch.Tensor] = None
     rollout_routed_experts: Optional[torch.Tensor] = None
     pair_roles: Optional[torch.Tensor] = None
+    # Rank-local index of the first row, for per-token statistics.
+    sample_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -237,6 +241,24 @@ class MegatronModelWrapper:
         if self.use_sample_packing:
             return unpack_packed_token_values(values, packed_seq_params, attention_mask)
         return scatter_token_values(values, attention_mask, drop_last=False)
+
+    def _logit_top1_values(
+        self, logits: torch.Tensor, attention_mask: torch.Tensor, packed_seq_params
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-1 margin and token of model-dtype vocabulary-parallel logits, restored to ``[batch, seq]``."""
+        vocabulary_size = self.vocabulary_size
+        if vocabulary_size is None:
+            vocabulary_size = logits.shape[-1] * mpu.get_tensor_model_parallel_world_size()
+        margin, token = vocab_parallel_top2_margin(
+            logits,
+            mpu.get_tensor_model_parallel_rank() * logits.shape[-1],
+            vocabulary_size,
+            mpu.get_tensor_model_parallel_group(),
+        )
+        return (
+            self._position_values(margin, attention_mask, packed_seq_params),
+            self._position_values(token, attention_mask, packed_seq_params),
+        )
 
     def _projection_request(
         self,
@@ -597,6 +619,8 @@ class MegatronModelWrapper:
         temperature: float = 1.0,
         timings: PhaseBreakdown | None = None,
         profiler: Profiler | None = None,
+        token_stats: Optional[List[TokenStatsBatch]] = None,
+        global_step: int = 0,
     ) -> List[dict]:
         """
         Run forward-backward over a full mini-batch consisting of multiple micro-batches.
@@ -609,6 +633,9 @@ class MegatronModelWrapper:
             temperature: Optional temperature for logits scaling.
             timings: Optional recorder for the forward-backward scheduler and pipeline metric broadcast.
             profiler: Optional profiler for the first forward micro-batch.
+            token_stats: When given, receives each micro-batch's loss-masked per-token statistics
+                (on the last pipeline stage only).
+            global_step: Step recorded on the per-token statistics.
 
         Returns:
             List[dict]: one metrics dict per micro-batch in order.
@@ -638,11 +665,12 @@ class MegatronModelWrapper:
             self.cfg.trainer.algorithm.max_seq_len,
             sum_data_parallel,
         )
+        compute_top1 = token_stats is not None
         projection = (
             _ProjectionOptions(
                 temperature=temperature,
                 entropy_requires_grad=bool(self.cfg.trainer.algorithm.use_entropy_loss),
-                compute_top1=False,
+                compute_top1=compute_top1,
             )
             if self.fp32_output_projection
             else None
@@ -684,8 +712,14 @@ class MegatronModelWrapper:
             attention_mask = data.attention_mask.to(bool)
             sparse_student_logprobs = None
             if projection is not None:
-                values = self._projected_token_values(logits, attention_mask, packed_seq_params, compute_top1=False)
+                values = self._projected_token_values(
+                    logits, attention_mask, packed_seq_params, compute_top1=compute_top1
+                )
             else:
+                top1_margin = top1_token = None
+                if compute_top1:
+                    # The margin is measured on unscaled logits, before the temperature division.
+                    top1_margin, top1_token = self._logit_top1_values(logits, attention_mask, packed_seq_params)
                 # FTPO's logit margin and reference tether use unscaled model logits.
                 if data.ftpo is None and temperature != 1.0:
                     logits.div_(temperature)
@@ -697,7 +731,7 @@ class MegatronModelWrapper:
                 # avoids saving two vocab-sized copies of the logits for backward on the last stage.
                 with torch.set_grad_enabled(self.cfg.trainer.algorithm.use_entropy_loss):
                     token_entropies = self._token_entropies(logits, attention_mask, packed_seq_params)
-                values = _TokenValues(token_logprobs, token_entropies)
+                values = _TokenValues(token_logprobs, token_entropies, top1_margin, top1_token)
             token_logprobs = values.logprobs
             token_entropies = values.entropy
 
@@ -737,6 +771,24 @@ class MegatronModelWrapper:
             if log_ratio_monitor is None:
                 log_ratio_monitor = LogRatioMonitor(action_log_probs.device)
             log_ratio_monitor.add(action_log_probs, old_action_log_probs, loss_mask)
+            if token_stats is not None:
+                assert values.top1_margin is not None and values.top1_token is not None
+                prediction = slice(-num_actions - 1, -1)
+                token_stats.append(
+                    select_micro_batch_tokens(
+                        global_step=global_step,
+                        sequences=sequences,
+                        num_actions=num_actions,
+                        loss_mask=loss_mask,
+                        learner_logprobs=action_log_probs,
+                        rollout_logprobs=rollout_action_logprobs,
+                        entropy=token_entropies[:, prediction],
+                        top1_margin=values.top1_margin[:, prediction],
+                        top1_token=values.top1_token[:, prediction],
+                        advantages=advantages,
+                        sample_offset=data.sample_offset,
+                    )
+                )
             completed_microbatches += 1
 
             metrics = {

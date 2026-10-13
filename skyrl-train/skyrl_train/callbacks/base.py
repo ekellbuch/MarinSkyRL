@@ -353,6 +353,30 @@ class TrainerCallback(ABC):
         """
         pass
 
+    def on_generation_selected(
+        self,
+        state: TrainerState,
+        control: TrainerControl,
+        *,
+        attempt: Any,
+        prompts: List[dict],
+        **kwargs,
+    ) -> Optional[TrainerControl]:
+        """
+        Called once per step with the prompt groups the trainer took into the batch, before batch assembly.
+
+        Args:
+            state: Current trainer state
+            control: Control object for influencing training
+            attempt: The admitted rollout groups (uid, policy step, prompt and trajectories of each)
+            prompts: The groups' dataset prompt rows, in batch order; each carries its ``uid``
+            **kwargs: Additional arguments
+
+        Returns:
+            Optionally return a modified control object
+        """
+        pass
+
     # Async variants (override for I/O-bound operations)
     async def on_train_begin_async(
         self,
@@ -436,6 +460,18 @@ class TrainerCallback(ABC):
     ) -> Optional[TrainerControl]:
         """Async version of on_log. Defaults to calling sync version."""
         return self.on_log(state, control, logs, **kwargs)
+
+    async def on_generation_selected_async(
+        self,
+        state: TrainerState,
+        control: TrainerControl,
+        *,
+        attempt: Any,
+        prompts: List[dict],
+        **kwargs,
+    ) -> Optional[TrainerControl]:
+        """Async version of on_generation_selected. Defaults to calling sync version."""
+        return self.on_generation_selected(state, control, attempt=attempt, prompts=prompts, **kwargs)
 
 
 class CallbackHandler:

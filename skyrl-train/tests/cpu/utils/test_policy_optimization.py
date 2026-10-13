@@ -578,9 +578,10 @@ def test_validate_cfg_rejects_invalid_dppo_region(key, value, message):
         validate_cfg(cfg)
 
 
-def test_validate_cfg_accepts_fp32_lm_head():
+def test_validate_cfg_accepts_fp32_lm_head_with_token_stats():
     cfg = _dppo_config()
     cfg.trainer.policy.model.lm_head_compute_dtype = "float32"
+    cfg.trainer.token_stats.enabled = True
     validate_cfg(cfg)
 
 

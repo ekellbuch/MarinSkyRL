@@ -29,6 +29,7 @@ from skyrl_train.config.objective_spec import LossReduction
 from skyrl_train.objective.reduction import reduce_to_step, step_counts
 from skyrl_train.training_batch import TrainingBatchIterator
 from skyrl_train.utils.trainer_utils import ResumeMode
+from skyrl_train.utils.token_stats import TOKEN_STATS_METADATA_KEY, select_micro_batch_tokens
 from skyrl_train.utils.utils import validate_batch_sizes
 from skyrl_train.workers.worker import CriticWorkerBase, PolicyWorkerBase
 from tests.cpu.util import example_dummy_config
@@ -915,3 +916,56 @@ def test_grpo_reports_one_flat_and_one_varied_reward_group():
     assert trainer.all_metrics["reward/zero_std_group_fraction"] == pytest.approx(0.5)
     assert torch.equal(result["advantages"][:2], torch.zeros(2, 1))
     assert torch.isfinite(result["advantages"]).all()
+
+
+def test_policy_training_attaches_gathered_token_stats_to_the_trainer(monkeypatch):
+    cfg = get_default_config()
+    cfg.trainer.token_stats.enabled = True
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = cfg
+    trainer.colocate_all = False
+    trainer.critic_model = None
+    trainer.global_step = 4
+    trainer.all_metrics = {}
+    trainer.all_timings = {}
+    trainer.apply_loop_advantages = lambda batch: batch
+
+    data = TrainingInputBatch({"sequences": torch.zeros(4, 3, dtype=torch.long), "rewards": torch.zeros(4, 3)})
+    data.metadata = {"uids": ["a", "a", "b", "pad0"]}
+    trainer.apply_loop_credit_and_drop_advantage_inputs(data)
+    assert "uids" not in data.metadata
+
+    # Each data-parallel rank selected one token of its second local row.
+    shard = select_micro_batch_tokens(
+        global_step=4,
+        sequences=torch.tensor([[3, 7]]),
+        num_actions=1,
+        loss_mask=torch.ones(1, 1),
+        learner_logprobs=torch.tensor([[-0.5]]),
+        rollout_logprobs=None,
+        entropy=torch.tensor([[1.0]]),
+        top1_margin=torch.tensor([[2.0]]),
+        top1_token=torch.tensor([[7]]),
+        advantages=torch.tensor([[1.0]]),
+        sample_offset=1,
+    )
+    actor_infos = [
+        SimpleNamespace(rank=MeshRank(dp=dp, sp=0, tp=0, pp=0, world_size=2, dp_size=2, pp_size=1)) for dp in range(2)
+    ]
+    outputs = []
+    for _ in actor_infos:
+        output = TrainingOutputBatch()
+        output.metadata = {"train_status": {"policy_loss": 0.0}, TOKEN_STATS_METADATA_KEY: shard}
+        outputs.append(output)
+    trainer.policy_model = SimpleNamespace(actor_infos=actor_infos, async_run_ray_method=lambda *args, **kwargs: [])
+    monkeypatch.setattr(trainer_module, "collect_actor_results", lambda *args, **kwargs: outputs)
+    monkeypatch.setattr(trainer_module.ray, "get", lambda refs: refs)
+
+    trainer.train_critic_and_policy(data)
+
+    stats = trainer.last_token_stats
+    assert stats.global_step == 4
+    assert stats.sample_ids == ("a", "a", "b", "pad0")
+    # Data-parallel rank 1 owns the second half of the batch.
+    assert stats.sample_index.tolist() == [1, 3]
+    assert stats.sampled_is_top1.tolist() == [True, True]

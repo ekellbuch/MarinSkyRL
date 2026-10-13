@@ -1,8 +1,8 @@
 """The Megatron policy wrapper with ``lm_head_compute_dtype=float32``.
 
 A fake GPT chunk calls the wrapper's output processor the way ``GPTModel`` does, so the
-target layout, the restoration of left-padded rows, and the gradients reaching the
-projection weight and hidden states run through real wrapper code. The reference is the
+target layout, the restoration of left-padded rows, the token statistics, and the
+gradients reaching the projection weight and hidden states run through real wrapper code. The reference is the
 same wrapper consuming full FP32 logits on the logits path.
 """
 
@@ -139,6 +139,7 @@ def _model_and_batch(group, seed=0):
         loss_mask=torch.tensor([[1.0, 1.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]]),
         rollout_action_logprobs=-torch.rand(BATCH, NUM_ACTIONS, generator=generator),
         response_span_tags=None,
+        sample_offset=3,
     )
     chunk = _FakeGPTChunk(embedding, _OutputLayer(weight, group))
     return chunk, micro_batch
@@ -185,6 +186,35 @@ def test_fp32_projection_gradients_match_fp32_logits_path(megatron_mesh, chunk_s
     assert projected.output_layer.weight.grad.dtype is torch.bfloat16
     torch.testing.assert_close(projected.output_layer.weight.grad.float(), reference.output_layer.weight.grad.float())
     torch.testing.assert_close(projected.embedding.grad.float(), reference.embedding.grad.float())
+
+
+def _token_stats(fp32_output_projection, group):
+    chunk, micro_batch = _model_and_batch(group)
+    stats = []
+    _wrapper(chunk, fp32_output_projection=fp32_output_projection, chunk_size=3).forward_backward_mini_batch(
+        micro_batches=[micro_batch],
+        seq_len=SEQ,
+        micro_batch_size=BATCH,
+        temperature=0.8,
+        token_stats=stats,
+        global_step=5,
+    )
+    (batch,) = stats
+    return micro_batch, batch
+
+
+def test_fp32_projection_token_stats_match_fp32_logits_path(megatron_mesh):
+    micro_batch, projected = _token_stats(True, megatron_mesh)
+    _, reference = _token_stats(False, megatron_mesh)
+
+    assert projected.global_step == 5
+    for name in ("sample_index", "position", "token_id", "sampled_is_top1"):
+        assert torch.equal(getattr(projected, name), getattr(reference, name))
+    for name in ("learner_logprob", "entropy", "top1_margin", "advantage", "rollout_logprob"):
+        torch.testing.assert_close(getattr(projected, name), getattr(reference, name), rtol=1e-5, atol=1e-5)
+    # sample_offset shifts the rank-local row index; only loss-masked tokens are kept.
+    assert sorted(set(projected.sample_index.tolist())) == [3, 4]
+    assert len(projected) == int(micro_batch.loss_mask.sum())
 
 
 def test_fp32_projection_logprobs_match_direct_fp32_reference(megatron_mesh):

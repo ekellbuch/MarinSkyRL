@@ -625,6 +625,8 @@ def validate_cfg(cfg: DictConfig):
     if lm_head_compute_dtype is not None and (is_ftpo or distillation_plan is not None):
         # The FP32 learner projection returns per-token statistics; FTPO and distillation consume logits.
         raise ValueError("trainer.policy.model.lm_head_compute_dtype=float32 does not support FTPO or distillation")
+    if cfg.trainer.token_stats.enabled and is_ftpo:
+        raise ValueError("trainer.token_stats.enabled does not support FTPO")
 
     if cfg.trainer.policy.model.lora.rank > 0:
         raise ValueError("Megatron training does not support LoRA")

@@ -478,6 +478,7 @@ async def test_ftpo_empty_rollout_batch_skips_training(config):
     ("path", "value", "message"),
     [
         ("trainer.policy.model.lm_head_compute_dtype", "float32", "does not support FTPO"),
+        ("trainer.token_stats.enabled", True, "token_stats.enabled does not support FTPO"),
     ],
 )
 def test_ftpo_recipe_rejects_settings_that_replace_boundary_logits(config, path, value, message):

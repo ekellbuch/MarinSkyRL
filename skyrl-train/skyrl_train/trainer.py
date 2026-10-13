@@ -125,6 +125,7 @@ from skyrl_train.utils.utils import (
 
 from skyrl_train.config.objective_spec import rollout_logprobs_required
 from skyrl_train.utils.algorithm_registry import PolicyLossRegistry
+from skyrl_train.utils.token_stats import TokenStatsBatch, gather_token_stats
 from skyrl_train.evaluate import evaluate, evaluate_step_wise
 from skyrl_train.callbacks.base import TrainerCallback, TrainerState, TrainerControl, CallbackHandler
 from skyrl_train.callbacks.builtin import DefaultCallbackHandler, RefModelUpdateCallback
@@ -403,6 +404,11 @@ class RayPPOTrainer:
 
         # Trainer control object for callback coordination
         self._control = TrainerControl()
+
+        # Per-token learner/rollout statistics of the last optimizer step, for
+        # on_step_end callbacks (trainer.token_stats.enabled).
+        self.last_token_stats: Optional[TokenStatsBatch] = None
+        self._token_stats_sample_ids: List[str] = []
 
     def configure_distillation(self, runtime: DistillationRuntime) -> None:
         """Install admitted-group teacher scoring before the training loop starts."""
@@ -1467,6 +1473,14 @@ class RayPPOTrainer:
                 on_admitted=self._submit_admitted_groups_for_teacher_scoring,
             )
         self.all_metrics.update(selection_metrics)
+        self._control = await self.callback_handler.call_event_async(
+            "on_generation_selected",
+            self._create_trainer_state(epoch),
+            self._control,
+            attempt=tuple(groups),
+            prompts=[group.prompt for group in groups],
+            trainer=self,
+        )
         await self._seal_speculator_capture()
         await self._start_speculator_update()
         if self.colocate_all:
@@ -2532,7 +2546,10 @@ class RayPPOTrainer:
         data = self.apply_loop_advantages(data)
         data.pop("rewards")
         data.pop("loop_advantages", None)
-        data.metadata.pop("uids")
+        uids = data.metadata.pop("uids")
+        if self.cfg.trainer.token_stats.enabled:
+            # Workers never see uids; the trainer re-attaches them to the token stats.
+            self._token_stats_sample_ids = list(uids)
         return data
 
     def dump_data(self, data: TrainingInputBatch, file_name: str):
@@ -2885,6 +2902,13 @@ class RayPPOTrainer:
         policy_status = policy_statuses[0].metadata["train_status"]
         for k, v in policy_status.items():
             self.all_metrics.update({f"policy/{k}": v})
+        if self.cfg.trainer.token_stats.enabled:
+            self.last_token_stats = gather_token_stats(
+                self.policy_model.actor_infos,
+                policy_statuses,
+                sample_ids=self._token_stats_sample_ids,
+                global_step=self.global_step,
+            )
         empty_cache_refs += self.policy_model.async_run_ray_method("pass_through", "empty_cache")
         ray.get(empty_cache_refs)
 

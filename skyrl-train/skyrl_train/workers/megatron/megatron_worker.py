@@ -44,6 +44,7 @@ from skyrl_train.training_batch import (
 )
 from skyrl_train.utils.metrics import policy_progress_metrics, policy_training_metrics
 from skyrl_train.utils.profiler import Profiler
+from skyrl_train.utils.token_stats import TOKEN_STATS_METADATA_KEY, TokenStatsBatch, concat_token_stats
 from skyrl_train.utils.progress import tqdm
 from skyrl_train.utils.utils import (
     get_physical_gpu_id,
@@ -570,11 +571,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         status_list = []
         all_metrics = defaultdict(list)
         policy_update_steps = 0
+        global_step = int(train_data.metadata["global_step"])
+        token_stats_enabled = bool(self.cfg.trainer.token_stats.enabled)
+        token_stats_shards: list[TokenStatsBatch] = []
 
         if self.profiler is not None:
             self.profiler.begin_update()
 
         for epoch in range(self.cfg.trainer.update_epochs_per_batch):
+            # Token stats describe the batch's last update epoch: earlier epochs' shards are dropped.
+            token_stats_shards = []
             self.optimizer.zero_grad()
             pbar = tqdm(
                 dataloader,
@@ -607,6 +613,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                         ftpo=experience.ftpo,
                         rollout_routed_experts=experience.rollout_routed_experts,
                         pair_roles=experience.pair_roles,
+                        sample_offset=local_step * self.cfg.trainer.micro_train_batch_size_per_gpu,
                     )
                 )
 
@@ -638,6 +645,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                         temperature=self.scoring_temperature,
                         timings=timing,
                         profiler=profiler,
+                        token_stats=token_stats_shards if token_stats_enabled else None,
+                        global_step=global_step,
                     )
 
                     if self.empty_cuda_cache:
@@ -713,6 +722,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         output = TrainingOutputBatch()
         output.metadata = {"train_status": status_mean}
+        if token_stats_enabled:
+            output.metadata[TOKEN_STATS_METADATA_KEY] = concat_token_stats(token_stats_shards, global_step=global_step)
         return output
 
     async def expert_block_rpc(self, method: str, *args):

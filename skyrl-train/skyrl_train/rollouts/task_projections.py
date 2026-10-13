@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 import json
 
 import numpy as np
+from loguru import logger
 from skyrl_gym.verification import (
     VERIFIER_RUNTIME_ERROR,
     RewardResult,
@@ -37,6 +38,7 @@ from skyrl_train.utils.harbor_errors import (
 )
 
 MASKED_TOKEN_ID = 0
+MISSING_ROLLOUT_LOGPROBS_REASON = "missing_rollout_logprobs"
 
 
 def verification_result(grade: GradeResult) -> VerificationResult:
@@ -253,6 +255,10 @@ def training_output(
                     raise ValueError("Span tags must align with generated tokens")
                 response_span_tags[step.response_end + 1 - len(tags) : step.response_end + 1] = tags
     evidence = _model_evidence(rollout)
+    if logprobs_required and evidence.behavior_logprobs is None and disposition.loss_eligible:
+        # A behavior-referenced objective cannot score these tokens. Leave the loss but keep the
+        # graded reward in the baseline, so the rest of the group still trains.
+        disposition = replace(disposition, loss_eligible=False, reason=MISSING_ROLLOUT_LOGPROBS_REASON)
     if evidence.behavior_logprobs is None and not disposition.loss_eligible:
         evidence = replace(evidence, behavior_logprobs=np.zeros(len(rollout.response_token_ids), dtype=np.float32))
     return AgentLoopOutput(
@@ -283,6 +289,7 @@ class WholeTaskProjection:
         for index, environment in enumerate(request.get("env_classes") or []):
             if environment == TASKCOMPENDIUM_ENVIRONMENT:
                 outputs[index] = replace(outputs[index], env_metrics={})
+        _warn_missing_logprobs(rollouts, outputs, request)
         batch = self.projection.project(outputs, request)
         _merge_task_metrics(batch, rollouts, request)
         _merge_reward_group_metrics(batch, outputs, request)
@@ -305,6 +312,7 @@ class StepTaskProjection:
         for index, environment in enumerate(request.get("env_classes") or []):
             if environment == TASKCOMPENDIUM_ENVIRONMENT:
                 outputs[index] = [replace(output, env_metrics={}) for output in outputs[index]]
+        _warn_missing_logprobs(rollouts, [step for steps in outputs for step in steps], request)
         batch = self.projection.project(outputs, request)
         _merge_task_metrics(batch, rollouts, request)
         _merge_reward_group_metrics(batch, [steps[-1] for steps in outputs], request)
@@ -360,6 +368,24 @@ def _merge_task_metrics(
             continue
         for key, value in rollout.metrics.items():
             metrics[key] = metrics.get(key, 0.0) + value
+
+
+def _warn_missing_logprobs(
+    rollouts: Sequence[RolloutData], outputs: Sequence[AgentLoopOutput], request: TrajectoryRequestBatch
+) -> None:
+    """Log once per request when trainable outputs were masked for missing behavior logprobs."""
+    masked = sum(output.disposition.reason == MISSING_ROLLOUT_LOGPROBS_REASON for output in outputs)
+    if not masked:
+        return
+    missing = [rollout.task_id for rollout in rollouts if rollout.logprobs is None]
+    logger.warning(
+        "{} trainable outputs masked out of the loss (reason={}): {}/{} rollouts have no behavior logprobs. Tasks: {}",
+        masked,
+        MISSING_ROLLOUT_LOGPROBS_REASON,
+        len(missing),
+        len(rollouts),
+        ", ".join(sorted(set(missing))),
+    )
 
 
 def _merge_reward_group_metrics(

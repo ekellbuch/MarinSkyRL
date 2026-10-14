@@ -8,6 +8,11 @@ expert_tensor_parallel_size: 1
 
 model_config_kwargs: {}
 
+# Build without the checkpoint's multi-token-prediction layers. RL trains next-token
+# logprobs only; Qwen3.5's MTP layer fails under gradient checkpointing with
+# megatron-bridge 0.6 + megatron-core 0.18 (unexpected padding_mask).
+disable_mtp: false
+
 transformer_config_kwargs: {}
 logprob_chunk_size: 1024
 

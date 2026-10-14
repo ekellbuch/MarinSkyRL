@@ -163,6 +163,8 @@ class MegatronWorker:
 
         for k, v in transformer_config_kwargs.items():
             setattr(provider, k, v)
+        if megatron_config.get("disable_mtp", False):
+            provider.mtp_num_layers = None
         provider.finalize()
 
         self.provider = provider

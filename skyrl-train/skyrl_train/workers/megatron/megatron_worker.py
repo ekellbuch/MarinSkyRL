@@ -509,7 +509,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # create worker model
         self.model = MegatronModelWrapper(
             config=self.cfg,
-            vocabulary_size=self.strategy.hf_config.vocab_size,
+            vocabulary_size=self.strategy.hf_config.get_text_config().vocab_size,
             actor_module=self.actor_module,
             actor_optimizer=self.optimizer,
             policy_loss_fn=self.policy_loss_fn,
@@ -546,7 +546,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         self._initialize_policy_modules(model_path, mode=_MegatronInitMode.CHECKPOINT_EXPORT)
         self.model = MegatronModelWrapper(
             config=self.cfg,
-            vocabulary_size=self.strategy.hf_config.vocab_size,
+            vocabulary_size=self.strategy.hf_config.get_text_config().vocab_size,
             actor_module=self.actor_module,
             logprob_chunk_size=OmegaConf.select(
                 self.cfg, "trainer.policy.megatron_config.logprob_chunk_size", default=None
@@ -991,7 +991,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         # create worker model — ref honors its OWN logprob_chunk_size key
         self.model = MegatronModelWrapper(
             config=self.cfg,
-            vocabulary_size=self.strategy.hf_config.vocab_size,
+            vocabulary_size=self.strategy.hf_config.get_text_config().vocab_size,
             actor_module=self.actor_module,
             logprob_chunk_size=OmegaConf.select(
                 self.cfg, "trainer.ref.megatron_config.logprob_chunk_size", default=None

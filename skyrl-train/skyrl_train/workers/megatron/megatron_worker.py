@@ -775,7 +775,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
                     def broadcast_bucket():
                         for tensor in chunk.tensors:
-                            torch.distributed.broadcast(tensor.data, 0, group=self._model_update_group)
+                            # NCCL rejects strided views; Qwen3.5's converted weights include some.
+                            torch.distributed.broadcast(tensor.data.contiguous(), 0, group=self._model_update_group)
 
                     await asyncio.to_thread(broadcast_bucket)
                 if torch.distributed.get_rank() == 0:

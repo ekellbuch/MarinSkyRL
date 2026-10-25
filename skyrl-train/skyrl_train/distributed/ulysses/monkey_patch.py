@@ -20,14 +20,14 @@ Apply monkey-patch function to models
 import importlib.metadata
 import sys
 from functools import lru_cache
-from typing import Optional
 
-from loguru import logger
 import torch
+from loguru import logger
 from packaging import version
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.modeling_utils import PreTrainedModel
 
+from skyrl_train.distributed.ulysses.gated_delta_net import apply_gated_delta_net_patch
 from skyrl_train.distributed.ulysses.utils import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
@@ -54,9 +54,9 @@ def _ulysses_flash_attention_forward(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
+    attention_mask: torch.Tensor | None = None,
     *args,
-    position_ids: Optional[torch.Tensor] = None,
+    position_ids: torch.Tensor | None = None,
     **kwargs,
 ):
     """Insert all-to-all before and after flash attention.
@@ -157,6 +157,10 @@ def apply_monkey_patch(
 
             flash_attention._flash_attention_forward = _ulysses_flash_attention_forward
             logger.info(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
+
+    # Gated DeltaNet layers (Qwen3.5) never reach _flash_attention_forward; their
+    # recurrence has to be carried across the sequence shards separately.
+    apply_gated_delta_net_patch(model, ulysses_sp_size)
 
 
 @lru_cache
